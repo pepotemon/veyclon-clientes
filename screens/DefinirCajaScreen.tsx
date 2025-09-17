@@ -13,6 +13,20 @@ import { pickTZ, todayInTZ } from '../utils/timezone';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'DefinirCaja'>;
 
+const DISPLAY_LOCALE = 'es-AR';
+const MIN_APERTURA = 0.01;
+
+function parseMoney(input: string): number {
+  if (!input) return NaN;
+  // admitir "3400", "3.400,50", "3400,50", "3400.50"
+  const s = input.trim()
+    .replace(/\s/g, '')
+    .replace(/\./g, '')        // quita separadores de miles
+    .replace(',', '.');        // coma -> punto decimal
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 export default function DefinirCajaScreen({ route, navigation }: Props) {
   const { admin } = route.params;
   const { palette } = useAppTheme();
@@ -24,19 +38,24 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
   const [montoStr, setMontoStr] = useState('');
   const [nota, setNota] = useState('');
 
-  const montoNum = useMemo(() => {
-    const n = Number((montoStr || '').replace(',', '.'));
-    return Number.isFinite(n) ? n : NaN;
-  }, [montoStr]);
-
-  const disabled = !(Number.isFinite(montoNum) && montoNum > 0);
+  const montoNum = useMemo(() => parseMoney(montoStr), [montoStr]);
+  const disabled = !(Number.isFinite(montoNum) && montoNum >= MIN_APERTURA);
 
   const onApertura = async () => {
     try {
-      if (disabled) return;
-      const val = Math.round(montoNum * 100) / 100;
+      if (disabled) {
+        Alert.alert('Monto inválido', `Ingresa un valor mayor o igual a R$ ${MIN_APERTURA.toFixed(2)}.`);
+        return;
+      }
 
-      // ⬇️ Recalcular TZ y fecha operativa en el momento de guardar (evita desfasajes al pasar de día)
+      // Redondeo seguro a 2 decimales (evita -0.00)
+      const val = Math.abs(montoNum) < 0.005 ? 0 : Math.round(montoNum * 100) / 100;
+      if (val < MIN_APERTURA) {
+        Alert.alert('Monto muy pequeño', `El valor debe ser al menos R$ ${MIN_APERTURA.toFixed(2)}.`);
+        return;
+      }
+
+      // Recalcular TZ y fecha operativa justo al guardar (evita desfasajes al pasar de día)
       const tzNow = pickTZ();
       const opDateNow = todayInTZ(tzNow);
       const notaTrim = nota.trim() || undefined;
@@ -47,10 +66,10 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
       // 2) saldo persistente (Caja Inicial acumulada que arrastra al siguiente día)
       await setSaldoActual(admin, val, tzNow);
 
-      Alert.alert('Listo', 'Caja inicial registrada y saldo persistente actualizado.');
+      Alert.alert('Listo', `Caja inicial registrada por ${val.toLocaleString(DISPLAY_LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} y saldo persistente actualizado.`);
       navigation.goBack();
-    } catch (e) {
-      console.warn(e);
+    } catch (e: any) {
+      console.warn('[DefinirCaja] onApertura error:', e?.message || e);
       Alert.alert('Error', 'No se pudo registrar la apertura de caja.');
     }
   };

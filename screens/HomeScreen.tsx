@@ -1,5 +1,5 @@
 // screens/HomeScreen.tsx
-import React, { useEffect, useMemo, useState, useCallback  } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -54,6 +54,10 @@ import {
 // 🆕 Ruta (asegurar/usar orden)
 import { ensureRouteOrder, loadRutaOrder } from '../utils/ruta'; // ⬅️ añadido loadRutaOrder
 import { useFocusEffect } from '@react-navigation/native'; // ⬅️ añadido useFocusEffect
+
+// ✅ NUEVO: saneador de caja (cierra días faltantes y asegura apertura de hoy)
+import { closeMissingDays, ensureAperturaDeHoy } from '../utils/cajaEstado';
+
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
 type Cliente = {
@@ -156,389 +160,407 @@ export default function HomeScreen({ route, navigation }: Props) {
 
   // ⬇️ NUEVO: ids de clientes ordenados guardados por EnrutarClientes
   const [routeOrderIds, setRouteOrderIds] = useState<string[]>([]);
-// ⬇️ Asegura sesión y administra admin desde params si falta
-useFocusEffect(
-  useCallback(() => {
+  // ⬇️ Asegura sesión y administra admin desde params si falta
+  useFocusEffect(
+    useCallback(() => {
+      let alive = true;
+      (async () => {
+        try {
+          const u = await AsyncStorage.getItem('usuarioSesion');
+          if (!alive) return;
+
+          if (!u) {
+            // 🔄 si no hay sesión, vuelve al señuelo retro
+            navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
+            return;
+          }
+
+          // Si hay sesión pero Home no recibió admin por params, lo inyectamos
+          if (!route.params?.admin) {
+            navigation.setParams({ admin: u } as any);
+          }
+        } catch {
+          // Si hay error leyendo sesión, volvemos al señuelo por seguridad
+          navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
+        }
+      })();
+
+      return () => { alive = false; };
+    }, [navigation, route.params?.admin])
+  );
+
+  useEffect(() => {
+    const unsub = subscribeCount(setOutboxCount);
+    return unsub;
+  }, []);
+
+  const { storageKeyV, storageKeyO } = useMemo(() => {
+    const d = hoyApp;
+    return {
+      storageKeyV: `home:${admin}:${d}:visitados`,
+      storageKeyO: `home:${admin}:${d}:omitidos`,
+    };
+  }, [admin, hoyApp]);
+
+  useEffect(() => {
+    // ⛑️ Evita tocar almacenamiento si aún no tenemos admin
+    if (!admin) return;
+
+    const loadLists = async () => {
+      const oldV = await AsyncStorage.getItem('visitadosHoy');
+      const oldO = await AsyncStorage.getItem('omitidosHoy');
+      if (oldV) { await AsyncStorage.setItem(storageKeyV, oldV); await AsyncStorage.removeItem('visitadosHoy'); }
+      if (oldO) { await AsyncStorage.setItem(storageKeyO, oldO); await AsyncStorage.removeItem('omitidosHoy'); }
+
+      const [v, o] = await Promise.all([
+        AsyncStorage.getItem(storageKeyV),
+        AsyncStorage.getItem(storageKeyO),
+      ]);
+      setVisitadosHoy(v ? JSON.parse(v) : []);
+      setOmitidosHoy(o ? JSON.parse(o) : []);
+    };
+    loadLists();
+  }, [admin, storageKeyV, storageKeyO]);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      const t = todayInTZ(tzSession);
+      if (t !== hoyApp) setHoyApp(t);
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [hoyApp]);
+
+  useEffect(() => {
+    // @ts-ignore — tu tipo Home ya lo ampliamos con refreshToken?: number
+    const token = route.params?.refreshToken;
+    if (token) {
+      handleManualRefresh();
+      // limpiar param para no re-disparar
+      navigation.setParams({ refreshToken: undefined } as any);
+    }
+  }, [route.params?.refreshToken]);
+
+  // 🆕 asegurar que todos los clientes tengan routeOrder (best-effort)
+  useEffect(() => {
+    if (!admin) return;
+    (async () => {
+      try { await ensureRouteOrder(admin); } catch (e) { console.warn('[ensureRouteOrder]', e); }
+    })();
+  }, [admin, refreshKey]);
+
+  // 🆕 cargar orden de ruta al enfocar la pantalla
+  useFocusEffect(
+    React.useCallback(() => {
+      let alive = true;
+      (async () => {
+        if (!admin) return; // 👈 evita leer sin admin
+        try {
+          const ids = await loadRutaOrder(admin);
+          if (alive) setRouteOrderIds(ids);
+        } catch (e) {
+          console.warn('[loadRutaOrder]', e);
+        }
+      })();
+      return () => { alive = false; };
+    }, [admin])
+  );
+
+  // 👇 NUEVO: Hidratar desde cache al iniciar
+  useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const u = await AsyncStorage.getItem('usuarioSesion');
-        if (!alive) return;
-
-        if (!u) {
-          // 🔄 si no hay sesión, vuelve al señuelo retro
-          navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
-          return;
-        }
-
-        // Si hay sesión pero Home no recibió admin por params, lo inyectamos
-        if (!route.params?.admin) {
-          navigation.setParams({ admin: u } as any);
+        if (!admin) return;
+        const snap = await loadCatalogSnapshot(admin);
+        if (alive && snap) {
+          // prestamos: directo
+          setPrestamosRaw(Array.isArray(snap.prestamos) ? (snap.prestamos as any) : []);
+          // clientes: convertir a mapa
+          if (Array.isArray(snap.clientes)) {
+            const map: Record<string, Cliente> = {};
+            for (const c of snap.clientes as any[]) {
+              if (c?.id) map[c.id] = c as Cliente;
+            }
+            setClientesMap(map);
+          }
+          setUltimaActualizacion(snap.ts || Date.now());
         }
       } catch {
-        // Si hay error leyendo sesión, volvemos al señuelo por seguridad
-        navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
-      }
-    })();
-
-    return () => { alive = false; };
-  }, [navigation, route.params?.admin])
-);
-
-useEffect(() => {
-  const unsub = subscribeCount(setOutboxCount);
-  return unsub;
-}, []);
-
-const { storageKeyV, storageKeyO } = useMemo(() => {
-  const d = hoyApp;
-  return {
-    storageKeyV: `home:${admin}:${d}:visitados`,
-    storageKeyO: `home:${admin}:${d}:omitidos`,
-  };
-}, [admin, hoyApp]);
-
-useEffect(() => {
-  // ⛑️ Evita tocar almacenamiento si aún no tenemos admin
-  if (!admin) return;
-
-  const loadLists = async () => {
-    const oldV = await AsyncStorage.getItem('visitadosHoy');
-    const oldO = await AsyncStorage.getItem('omitidosHoy');
-    if (oldV) { await AsyncStorage.setItem(storageKeyV, oldV); await AsyncStorage.removeItem('visitadosHoy'); }
-    if (oldO) { await AsyncStorage.setItem(storageKeyO, oldO); await AsyncStorage.removeItem('omitidosHoy'); }
-
-    const [v, o] = await Promise.all([
-      AsyncStorage.getItem(storageKeyV),
-      AsyncStorage.getItem(storageKeyO),
-    ]);
-    setVisitadosHoy(v ? JSON.parse(v) : []);
-    setOmitidosHoy(o ? JSON.parse(o) : []);
-  };
-  loadLists();
-}, [admin, storageKeyV, storageKeyO]);
-
-useEffect(() => {
-  const id = setInterval(() => {
-    const t = todayInTZ(tzSession);
-    if (t !== hoyApp) setHoyApp(t);
-  }, 60_000);
-  return () => clearInterval(id);
-}, [hoyApp]);
-
-useEffect(() => {
-  // @ts-ignore — tu tipo Home ya lo ampliamos con refreshToken?: number
-  const token = route.params?.refreshToken;
-  if (token) {
-    handleManualRefresh();
-    // limpiar param para no re-disparar
-    navigation.setParams({ refreshToken: undefined } as any);
-  }
-}, [route.params?.refreshToken]);
-
-// 🆕 asegurar que todos los clientes tengan routeOrder (best-effort)
-useEffect(() => {
-  if (!admin) return;
-  (async () => {
-    try { await ensureRouteOrder(admin); } catch (e) { console.warn('[ensureRouteOrder]', e); }
-  })();
-}, [admin, refreshKey]);
-
-// 🆕 cargar orden de ruta al enfocar la pantalla
-useFocusEffect(
-  React.useCallback(() => {
-    let alive = true;
-    (async () => {
-      if (!admin) return; // 👈 evita leer sin admin
-      try {
-        const ids = await loadRutaOrder(admin);
-        if (alive) setRouteOrderIds(ids);
-      } catch (e) {
-        console.warn('[loadRutaOrder]', e);
+        // ignore cache errors
       }
     })();
     return () => { alive = false; };
-  }, [admin])
-);
+  }, [admin]);
 
-// 👇 NUEVO: Hidratar desde cache al iniciar
-useEffect(() => {
-  let alive = true;
-  (async () => {
-    try {
-      if (!admin) return;
-      const snap = await loadCatalogSnapshot(admin);
-      if (alive && snap) {
-        // prestamos: directo
-        setPrestamosRaw(Array.isArray(snap.prestamos) ? (snap.prestamos as any) : []);
-        // clientes: convertir a mapa
-        if (Array.isArray(snap.clientes)) {
-          const map: Record<string, Cliente> = {};
-          for (const c of snap.clientes as any[]) {
-            if (c?.id) map[c.id] = c as Cliente;
-          }
-          setClientesMap(map);
-        }
-        setUltimaActualizacion(snap.ts || Date.now());
-      }
-    } catch {
-      // ignore cache errors
-    }
-  })();
-  return () => { alive = false; };
-}, [admin]);
+  // 🧾 Suscripción a cajaDiaria para KPI “cobrado hoy”
+  useEffect(() => {
+    if (!admin) return; // 👈 evita query sin admin
 
-// 🧾 Suscripción a cajaDiaria para KPI “cobrado hoy”
-useEffect(() => {
-  if (!admin) return; // 👈 evita query sin admin
-
-  setTieneCajaSnapshot(false);
-  setCobradoHoy(0);
-
-  try {
-    const qCaja = query(
-      collection(db, 'cajaDiaria'),
-      where('admin', '==', admin),
-      where('operationalDate', '==', hoyApp)
-    );
-    const unsub = onSnapshot(
-      qCaja,
-      (snap) => {
-        let total = 0;
-        snap.forEach((d) => {
-          const data = d.data() as any;
-          const m = Number(data?.monto || 0);
-          const tipo = String(data?.tipo || '');
-          // 👇 Solo los movimientos tipo 'abono' cuentan como cobrado
-          if (tipo === 'abono' && Number.isFinite(m)) {
-            total += m;
-          }
-        });
-        setCobradoHoy(total);
-        setTieneCajaSnapshot(true);
-      },
-      (err) => {
-        console.warn('[cajaDiaria] snapshot error:', err?.code || err?.message || err);
-        // Fallback legacy (tieneCajaSnapshot permanece false)
-      }
-    );
-    return () => unsub();
-  } catch (e) {
-    console.warn('[cajaDiaria] suscripción no disponible:', e);
-    return () => {};
-  }
-}, [admin, hoyApp, refreshKey]); // 👈 incluye refreshKey para “Actualizar ahora”
-
-// 👤 Suscripción en tiempo real a /clientes → mapa por id
-useEffect(() => {
-  let unsub: undefined | (() => void);
-  let alive = true;
-
-  setClientesLoaded(false);
-
-  try {
-    unsub = onSnapshot(
-      collection(db, 'clientes'),
-      (snap) => {
-        if (!alive) return;
-        const map: Record<string, Cliente> = {};
-        snap.forEach((d) => {
-          const data = d.data() as any;
-          map[d.id] = {
-            id: d.id,
-            nombre: data?.nombre,
-            alias: data?.alias,
-            direccion1: data?.direccion1,
-            direccion2: data?.direccion2,
-            telefono1: data?.telefono1,
-            telefono2: data?.telefono2,
-            // 🆕 tomar routeOrder si existe
-            routeOrder: typeof data?.routeOrder === 'number' ? data.routeOrder : undefined,
-          };
-        });
-        setClientesMap(map);
-        setClientesLoaded(true);
-      },
-      (err) => {
-        console.warn('[clientes] snapshot error:', err?.code || err?.message || err);
-        if (!alive) return;
-        setClientesMap({});
-        setClientesLoaded(false);
-      }
-    );
-  } catch (e) {
-    console.warn('[clientes] suscripción no disponible:', e);
-    setClientesMap({});
-    setClientesLoaded(false);
-  }
-
-  return () => {
-    alive = false;
-    try { unsub && unsub(); } catch {}
-  };
-}, [refreshKey]);
-
-// 🔐 Suscripción a préstamos del admin
-useEffect(() => {
-  if (!admin) return; // 👈 evita query sin admin
-
-  let unsub: (() => void) | undefined;
-
-  const suscribir = () => {
-    setCargando(true);
-    setCargaPrestamosOk(null);
-    setPrestamosLoaded(false); // ✅ NUEVO
+    setTieneCajaSnapshot(false);
+    setCobradoHoy(0);
 
     try {
-      const qPrestamos = query(
-        collectionGroup(db, 'prestamos'),
-        where('creadoPor', '==', admin)
+      const qCaja = query(
+        collection(db, 'cajaDiaria'),
+        where('admin', '==', admin),
+        where('operationalDate', '==', hoyApp)
       );
-
-      unsub = onSnapshot(
-        qPrestamos,
-        (sg) => {
-          const lista: Prestamo[] = [];
-          sg.forEach((docSnap) => {
-            const data = docSnap.data() as any;
-            lista.push({
-              id: docSnap.id,
-              concepto: (data.concepto ?? '').trim() || 'Sin nombre',
-              cobradorId: data.cobradorId ?? '',
-              montoTotal: data.montoTotal ?? data.totalPrestamo ?? 0,
-              totalPrestamo: data.totalPrestamo ?? data.montoTotal ?? 0,
-              restante: data.restante ?? 0,
-              abonos: Array.isArray(data.abonos) ? data.abonos : [],
-              creadoPor: data.creadoPor ?? '',
-              valorCuota: data.valorCuota ?? 0,
-              modalidad: data.modalidad ?? 'Diaria',
-              clienteId: data.clienteId,
-
-              // denormalizados tal como vengan (completaremos con clientesMap más abajo)
-              clienteAlias: data.clienteAlias ?? data.clienteNombre ?? '',
-              clienteDireccion1: data.clienteDireccion1 ?? '',
-              clienteDireccion2: data.clienteDireccion2 ?? '',
-              clienteTelefono1: data.clienteTelefono1 ?? '',
-
-              tz: data.tz || 'America/Sao_Paulo',
-              fechaInicio: data.fechaInicio,
-              creadoEn: data.creadoEn,
-              createdAtMs: data.createdAtMs,
-              diasHabiles: data.diasHabiles,
-              feriados: data.feriados,
-              pausas: data.pausas,
-              modoAtraso: data.modoAtraso,
-              permitirAdelantar: data.permitirAdelantar,
-              cuotas: data.cuotas,
-              diasAtraso: data.diasAtraso,
-              faltas: data.faltas,
-            });
-          });
-
-          setPrestamosRaw(lista);
-          setPrestamosLoaded(true); // ✅ NUEVO
-          setCargando(false);
-          setCargaPrestamosOk(true);
-
-          // Reconciliar atraso en lote pequeño
-          (async () => {
-            const candidatos = lista.filter((p) => Number(p.restante || 0) > 0);
-            const MAX_UPDATES = 10;
-            let count = 0;
-
-            for (const p of candidatos) {
-              if (count >= MAX_UPDATES) break;
-
-              const hoyLocal = todayInTZ(pickTZ(p?.tz, tzSession));
-              const diasHabiles =
-                Array.isArray(p?.diasHabiles) && p.diasHabiles.length
-                  ? p.diasHabiles
-                  : [1, 2, 3, 4, 5, 6];
-              const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
-              const pausas = Array.isArray(p?.pausas) ? p?.pausas : [];
-              const modo =
-                (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
-              const permitirAdelantar = !!p?.permitirAdelantar;
-              const cuotas =
-                Number(p?.cuotas || 0) ||
-                Math.ceil(
-                  Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
-                );
-
-              const calc = calcularDiasAtraso({
-                fechaInicio: p?.fechaInicio || hoyLocal,
-                hoy: hoyLocal,
-                cuotas,
-                valorCuota: Number(p?.valorCuota || 0),
-                abonos: (p?.abonos || []).map((a: any) => ({
-                  monto: Number(a.monto) || 0,
-                  operationalDate: a.operationalDate,
-                  fecha: a.fecha,
-                })),
-                diasHabiles,
-                feriados,
-                pausas,
-                modo,
-                permitirAdelantar,
-              });
-
-              if (calc.atraso !== Number(p.diasAtraso ?? -1)) {
-                try {
-                  const ref = doc(db, 'clientes', p.clienteId!, 'prestamos', p.id);
-                  await updateDoc(ref, {
-                    diasAtraso: calc.atraso,
-                    faltas: calc.faltas || [],
-                    ultimaReconciliacion: serverTimestamp(),
-                  });
-                  count++;
-                } catch (e) {
-                  console.warn('Reconciliación omitida para préstamo', p?.id, e);
-                }
-              }
+      const unsub = onSnapshot(
+        qCaja,
+        (snap) => {
+          let total = 0;
+          snap.forEach((d) => {
+            const data = d.data() as any;
+            const m = Number(data?.monto || 0);
+            const tipo = String(data?.tipo || '');
+            // 👇 Solo los movimientos tipo 'abono' cuentan como cobrado
+            if (tipo === 'abono' && Number.isFinite(m)) {
+              total += m;
             }
-          })();
+          });
+          setCobradoHoy(total);
+          setTieneCajaSnapshot(true);
         },
         (err) => {
-          console.warn('[prestamos] snapshot error:', err?.code || err?.message || err);
-          setCargando(false);
-          setCargaPrestamosOk(false);
-          setPrestamosRaw([]);
-          setPrestamosLoaded(false); // ✅ NUEVO
-          Alert.alert(
-            'Permisos insuficientes',
-            'No tienes permisos para leer los préstamos. Revisa tus reglas de Firestore.'
-          );
+          console.warn('[cajaDiaria] snapshot error:', err?.code || err?.message || err);
+          // Fallback legacy (tieneCajaSnapshot permanece false)
+        }
+      );
+      return () => unsub();
+    } catch (e) {
+      console.warn('[cajaDiaria] suscripción no disponible:', e);
+      return () => {};
+    }
+  }, [admin, hoyApp, refreshKey]); // 👈 incluye refreshKey para “Actualizar ahora”
+
+  // 👤 Suscripción en tiempo real a /clientes → mapa por id
+  useEffect(() => {
+    let unsub: undefined | (() => void);
+    let alive = true;
+
+    setClientesLoaded(false);
+
+    try {
+      unsub = onSnapshot(
+        collection(db, 'clientes'),
+        (snap) => {
+          if (!alive) return;
+          const map: Record<string, Cliente> = {};
+          snap.forEach((d) => {
+            const data = d.data() as any;
+            map[d.id] = {
+              id: d.id,
+              nombre: data?.nombre,
+              alias: data?.alias,
+              direccion1: data?.direccion1,
+              direccion2: data?.direccion2,
+              telefono1: data?.telefono1,
+              telefono2: data?.telefono2,
+              // 🆕 tomar routeOrder si existe
+              routeOrder: typeof data?.routeOrder === 'number' ? data.routeOrder : undefined,
+            };
+          });
+          setClientesMap(map);
+          setClientesLoaded(true);
+        },
+        (err) => {
+          console.warn('[clientes] snapshot error:', err?.code || err?.message || err);
+          if (!alive) return;
+          setClientesMap({});
+          setClientesLoaded(false);
         }
       );
     } catch (e) {
-      console.warn('[prestamos] suscripción no disponible:', e);
-      setCargando(false);
-      setCargaPrestamosOk(false);
+      console.warn('[clientes] suscripción no disponible:', e);
+      setClientesMap({});
+      setClientesLoaded(false);
+    }
+
+    return () => {
+      alive = false;
+      try { unsub && unsub(); } catch {}
+    };
+  }, [refreshKey]);
+
+  // 🔐 Suscripción a préstamos del admin
+  useEffect(() => {
+    if (!admin) return; // 👈 evita query sin admin
+
+    let unsub: (() => void) | undefined;
+
+    const suscribir = () => {
+      setCargando(true);
+      setCargaPrestamosOk(null);
       setPrestamosLoaded(false); // ✅ NUEVO
-    }
-  };
 
-  suscribir();
-  return () => {
-    try { unsub && unsub(); } catch {}
-  };
-}, [admin, tzSession]);
+      try {
+        const qPrestamos = query(
+          collectionGroup(db, 'prestamos'),
+          where('creadoPor', '==', admin)
+        );
 
-// 👇 NUEVO: Guardar snapshot en cache cuando AMBAS fuentes estén listas
-useEffect(() => {
-  if (!admin) return;
-  if (!clientesLoaded || !prestamosLoaded) return;
-  const clientesArr = Object.values(clientesMap);
-  // Guardamos snapshot best-effort (no bloquea la UI)
-  void (async () => {
-    try {
-      await saveCatalogSnapshot(admin, { clientes: clientesArr as any, prestamos: prestamosRaw as any });
-      setUltimaActualizacion(Date.now());
-    } catch {
-      // ignore
-    }
-  })();
-}, [admin, clientesLoaded, prestamosLoaded, clientesMap, prestamosRaw]);
+        unsub = onSnapshot(
+          qPrestamos,
+          (sg) => {
+            const lista: Prestamo[] = [];
+            sg.forEach((docSnap) => {
+              const data = docSnap.data() as any;
+              lista.push({
+                id: docSnap.id,
+                concepto: (data.concepto ?? '').trim() || 'Sin nombre',
+                cobradorId: data.cobradorId ?? '',
+                montoTotal: data.montoTotal ?? data.totalPrestamo ?? 0,
+                totalPrestamo: data.totalPrestamo ?? data.montoTotal ?? 0,
+                restante: data.restante ?? 0,
+                abonos: Array.isArray(data.abonos) ? data.abonos : [],
+                creadoPor: data.creadoPor ?? '',
+                valorCuota: data.valorCuota ?? 0,
+                modalidad: data.modalidad ?? 'Diaria',
+                clienteId: data.clienteId,
+
+                // denormalizados tal como vengan (completaremos con clientesMap más abajo)
+                clienteAlias: data.clienteAlias ?? data.clienteNombre ?? '',
+                clienteDireccion1: data.clienteDireccion1 ?? '',
+                clienteDireccion2: data.clienteDireccion2 ?? '',
+                clienteTelefono1: data.clienteTelefono1 ?? '',
+
+                tz: data.tz || 'America/Sao_Paulo',
+                fechaInicio: data.fechaInicio,
+                creadoEn: data.creadoEn,
+                createdAtMs: data.createdAtMs,
+                diasHabiles: data.diasHabiles,
+                feriados: data.feriados,
+                pausas: data.pausas,
+                modoAtraso: data.modoAtraso,
+                permitirAdelantar: data.permitirAdelantar,
+                cuotas: data.cuotas,
+                diasAtraso: data.diasAtraso,
+                faltas: data.faltas,
+              });
+            });
+
+            setPrestamosRaw(lista);
+            setPrestamosLoaded(true); // ✅ NUEVO
+            setCargando(false);
+            setCargaPrestamosOk(true);
+
+            // Reconciliar atraso en lote pequeño
+            (async () => {
+              const candidatos = lista.filter((p) => Number(p.restante || 0) > 0);
+              const MAX_UPDATES = 10;
+              let count = 0;
+
+              for (const p of candidatos) {
+                if (count >= MAX_UPDATES) break;
+
+                const hoyLocal = todayInTZ(pickTZ(p?.tz, tzSession));
+                const diasHabiles =
+                  Array.isArray(p?.diasHabiles) && p.diasHabiles.length
+                    ? p.diasHabiles
+                    : [1, 2, 3, 4, 5, 6];
+                const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
+                const pausas = Array.isArray(p?.pausas) ? p?.pausas : [];
+                const modo =
+                  (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
+                const permitirAdelantar = !!p?.permitirAdelantar;
+                const cuotas =
+                  Number(p?.cuotas || 0) ||
+                  Math.ceil(
+                    Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
+                  );
+
+                const calc = calcularDiasAtraso({
+                  fechaInicio: p?.fechaInicio || hoyLocal,
+                  hoy: hoyLocal,
+                  cuotas,
+                  valorCuota: Number(p?.valorCuota || 0),
+                  abonos: (p?.abonos || []).map((a: any) => ({
+                    monto: Number(a.monto) || 0,
+                    operationalDate: a.operationalDate,
+                    fecha: a.fecha,
+                  })),
+                  diasHabiles,
+                  feriados,
+                  pausas,
+                  modo,
+                  permitirAdelantar,
+                });
+
+                if (calc.atraso !== Number(p.diasAtraso ?? -1)) {
+                  try {
+                    const ref = doc(db, 'clientes', p.clienteId!, 'prestamos', p.id);
+                    await updateDoc(ref, {
+                      diasAtraso: calc.atraso,
+                      faltas: calc.faltas || [],
+                      ultimaReconciliacion: serverTimestamp(),
+                    });
+                    count++;
+                  } catch (e) {
+                    console.warn('Reconciliación omitida para préstamo', p?.id, e);
+                  }
+                }
+              }
+            })();
+          },
+          (err) => {
+            console.warn('[prestamos] snapshot error:', err?.code || err?.message || err);
+            setCargando(false);
+            setCargaPrestamosOk(false);
+            setPrestamosRaw([]);
+            setPrestamosLoaded(false); // ✅ NUEVO
+            Alert.alert(
+              'Permisos insuficientes',
+              'No tienes permisos para leer los préstamos. Revisa tus reglas de Firestore.'
+            );
+          }
+        );
+      } catch (e) {
+        console.warn('[prestamos] suscripción no disponible:', e);
+        setCargando(false);
+        setCargaPrestamosOk(false);
+        setPrestamosLoaded(false); // ✅ NUEVO
+      }
+    };
+
+    suscribir();
+    return () => {
+      try { unsub && unsub(); } catch {}
+    };
+  }, [admin, tzSession]);
+
+  // 👇 NUEVO: Guardar snapshot en cache cuando AMBAS fuentes estén listas
+  useEffect(() => {
+    if (!admin) return;
+    if (!clientesLoaded || !prestamosLoaded) return;
+    const clientesArr = Object.values(clientesMap);
+    // Guardamos snapshot best-effort (no bloquea la UI)
+    void (async () => {
+      try {
+        await saveCatalogSnapshot(admin, { clientes: clientesArr as any, prestamos: prestamosRaw as any });
+        setUltimaActualizacion(Date.now());
+      } catch {
+        // ignore
+      }
+    })();
+  }, [admin, clientesLoaded, prestamosLoaded, clientesMap, prestamosRaw]);
+
+  // ✅ NUEVO: saneador de caja al abrir Home (una sola vez cuando hay admin)
+  const saneadorOnce = useRef(false);
+  useEffect(() => {
+    if (!admin || saneadorOnce.current) return;
+    saneadorOnce.current = true;
+
+    (async () => {
+      try {
+        const tz = pickTZ(undefined, tzSession);
+        const hoy = todayInTZ(tz);
+        await closeMissingDays(admin, hoy, tz);
+        await ensureAperturaDeHoy(admin, hoy, tz);
+      } catch (e: any) {
+        console.warn('[Home] saneador error:', e?.message || e);
+      }
+    })();
+  }, [admin, tzSession]);
 
   // 🔄 Merge en vivo: prestamosRaw + clientesMap
   const prestamos: Prestamo[] = useMemo(() => {

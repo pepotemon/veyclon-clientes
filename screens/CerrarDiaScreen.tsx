@@ -1,4 +1,4 @@
-// screens/CerrarDiaScreen.tsx
+// screens/CerrarDiaScreen.tsx (versión ajustada)
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { SafeAreaView, View, Text, StyleSheet, ActivityIndicator, Alert } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -6,21 +6,17 @@ import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
 import { db } from '../firebase/firebaseConfig';
 import {
-  addDoc,
   collection,
   collectionGroup,
   doc,
   getDocs,
   onSnapshot,
-  orderBy,
   query,
-  serverTimestamp,
   where,
 } from 'firebase/firestore';
 import { pickTZ, todayInTZ, normYYYYMMDD } from '../utils/timezone';
-// ⬇️ CAMBIO: usar registrarCierre (y seguimos usando ensureAperturaDeHoy)
-import { ensureAperturaDeHoy, registrarCierre } from '../utils/cajaEstado';
-import { logAudit, pick } from '../utils/auditLogs';
+import { ensureAperturaDeHoy, closeMissingDays } from '../utils/cajaEstado';
+import { canonicalTipo } from '../utils/movimientoHelper';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'CerrarDia'>;
 
@@ -92,13 +88,6 @@ export default function CerrarDiaScreen({ route }: Props) {
     dt.setUTCDate(dt.getUTCDate() + days);
     return formatDateToYMD(dt, tzLocal);
   }
-
-  // ⛔️ Quitado: ensureAperturaDeHoy al montar (creaba apertura antes de cerrar AYER).
-  // useEffect(() => {
-  //   ensureAperturaDeHoy(admin, hoy, tz).catch(e => {
-  //     console.warn('[CerrarDia] ensureAperturaDeHoy:', e?.message || e);
-  //   });
-  // }, [admin, hoy, tz]);
 
   // —— préstamos del cobrador
   useEffect(() => {
@@ -175,25 +164,29 @@ export default function CerrarDiaScreen({ route }: Props) {
 
           snap.forEach((d) => {
             const data = d.data() as any;
-            const m = Number(data?.monto || 0);
-            const tipo = String(data?.tipo || '');
-            if (!Number.isFinite(m)) return;
+            const tip = canonicalTipo(data?.tipo);
+            if (!tip) return;
 
+            const monto = Number(data?.monto ?? data?.balance ?? 0) || 0;
             const ts =
               (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
               (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
               0;
 
-            if (tipo === 'apertura' || tipo === 'aperturaAuto') {
-              if (ts >= lastAperturaTs) { lastAperturaTs = ts; lastAperturaMonto = m; }
-            } else if (tipo === 'abono' || tipo === 'pago') {
-              cobrado += m;
-            } else if (tipo === 'ingreso') {
-              ingresos += m;
-            } else if (tipo === 'retiro') {
-              retiros += m;
-            } else if (tipo === 'gastoAdmin') {
-              gastosAdmin += m;
+            switch (tip) {
+              case 'apertura':
+                if (ts >= lastAperturaTs) { lastAperturaTs = ts; lastAperturaMonto = monto; }
+                break;
+              case 'abono':
+                cobrado += monto; break;
+              case 'ingreso':
+                ingresos += monto; break;
+              case 'retiro':
+                retiros += monto; break;
+              case 'gasto_admin':
+                gastosAdmin += monto; break;
+              default:
+                break; // cierre y otros no suman en KPIs
             }
           });
 
@@ -289,7 +282,7 @@ export default function CerrarDiaScreen({ route }: Props) {
 
   const ingresos = kpiCaja.ingresos;
   const retiros = kpiCaja.retiros;
-  const gastos = kpiCaja.gastos; // solo gastoAdmin
+  const gastos = kpiCaja.gastos; // solo gasto_admin
 
   // Caja Inicial mostrada = saldo persistente si existe, si no, última apertura del día
   const cajaInicial = (cajaInicialPersistente ?? aperturaDelDia) || 0;
@@ -298,95 +291,22 @@ export default function CerrarDiaScreen({ route }: Props) {
   const cajaFinalRaw = cajaInicial + ingresos + cobrado - retiros - prestamosDelDia - gastos;
   const cajaFinal = useMemo(() => Math.round(cajaFinalRaw * 100) / 100, [cajaFinalRaw]);
 
-  // ====== CIERRE AUTOMÁTICO AL INICIAR NUEVO DÍA ======
+  // ====== SANEADOR: Cierra días pendientes y luego asegura apertura de HOY ======
   const autoCloseGuard = useRef(false);
   useEffect(() => {
     if (autoCloseGuard.current) return;
     autoCloseGuard.current = true;
 
     (async () => {
-      const ayer = addDaysYMD(hoy, -1, tz);
+      // 1) Cerrar en cadena días faltantes (si no abriste la app por 1–N días)
+      await closeMissingDays(admin, hoy, tz); // ← calcula KPIs y registra 'cierre' por cada día faltante
 
-      // 1) ¿ya existe un cierre para AYER?
-      const qCierreAyer = query(
-        collection(db, 'cajaDiaria'),
-        where('admin', '==', admin),
-        where('operationalDate', '==', ayer),
-        where('tipo', '==', 'cierre')
-      );
-      const cierreSnap = await getDocs(qCierreAyer);
-      const yaCerrado = !cierreSnap.empty;
-
-      if (!yaCerrado) {
-        // 2) Agregar KPIs de AYER desde cajaDiaria (para calcular balance)
-        const qDiaAyer = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', ayer),
-          orderBy('createdAt', 'asc')
-        );
-        const movSnap = await getDocs(qDiaAyer);
-
-        let lastAperturaMonto = 0;
-        let lastAperturaTs = -1;
-        let _abonos = 0, _ingresos = 0, _retiros = 0, _gastosAdmin = 0;
-
-        movSnap.forEach((d) => {
-          const data = d.data() as any;
-          const m = Number(data?.monto || 0);
-          const tipo = String(data?.tipo || '');
-          if (!Number.isFinite(m)) return;
-
-          const ts =
-            (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
-            (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
-            0;
-
-          if (tipo === 'apertura' || tipo === 'aperturaAuto') {
-            if (ts >= lastAperturaTs) { lastAperturaTs = ts; lastAperturaMonto = m; }
-          } else if (tipo === 'abono' || tipo === 'pago') {
-            _abonos += m;
-          } else if (tipo === 'ingreso') {
-            _ingresos += m;
-          } else if (tipo === 'retiro') {
-            _retiros += m;
-          } else if (tipo === 'gastoAdmin') {
-            _gastosAdmin += m;
-          }
-        });
-
-        // 3) “Préstamos” de AYER (solo valorNeto)
-        const prestamosSnap = await getDocs(query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin)));
-        let _prestamosAyer = 0;
-        prestamosSnap.forEach((d) => {
-          const p = d.data() as any;
-          const tzP = pickTZ(p?.tz, tz);
-          const startYmd = anyDateToYYYYMMDD(
-            (typeof p?.createdAtMs === 'number' ? p.createdAtMs : (p?.createdAt ?? p?.fechaInicio)),
-            tzP
-          );
-          if (startYmd === ayer) {
-            const capital = Number(p?.valorNeto ?? p?.capital ?? 0);
-            if (Number.isFinite(capital) && capital > 0) _prestamosAyer += capital;
-          }
-        });
-
-        // 4) Caja inicial AYER (si no hubo apertura en AYER, usamos cajaInicial actual como fallback)
-        const cajaInicialAyer = (lastAperturaMonto || cajaInicial);
-
-        // 5) Caja final AYER
-        const cajaFinalAyer = Math.round((cajaInicialAyer + _ingresos + _abonos - _retiros - _prestamosAyer - _gastosAdmin) * 100) / 100;
-
-        // 6) Registrar cierre (esto actualiza cajaEstado.saldoActual)
-        await registrarCierre(admin, ayer, cajaFinalAyer, tz);
-      }
-
-      // 7) Ahora sí, asegurar APERTURA de HOY (basada en el cierre de AYER)
+      // 2) Ahora sí, asegurar APERTURA de HOY (basada en el CIERRE inmediato anterior)
       await ensureAperturaDeHoy(admin, hoy, tz);
     })().catch((e) => {
-      console.warn('[CerrarDia] auto-cierre error:', e?.message || e);
+      console.warn('[CerrarDia] auto-saneador error:', e?.message || e);
     });
-  }, [admin, hoy, tz, cajaInicial]);
+  }, [admin, hoy, tz]);
 
   // ====== UI ======
   return (
@@ -420,9 +340,9 @@ export default function CerrarDiaScreen({ route }: Props) {
 
           {/* Clientes */}
           <Card title="Clientes" palette={palette}>
-            <Row label="Programados" value={totalProgramados} palette={palette} />
+            <Row label="Programados" value={prestamos.length} palette={palette} />
             <Row label="Visitados" value={visitadosHoy} palette={palette} />
-            <Row label="Pendientes" value={pendientes} palette={palette} />
+            <Row label="Pendientes" value={Math.max(0, prestamos.length - visitadosHoy)} palette={palette} />
           </Card>
 
           {/* Resultado */}

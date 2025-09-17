@@ -1,7 +1,6 @@
 // utils/cajaManual.ts
-import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
-import { db } from '../firebase/firebaseConfig';
-import { logAudit, pick } from './auditLogs';
+import { addMovimiento, addMovimientoIdempotente } from './caja';
+import { pickTZ, todayInTZ, normYYYYMMDD } from './timezone';
 
 /**
  * Estructura base SIN 'admin' (admin se pasa como 1er argumento).
@@ -12,17 +11,11 @@ type BaseNoAdmin = {
   nota?: string | null;
 };
 
-function normMonto(n: number): number {
-  const x = Number(n || 0);
-  if (!Number.isFinite(x) || x < 0) return 0;
-  return Math.round(x * 100) / 100;
-}
-
 /**
  * Registra una APERTURA manual del día (tipo canónico: 'apertura').
- * - Escribe un documento en 'cajaDiaria'
- * - Deja rastro en 'auditLogs' (caja_apertura)
- * - Devuelve el ID del documento creado
+ * - Escribe un documento en 'cajaDiaria' (idempotente por admin+fecha).
+ * - NO modifica cajaEstado.saldoActual (eso se hace en DefinirCajaScreen con setSaldoActual).
+ * - Devuelve el ID del documento creado (o existente).
  */
 export async function setCajaInicial(
   admin: string,
@@ -31,68 +24,52 @@ export async function setCajaInicial(
   tz: string,
   nota?: string,
 ): Promise<string> {
-  const payload = {
-    tipo: 'apertura' as const, // canónico
+  const tzOk = pickTZ(tz);
+  const op = normYYYYMMDD(operationalDate) || todayInTZ(tzOk);
+
+  // Id determinístico → evita aperturas duplicadas el mismo día
+  const docId = `ap_${admin}_${op}`;
+
+  const res = await addMovimientoIdempotente(
     admin,
-    monto: normMonto(monto),
-    operationalDate,
-    tz,
-    nota: (nota ?? '').trim() ? nota!.trim() : null,
-    createdAt: serverTimestamp(),
-    createdAtMs: Date.now(),
-    source: 'manual' as const,
-  };
+    {
+      tipo: 'apertura',
+      monto,
+      operationalDate: op,
+      tz: tzOk,
+      nota: (nota ?? '').trim() || undefined,
+      source: 'manual',
+    },
+    docId
+  );
 
-  const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
-
-  await logAudit({
-    userId: admin,
-    action: 'caja_apertura',
-    ref,
-    before: null,
-    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','source']),
-  });
-
-  return ref.id;
+  return res.id;
 }
 
 /**
  * Registra un movimiento MANUAL de 'ingreso' o 'retiro' (tipos canónicos).
  * - Escribe un documento en 'cajaDiaria'
- * - Deja rastro en 'auditLogs' (caja_ingreso / caja_retiro)
  * - Devuelve el ID del documento creado
  */
 export async function addMovimientoManual(
   admin: string,
   data: BaseNoAdmin & { tipo: 'ingreso' | 'retiro'; monto: number },
 ): Promise<string> {
-  const payload = {
-    tipo: data.tipo, // 'ingreso' | 'retiro' (canónicos)
-    admin,
-    monto: normMonto(data.monto),
-    operationalDate: data.operationalDate,
-    tz: data.tz,
-    nota: (data.nota ?? '').trim() ? data.nota!.trim() : null,
-    createdAt: serverTimestamp(),
-    createdAtMs: Date.now(),
-    source: 'manual' as const,
-  };
+  const tzOk = pickTZ(data.tz);
+  const op = normYYYYMMDD(data.operationalDate)!;
 
-  const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
-
-  await logAudit({
-    userId: admin,
-    action: data.tipo === 'ingreso' ? 'caja_ingreso' : 'caja_retiro',
-    ref,
-    before: null,
-    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','source']),
+  return addMovimiento(admin, {
+    tipo: data.tipo, // canónico
+    monto: data.monto,
+    operationalDate: op,
+    tz: tzOk,
+    nota: (data.nota ?? '').trim() || undefined,
+    source: 'manual',
   });
-
-  return ref.id;
 }
 
 /**
- * (Opcional) Registra un GASTO ADMINISTRATIVO.
+ * Registra un GASTO ADMINISTRATIVO.
  * - Tipo canónico: 'gasto_admin'
  * - Este SÍ se incluye en el cierre.
  */
@@ -100,63 +77,39 @@ export async function addGastoAdmin(
   admin: string,
   data: BaseNoAdmin & { categoria?: string; monto: number },
 ): Promise<string> {
-  const payload = {
-    tipo: 'gasto_admin' as const, // canónico (cuenta en cierre)
-    admin,
+  const tzOk = pickTZ(data.tz);
+  const op = normYYYYMMDD(data.operationalDate)!;
+
+  return addMovimiento(admin, {
+    tipo: 'gasto_admin',
+    monto: data.monto,
+    operationalDate: op,
+    tz: tzOk,
     categoria: (data.categoria ?? '').trim() || 'Gasto admin',
-    monto: normMonto(data.monto),
-    operationalDate: data.operationalDate,
-    tz: data.tz,
-    nota: (data.nota ?? '').trim() ? data.nota!.trim() : null,
-    createdAt: serverTimestamp(),
-    createdAtMs: Date.now(),
-    source: 'manual' as const,
-  };
-
-  const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
-
-  await logAudit({
-    userId: admin,
-    action: 'caja_gasto_admin',
-    ref,
-    before: null,
-    after: pick(payload, ['tipo','admin','categoria','monto','operationalDate','tz','nota','source']),
+    nota: (data.nota ?? '').trim() || undefined,
+    source: 'manual',
   });
-
-  return ref.id;
 }
 
 /**
- * (Opcional) Registra un GASTO DEL COBRADOR.
+ * Registra un GASTO DEL COBRADOR.
  * - Tipo canónico: 'gasto_cobrador'
- * - Este NO se incluye en el cierre (solo se lista en pantallas del cobrador).
+ * - Este NO se incluye en el cierre (solo informativo para el cobrador).
  */
 export async function addGastoCobrador(
   admin: string,
   data: BaseNoAdmin & { categoria?: string; monto: number },
 ): Promise<string> {
-  const payload = {
-    tipo: 'gasto_cobrador' as const, // canónico (no cuenta en cierre)
-    admin,
+  const tzOk = pickTZ(data.tz);
+  const op = normYYYYMMDD(data.operationalDate)!;
+
+  return addMovimiento(admin, {
+    tipo: 'gasto_cobrador',
+    monto: data.monto,
+    operationalDate: op,
+    tz: tzOk,
     categoria: (data.categoria ?? '').trim() || 'Gasto cobrador',
-    monto: normMonto(data.monto),
-    operationalDate: data.operationalDate,
-    tz: data.tz,
-    nota: (data.nota ?? '').trim() ? data.nota!.trim() : null,
-    createdAt: serverTimestamp(),
-    createdAtMs: Date.now(),
-    source: 'cobrador' as const,
-  };
-
-  const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
-
-  await logAudit({
-    userId: admin,
-    action: 'caja_gasto',
-    ref,
-    before: null,
-    after: pick(payload, ['tipo','admin','categoria','monto','operationalDate','tz','nota','source']),
+    nota: (data.nota ?? '').trim() || undefined,
+    source: 'manual',
   });
-
-  return ref.id;
 }

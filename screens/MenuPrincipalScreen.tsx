@@ -1,5 +1,5 @@
 // screens/MenuPrincipalScreen.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -18,6 +18,10 @@ import { useAppTheme } from '../theme/ThemeProvider';
 // ✅ helpers de sesión (consistentes con Ajustes)
 import { getSessionUser, clearSession } from '../utils/session';
 
+// ✅ saneador de caja
+import { closeMissingDays, ensureAperturaDeHoy } from '../utils/cajaEstado';
+import { pickTZ, todayInTZ } from '../utils/timezone';
+
 type Props = {
   navigation: NativeStackNavigationProp<RootStackParamList, 'MenuPrincipal'>;
 };
@@ -34,6 +38,7 @@ export default function MenuPrincipalScreen({ navigation }: Props) {
   const [admin, setAdmin] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
 
+  // carga de sesión
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -42,6 +47,24 @@ export default function MenuPrincipalScreen({ navigation }: Props) {
     })();
     return () => { alive = false; };
   }, []);
+
+  // ✅ Al tener admin, sanea días pendientes y asegura apertura de HOY (una sola vez)
+  const saneadorOnce = useRef(false);
+  useEffect(() => {
+    if (!admin || saneadorOnce.current) return;
+    saneadorOnce.current = true;
+
+    (async () => {
+      try {
+        const tz = pickTZ();
+        const hoy = todayInTZ(tz);
+        await closeMissingDays(admin, hoy, tz);
+        await ensureAperturaDeHoy(admin, hoy, tz);
+      } catch (e: any) {
+        console.warn('[MenuPrincipal] saneador error:', e?.message || e);
+      }
+    })();
+  }, [admin]);
 
   // ✅ Cerrar sesión → confirmar, limpiar y resetear a DecoyRetro
   const cerrarSesion = () => {

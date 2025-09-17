@@ -8,31 +8,45 @@ export type MovimientoTipo =
   | 'apertura'
   | 'cierre';
 
+// Normaliza: quita acentos, separa camelCase, pasa a minúsculas y reemplaza espacios/guiones por "_"
+function normToken(raw: any): string {
+  const s = String(raw ?? '')
+    // separa camelCase -> "gastoAdmin" => "gasto_Admin"
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // sin acentos
+    .toLowerCase().trim()
+    .replace(/[\s\-]+/g, '_')        // espacios/guiones -> _
+    .replace(/__+/g, '_');           // colapsa dobles
+  return s;
+}
+
 // Mapea lo viejo a lo canónico (compatibilidad hacia atrás)
 export function canonicalTipo(raw: any): MovimientoTipo | null {
-  const t = String(raw || '').trim();
-  switch (t) {
-    case 'abono':
-    case 'pago':
-      return 'abono';
-    case 'gastoAdmin':
-    case 'gasto_admin':
-      return 'gasto_admin';
-    case 'gastoCobrador':
-    case 'gasto_cobrador':
-      return 'gasto_cobrador';
-    case 'ingreso':
-      return 'ingreso';
-    case 'retiro':
-      return 'retiro';
-    case 'apertura':
-    case 'aperturaAuto':
-      return 'apertura';
-    case 'cierre':
-      return 'cierre';
-    default:
-      return null;
+  if (raw == null) return null;
+  const t = normToken(raw);
+
+  // Abonos / pagos
+  if (['abono', 'pago', 'pago_diario', 'payment', 'pay'].includes(t)) return 'abono';
+
+  // Gastos administrativos (preferencia al cierre si era ambiguo "gasto")
+  if (['gasto_admin', 'gasto', 'gasto_caja', 'gasto_administrativo', 'gasto_admin_manual'].includes(t)) {
+    return 'gasto_admin';
   }
+
+  // Gasto del cobrador (no entra al cierre)
+  if (['gasto_cobrador', 'gasto_cob'].includes(t)) return 'gasto_cobrador';
+
+  // Ingresos / Retiros
+  if (['ingreso', 'entrada', 'deposito'].includes(t)) return 'ingreso';
+  if (['retiro', 'extraccion', 'retiro_caja'].includes(t)) return 'retiro';
+
+  // Aperturas (manual/auto) → apertura
+  if (['apertura', 'apertura_auto', 'apertura_manual', 'aperturaauto'].includes(t)) return 'apertura';
+
+  // Cierres (manual/auto) → cierre
+  if (['cierre', 'cierre_auto', 'cierre_manual'].includes(t)) return 'cierre';
+
+  return null;
 }
 
 export function labelFor(tipo: MovimientoTipo): string {
@@ -48,7 +62,7 @@ export function labelFor(tipo: MovimientoTipo): string {
 }
 
 export function iconFor(tipo: MovimientoTipo): { name: string } {
-  // Nombres de MaterialCommunityIcons
+  // MaterialCommunityIcons
   switch (tipo) {
     case 'abono': return { name: 'check-circle' };
     case 'gasto_admin': return { name: 'receipt' };

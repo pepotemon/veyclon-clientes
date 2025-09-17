@@ -33,6 +33,13 @@ export type CajaResumen = {
   items: CajaItem[]; // lista completa para UI (incluye gasto_cobrador y cierre)
 };
 
+// —— helpers numéricos (sin -0.00)
+const r2 = (n: number) => {
+  const v = Math.round((Number(n) || 0) * 100) / 100;
+  return Math.abs(v) < 0.005 ? 0 : v;
+};
+const n2 = (v: any) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
 function calcResumenFromSnap(snap: QuerySnapshot<DocumentData>): CajaResumen {
   let aperturaMonto = 0;
   let aperturaTs = -1; // tomamos la apertura más reciente
@@ -54,9 +61,7 @@ function calcResumenFromSnap(snap: QuerySnapshot<DocumentData>): CajaResumen {
       0;
 
     // Para listado, intentamos siempre tener un monto razonable
-    const montoDoc = Number(
-      (data?.monto ?? data?.balance ?? 0)
-    ) || 0;
+    const montoDoc = n2(data?.monto ?? data?.balance ?? 0);
 
     // Acumuladores por tipo canónico
     switch (tip) {
@@ -64,21 +69,21 @@ function calcResumenFromSnap(snap: QuerySnapshot<DocumentData>): CajaResumen {
         // quedarse con la última apertura del día
         if (ts >= aperturaTs) {
           aperturaTs = ts;
-          aperturaMonto = Number(data?.monto || 0) || 0;
+          aperturaMonto = n2(data?.monto);
         }
         break;
       }
       case 'ingreso':
-        ingresos += Number(data?.monto || 0) || 0;
+        ingresos += n2(data?.monto);
         break;
       case 'abono':
-        abonos += Number(data?.monto || 0) || 0;
+        abonos += n2(data?.monto);
         break;
       case 'retiro':
-        retiros += Number(data?.monto || 0) || 0;
+        retiros += n2(data?.monto);
         break;
       case 'gasto_admin':
-        gastosAdmin += Number(data?.monto || 0) || 0;
+        gastosAdmin += n2(data?.monto);
         break;
       case 'gasto_cobrador':
         // NO cuenta en KPI de gastos del cierre
@@ -93,20 +98,27 @@ function calcResumenFromSnap(snap: QuerySnapshot<DocumentData>): CajaResumen {
     items.push({
       id: d.id,
       tipo: tip as CajaItem['tipo'],
-      monto: montoDoc,
-      nota: data?.nota ?? null,
+      monto: r2(montoDoc),
+      nota: (data?.nota ?? null) || null,
       createdAt: (data?.createdAt as Timestamp) ?? null,
     });
   });
 
-  const apertura = aperturaMonto;
-  const gastos = gastosAdmin;
-  const neto = apertura + ingresos + abonos - retiros - gastos;
+  const apertura = r2(aperturaMonto);
+  const gastos = r2(gastosAdmin);
+  const resumen = {
+    apertura,
+    ingresos: r2(ingresos),
+    abonos: r2(abonos),
+    retiros: r2(retiros),
+    gastos,
+  };
+  const neto = r2(resumen.apertura + resumen.ingresos + resumen.abonos - resumen.retiros - resumen.gastos);
 
-  // (opcional) podrías ordenar items por fecha desc si lo quisieras:
+  // (opcional) ordenar items por fecha desc:
   // items.sort((a, b) => (b.createdAt?.seconds ?? 0) - (a.createdAt?.seconds ?? 0));
 
-  return { apertura, ingresos, abonos, retiros, gastos, neto, items };
+  return { ...resumen, neto, items };
 }
 
 /** Carga una vez (fetch) */

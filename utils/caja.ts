@@ -9,7 +9,6 @@ import {
   doc,
   getDoc,
   setDoc,
-  DocumentReference,
 } from 'firebase/firestore';
 import { db } from '../firebase/firebaseConfig';
 import { logAudit, pick } from './auditLogs';
@@ -19,6 +18,9 @@ import {
   canonicalTipo,
   type MovimientoTipo,
 } from './movimientoHelper';
+
+// 👇 Normalización de fecha/TZ y redondeos seguros
+import { pickTZ, normYYYYMMDD } from './timezone';
 
 // ===== Tipos =====
 type LegacyMovimientoTipo = 'gasto' | 'gastoAdmin' | 'pago' | 'aperturaAuto';
@@ -39,6 +41,55 @@ export type MovimientoCaja = {
   source?: 'manual' | 'auto' | 'system';
 };
 
+const MIN_AMOUNT = 0.01;
+const round2 = (n: number) => {
+  const v = Math.round(Number(n) * 100) / 100;
+  return Math.abs(v) < 0.005 ? 0 : v; // evita -0.00
+};
+
+// 🚿 Quita claves con valor undefined (Firestore no las admite)
+function stripUndefined<T extends Record<string, any>>(obj: T): T {
+  const out: any = {};
+  for (const k in obj) {
+    if (obj[k] !== undefined) out[k] = obj[k];
+  }
+  return out;
+}
+
+function sanitizeInput(_admin: string, data: {
+  tipo: AnyMovimientoTipo;
+  admin?: string;
+  monto: any;
+  operationalDate: any;
+  tz?: string | null;
+  nota?: string | null;
+  categoria?: string;
+  meta?: Record<string, any>;
+  source?: MovimientoCaja['source'];
+}) {
+  const tip = canonicalTipo(String(data.tipo));
+  if (!tip) throw new Error(`Tipo de movimiento inválido: ${String(data.tipo)}`);
+
+  const monto = round2(Number(data.monto ?? NaN));
+  if (!Number.isFinite(monto) || monto < MIN_AMOUNT) {
+    throw new Error(`Monto inválido (< ${MIN_AMOUNT.toFixed(2)}): ${data.monto}`);
+  }
+
+  const operationalDate = normYYYYMMDD(data.operationalDate);
+  if (!operationalDate) throw new Error('operationalDate inválido');
+
+  const tz = pickTZ(data.tz || undefined);
+  const admin = (data.admin || _admin || '').trim();
+  if (!admin) throw new Error('admin requerido');
+
+  const nota = (data.nota ?? '').toString().trim() || null;          // null OK en Firestore
+  const categoria = (data.categoria ?? '').toString().trim() || undefined; // undefined será removido
+  const meta = data.meta && typeof data.meta === 'object' ? data.meta : undefined;
+  const source: MovimientoCaja['source'] = data.source || 'manual';
+
+  return { tip, admin, monto, operationalDate, tz, nota, categoria, meta, source };
+}
+
 // =============== Escritura clásica (no idempotente) ===============
 /** Escribe un movimiento en 'cajaDiaria'. Acepta tipos legacy y los mapea a canónicos. */
 export async function addMovimiento(
@@ -47,29 +98,31 @@ export async function addMovimiento(
         { tipo: AnyMovimientoTipo; admin?: string; source?: MovimientoCaja['source'] }
 ) {
   const refCol = collection(db, 'cajaDiaria');
-  const tip = canonicalTipo(data.tipo as string);
-  if (!tip) throw new Error(`Tipo de movimiento inválido: ${data.tipo}`);
+  const s = sanitizeInput(_admin, data);
 
   const payload = {
-    ...data,
-    tipo: tip, // 👈 siempre canónico
-    admin: data.admin || _admin,
+    tipo: s.tip,                 // 👈 siempre canónico
+    admin: s.admin,
+    monto: s.monto,
+    operationalDate: s.operationalDate,
+    tz: s.tz,
+    nota: s.nota,
+    categoria: s.categoria,
+    meta: s.meta,
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
-    source: data.source || 'manual',
+    source: s.source,
   };
 
-  const docRef = await addDoc(refCol, payload);
+  const docRef = await addDoc(refCol, stripUndefined(payload));
 
   // ---- AUDIT
   await logAudit({
-    userId: _admin,
+    userId: s.admin,
     action: 'create',
     ref: doc(db, 'cajaDiaria', docRef.id),
     before: null,
-    after: {
-      ...pick(payload, ['tipo', 'admin', 'monto', 'operationalDate', 'tz', 'nota', 'categoria', 'meta', 'source']),
-    },
+    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source']),
   });
 
   return docRef.id;
@@ -94,29 +147,31 @@ export async function addMovimientoIdempotente(
     return { created: false, id: ref.id };
   }
 
-  const tip = canonicalTipo(data.tipo as string);
-  if (!tip) throw new Error(`Tipo de movimiento inválido: ${data.tipo}`);
+  const s = sanitizeInput(_admin, data);
 
   const payload = {
-    ...data,
-    tipo: tip, // 👈 canónico
-    admin: data.admin || _admin,
+    tipo: s.tip,                 // 👈 canónico
+    admin: s.admin,
+    monto: s.monto,
+    operationalDate: s.operationalDate,
+    tz: s.tz,
+    nota: s.nota,
+    categoria: s.categoria,
+    meta: s.meta,
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
-    source: data.source || 'manual',
+    source: s.source,
   };
 
-  await setDoc(ref, payload);
+  await setDoc(ref, stripUndefined(payload));
 
   // ---- AUDIT
   await logAudit({
-    userId: _admin,
+    userId: s.admin,
     action: 'create',
     ref,
     before: null,
-    after: {
-      ...pick(payload, ['tipo', 'admin', 'monto', 'operationalDate', 'tz', 'nota', 'categoria', 'meta', 'source']),
-    },
+    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source']),
   });
 
   return { created: true, id: ref.id };
@@ -139,17 +194,24 @@ export async function recordAbonoFromOutbox(params: {
 }): Promise<{ created: boolean; id: string }> {
   const { admin, outboxId, monto, operationalDate, tz, meta, tipo = 'abono' } = params;
 
-  // Mapear a canónico
-  const tip = canonicalTipo(tipo);
-  if (!tip) throw new Error(`Tipo inválido para outbox: ${tipo}`);
+  // Mapear a canónico + reutilizar saneo
+  const { tip, admin: adm, monto: m, operationalDate: od, tz: tzOk } = sanitizeInput(admin, {
+    tipo,
+    admin,
+    monto,
+    operationalDate,
+    tz,
+    meta,
+    source: 'system',
+  });
 
   return addMovimientoIdempotente(
-    admin,
+    adm,
     {
-      tipo: tip, // 'abono' canónico
-      monto: Number(monto),
-      operationalDate,
-      tz,
+      tipo: tip,        // 'abono' canónico
+      monto: m,
+      operationalDate: od,
+      tz: tzOk,
       meta: { fromOutboxId: outboxId, ...(meta || {}) },
       source: 'system',
     },

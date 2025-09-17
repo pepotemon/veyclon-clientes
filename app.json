@@ -7,7 +7,9 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
-    "assetBundlePatterns": ["**/*"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -27,7 +29,8 @@
         "backgroundColor": "#ffffff"
       },
       "backgroundColor": "#121212",
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.pepotemon.veyclonclientes"
     },
     "androidStatusBar": {
       "barStyle": "light-content",
@@ -43,6 +46,11 @@
     },
     "plugins": [
       "expo-font"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4ac5a02e-c3f1-4b0b-9d6b-8b3d4b41953e"
+      }
+    }
   }
 }
