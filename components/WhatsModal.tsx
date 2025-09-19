@@ -7,6 +7,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { fillTemplatePT, TEMPLATES_PT } from '../utils/whatsTemplates';
 import { openWhats, sanitizePhone } from '../utils/whats';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 type Props = {
   visible: boolean;
@@ -24,6 +25,8 @@ const KEY_WHATS_AUTO_CLOSE = 'prefs:whatsAutoCloseAfterSend';
 export default function WhatsModal({
   visible, onClose, phone, nombre, valorCuota, onSent,
 }: Props) {
+  const insets = useSafeAreaInsets();
+
   // Solo recordatorio/cobranza (sin preview ni edición)
   const DEFAULT_KEY: keyof typeof TEMPLATES_PT = 'LEMBRETE_SIMPLES';
   const [templateKey, setTemplateKey] = useState<keyof typeof TEMPLATES_PT>(DEFAULT_KEY);
@@ -88,7 +91,7 @@ export default function WhatsModal({
         keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0}
       >
         <Pressable style={styles.backdrop} onPress={onClose} />
-        <View style={styles.sheet}>
+        <View style={[styles.sheet, { paddingBottom: 14 + Math.max(insets.bottom, 8) }]}>
           <Text style={styles.title}>Mensagem WhatsApp</Text>
 
           {/* Modelos (recordatório/cobrança) */}

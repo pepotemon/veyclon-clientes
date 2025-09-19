@@ -4,7 +4,6 @@ import {
   View,
   Text,
   StyleSheet,
-  SafeAreaView,
   ActivityIndicator,
   FlatList,
   TouchableOpacity,
@@ -18,14 +17,13 @@ import {
   getDoc,
   getDocs,
   collection,
-  query,
-  where,
-  collectionGroup,
 } from 'firebase/firestore';
 import { MaterialCommunityIcons as MIcon, Ionicons } from '@expo/vector-icons';
 import { format } from 'date-fns';
 import { todayInTZ, normYYYYMMDD, pickTZ } from '../utils/timezone';
 import { useAppTheme } from '../theme/ThemeProvider';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { calcularDiasAtraso } from '../utils/atrasoHelper';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'InfoCliente'>;
 
@@ -60,6 +58,14 @@ type Prestamo = {
   abonos: Abono[];
   tz?: string;
   fechaInicio?: string;
+
+  // opcionales (como en Home)
+  diasHabiles?: number[];
+  feriados?: string[];
+  pausas?: { desde: string; hasta: string; motivo?: string }[];
+  modoAtraso?: 'porPresencia' | 'porCuota';
+  permitirAdelantar?: boolean;
+  cuotas?: number;
 };
 
 type HistorialItem = {
@@ -85,7 +91,6 @@ function fmtDate(value: any, pattern = 'dd/MM/yyyy') {
   return format(d, pattern);
 }
 
-// ✅ icono seguro según género
 const iconoPorGenero = (g?: 'F' | 'M' | 'O') => {
   if (g === 'F') return 'account-outline' as const;
   if (g === 'M') return 'account-tie' as const;
@@ -95,12 +100,12 @@ const iconoPorGenero = (g?: 'F' | 'M' | 'O') => {
 export default function InfoClienteScreen({ route, navigation }: Props) {
   const { clienteId, nombreCliente, admin } = route.params;
   const { palette } = useAppTheme();
+  const insets = useSafeAreaInsets();
 
   const [loading, setLoading] = useState(true);
   const [cliente, setCliente] = useState<Cliente | null>(null);
   const [prestamosActivos, setPrestamosActivos] = useState<Prestamo[]>([]);
   const [historial, setHistorial] = useState<HistorialItem[]>([]);
-  const [noPagoCountByPrestamo, setNoPagoCountByPrestamo] = useState<Record<string, number>>({});
 
   const hoySession = useMemo(() => todayInTZ('America/Sao_Paulo'), []);
 
@@ -114,7 +119,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
         const cData = cSnap.exists() ? ({ id: cSnap.id, ...(cSnap.data() as any) } as Cliente) : null;
         setCliente(cData);
 
-        // 2) Prestamos activos
+        // 2) Préstamos activos
         const pSnap = await getDocs(collection(db, 'clientes', clienteId, 'prestamos'));
         const activos: Prestamo[] = [];
         pSnap.forEach((d) => {
@@ -130,11 +135,18 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
             abonos: Array.isArray(data.abonos) ? data.abonos : [],
             tz: data.tz || 'America/Sao_Paulo',
             fechaInicio: data.fechaInicio,
+
+            diasHabiles: Array.isArray(data.diasHabiles) ? data.diasHabiles : undefined,
+            feriados: Array.isArray(data.feriados) ? data.feriados : undefined,
+            pausas: Array.isArray(data.pausas) ? data.pausas : undefined,
+            modoAtraso: data.modoAtraso,
+            permitirAdelantar: !!data.permitirAdelantar,
+            cuotas: typeof data.cuotas === 'number' ? data.cuotas : undefined,
           });
         });
         setPrestamosActivos(activos);
 
-        // 3) Historial (finalizados)
+        // 3) Historial
         const hSnap = await getDocs(collection(db, 'clientes', clienteId, 'historialPrestamos'));
         const hist: HistorialItem[] = [];
         hSnap.forEach((d) => {
@@ -153,21 +165,6 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
         });
         hist.sort((a, b) => (b?.fechaCierre?.seconds || 0) - (a?.fechaCierre?.seconds || 0));
         setHistorial(hist);
-
-        // 4) Conteo de reportes de no pago por préstamo
-        const qNoPago = query(
-          collectionGroup(db, 'reportesNoPago'),
-          where('clienteId', '==', clienteId)
-        );
-        const noPagoSnap = await getDocs(qNoPago);
-        const counts: Record<string, number> = {};
-        noPagoSnap.forEach((d) => {
-          const data = d.data() as any;
-          const pid = String(data?.prestamoId || '');
-          if (!pid) return;
-          counts[pid] = (counts[pid] || 0) + 1;
-        });
-        setNoPagoCountByPrestamo(counts);
       } catch (e) {
         console.error('❌ Error cargando InfoCliente:', e);
         Alert.alert('Error', 'No fue posible cargar la información del cliente.');
@@ -189,8 +186,70 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
     });
   };
 
+  // KPIs por préstamo (mismos criterios que en Home)
+  const kpisDePrestamo = (p: Prestamo) => {
+    const tz = pickTZ(p.tz, 'America/Sao_Paulo');
+    const hoy = todayInTZ(tz);
+
+    const diasHabiles =
+      Array.isArray(p?.diasHabiles) && p.diasHabiles.length
+        ? p.diasHabiles
+        : [1, 2, 3, 4, 5, 6];
+    const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
+    const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
+    const cuotas =
+      Number(p?.cuotas || 0) ||
+      Math.ceil(
+        Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
+      );
+
+    const abonosNorm = (p.abonos || []).map((a) => ({
+      monto: Number(a.monto) || 0,
+      operationalDate: a.operationalDate,
+      fecha: a.fecha,
+    }));
+
+    const pres = calcularDiasAtraso({
+      fechaInicio: p.fechaInicio || hoy,
+      hoy,
+      cuotas,
+      valorCuota: Number(p.valorCuota || 0),
+      abonos: abonosNorm,
+      diasHabiles,
+      feriados,
+      pausas,
+      modo: (p?.modoAtraso as any) === 'porCuota' ? 'porCuota' : 'porPresencia',
+      permitirAdelantar: !!p?.permitirAdelantar,
+    });
+
+    const cuota = calcularDiasAtraso({
+      fechaInicio: p.fechaInicio || hoy,
+      hoy,
+      cuotas,
+      valorCuota: Number(p.valorCuota || 0),
+      abonos: abonosNorm,
+      diasHabiles,
+      feriados,
+      pausas,
+      modo: 'porCuota',
+      permitirAdelantar: true,
+    });
+
+    return {
+      diasAtraso: Number(pres?.atraso || 0),
+      cuotasVencidas: Math.max(0, Array.isArray(cuota?.faltas) ? cuota.faltas.length : 0),
+    };
+  };
+
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+    <View
+      style={{
+        flex: 1,
+        backgroundColor: palette.screenBg,
+        paddingTop: insets.top,
+        paddingBottom: insets.bottom,
+      }}
+    >
       {/* Header */}
       <View
         style={[
@@ -212,8 +271,9 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
       ) : (
         <FlatList
           data={[{ key: 'info' }]}
+          contentContainerStyle={{ paddingBottom: 24 + insets.bottom }}
           renderItem={() => (
-            <View style={{ padding: 12, paddingBottom: 24 }}>
+            <View style={{ padding: 12 }}>
               {/* Card: Cliente */}
               <View
                 style={[
@@ -280,7 +340,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                 ) : (
                   prestamosActivos.map((p) => {
                     const abHoy = abonosHoyDe(p);
-                    const noPago = noPagoCountByPrestamo[p.id] || 0;
+                    const { cuotasVencidas, diasAtraso } = kpisDePrestamo(p);
 
                     return (
                       <View
@@ -323,30 +383,27 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                           >
                             Abonos hoy: {abHoy.length}
                           </Text>
+
+                          {/* KPIs corregidos */}
                           <Text
                             style={[
                               styles.badge,
-                              { backgroundColor: palette.topBg, color: palette.text, borderColor: palette.topBorder, borderWidth: 1 },
+                              { backgroundColor: palette.topBg, color: '#C62828', borderColor: palette.topBorder, borderWidth: 1 },
                             ]}
                           >
-                            No-pagos: {noPago}
+                            Vencidas: {cuotasVencidas}
+                          </Text>
+                          <Text
+                            style={[
+                              styles.badge,
+                              { backgroundColor: palette.topBg, color: '#1565C0', borderColor: palette.topBorder, borderWidth: 1 },
+                            ]}
+                          >
+                            Atraso: {diasAtraso} d
                           </Text>
                         </View>
 
                         <View style={styles.rowActions}>
-                          <TouchableOpacity
-                            activeOpacity={0.9}
-                            style={[
-                              styles.btn,
-                              { backgroundColor: palette.topBg, borderColor: palette.topBorder, borderWidth: 1 },
-                            ]}
-                            onPress={() =>
-                              Alert.alert('Acción', 'Desde Info completa puedes abrir el pago desde el listado del día.')
-                            }
-                          >
-                            <Text style={[styles.btnTxt, { color: palette.accent }]}>Pagar</Text>
-                          </TouchableOpacity>
-
                           <TouchableOpacity
                             activeOpacity={0.9}
                             style={[styles.btn, { backgroundColor: palette.accent }]}
@@ -382,57 +439,60 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                 <View style={styles.cardHeaderRow}>
                   <MIcon name="file-document" size={20} color={palette.accent} />
                   <Text style={[styles.cardTitle, { color: palette.text }]}>Historial de préstamos</Text>
-                  <TouchableOpacity
-                    activeOpacity={0.9}
-                    onPress={() =>
-                      navigation.navigate('HistorialPrestamos', {
-                        clienteId,
-                        nombreCliente: nombreCliente || cliente?.alias || 'Cliente',
-                        admin,
-                      })
-                    }
-                  >
-                    <Text style={[styles.link, { color: palette.accent }]}>ver todo</Text>
-                  </TouchableOpacity>
                 </View>
 
                 {historial.length === 0 ? (
                   <Text style={[styles.empty, { color: palette.softText }]}>No hay préstamos finalizados.</Text>
                 ) : (
-                  historial.slice(0, 3).map((h) => (
+                  <>
+                    {historial.slice(0, 3).map((h) => (
+                      <TouchableOpacity
+                        key={h.id}
+                        activeOpacity={0.9}
+                        onPress={() =>
+                          navigation.navigate('DetalleHistorialPrestamo', {
+                            clienteId,
+                            historialId: h.id,
+                            nombreCliente: h.concepto,
+                          })
+                        }
+                        style={[
+                          styles.histRow,
+                          { borderColor: palette.cardBorder, backgroundColor: palette.kpiBg },
+                        ]}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={[styles.histName, { color: palette.text }]}>{h.concepto}</Text>
+                          <Text style={[styles.histMeta, { color: palette.softText }]}>
+                            {fmtDate(h.fechaInicio)} → {fmtDate(h.fechaCierre)}
+                          </Text>
+                        </View>
+                        <Text style={[styles.histTotal, { color: palette.text }]}>
+                          R$ {Number(h.totalPrestamo || 0).toFixed(2)}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
                     <TouchableOpacity
-                      key={h.id}
                       activeOpacity={0.9}
                       onPress={() =>
-                        navigation.navigate('DetalleHistorialPrestamo', {
+                        navigation.navigate('HistorialPrestamos', {
                           clienteId,
-                          historialId: h.id,
-                          nombreCliente: h.concepto,
+                          nombreCliente: nombreCliente || cliente?.alias || 'Cliente',
+                          admin,
                         })
                       }
-                      style={[
-                        styles.histRow,
-                        { borderColor: palette.cardBorder, backgroundColor: palette.kpiBg },
-                      ]}
+                      style={{ marginTop: 8, alignSelf: 'flex-start' }}
                     >
-                      <View style={{ flex: 1 }}>
-                        <Text style={[styles.histName, { color: palette.text }]}>{h.concepto}</Text>
-                        <Text style={[styles.histMeta, { color: palette.softText }]}>
-                          {fmtDate(h.fechaInicio)} → {fmtDate(h.fechaCierre)}
-                        </Text>
-                      </View>
-                      <Text style={[styles.histTotal, { color: palette.text }]}>
-                        R$ {Number(h.totalPrestamo || 0).toFixed(2)}
-                      </Text>
+                      <Text style={[styles.link, { color: palette.accent }]}>ver todo</Text>
                     </TouchableOpacity>
-                  ))
+                  </>
                 )}
               </View>
             </View>
           )}
         />
       )}
-    </SafeAreaView>
+    </View>
   );
 }
 

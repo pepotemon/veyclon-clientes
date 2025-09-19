@@ -1,24 +1,46 @@
-// utils/whats.ts
-import { Linking, Alert } from 'react-native';
+import { Linking, Alert, Platform } from 'react-native';
 
 export function sanitizePhone(raw?: string) {
   if (!raw) return '';
-  // Mantém apenas dígitos. Se precisar, você pode prefixar com '55' se vier sem DDI.
   const digits = raw.replace(/\D+/g, '');
-  return digits; // ex: "5591999998888"
+
+  // Heurística opcional: si parece número local BR (10-11 dígitos) sin DDI, anteponer 55.
+  if (!digits.startsWith('55') && (digits.length === 10 || digits.length === 11)) {
+    return `55${digits}`;
+  }
+  return digits;
 }
 
 export async function openWhats(phone: string, text: string) {
   const num = sanitizePhone(phone);
-  if (!num) {
-    Alert.alert('WhatsApp', 'O cliente não possui telefone válido.');
+  const encoded = encodeURIComponent(text || '');
+
+  // Preferimos deep-link directo a la app
+  const deep = num
+    ? `whatsapp://send?phone=${num}&text=${encoded}`
+    : `whatsapp://send?text=${encoded}`;
+
+  // Fallback web (abre navegador → WhatsApp)
+  const web = num
+    ? `https://wa.me/${num}?text=${encoded}`
+    : `https://wa.me/?text=${encoded}`;
+
+  // 1) Intentar deep-link (no usamos canOpenURL por restricciones de "package visibility")
+  try {
+    await Linking.openURL(deep);
     return;
-  }
-  const url = `https://wa.me/${num}?text=${encodeURIComponent(text)}`;
-  const can = await Linking.canOpenURL(url);
-  if (!can) {
-    Alert.alert('WhatsApp', 'Não foi possível abrir o WhatsApp neste dispositivo.');
+  } catch {}
+
+  // 2) Fallback web
+  try {
+    await Linking.openURL(web);
     return;
-  }
-  await Linking.openURL(url);
+  } catch {}
+
+  Alert.alert(
+    'WhatsApp',
+    Platform.OS === 'android'
+      ? 'No se pudo abrir WhatsApp. Asegúrate de que esté instalado y que el número tenga código de país (ej.: 55...).'
+      : 'No se pudo abrir WhatsApp en este dispositivo.'
+  );
 }

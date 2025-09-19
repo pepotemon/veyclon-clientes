@@ -446,16 +446,21 @@ useFocusEffect(
       const c = item.cliente;
       const visitado = esVisitadoHoy(item);
       const esNuevo = !visitado && esNuevoHoyOPas48h(item);
+const qbRaw = computeQuotaBadge(item);
+let quotaLabel = qbRaw.label;
 
-      const qbRaw = computeQuotaBadge(item);
-      let quotaLabel = qbRaw.label;
-      if (quotaLabel.startsWith('Cuotas vencidas: ')) {
-        quotaLabel = '+' + quotaLabel.slice('Cuotas vencidas: '.length);
-      } else if (quotaLabel === 'Cuotas al día') {
-        quotaLabel = 'Al día';
-      } else if (quotaLabel === 'Cuotas adelantadas') {
-        quotaLabel = 'Adelantado';
-      }
+// Compactar a “+N” tanto para vencidas como adelantadas
+const mV = qbRaw.label.match(/^Cuota(?:s)?\s+vencida(?:s)?:\s*(\d+)/i);
+const mA = qbRaw.label.match(/^Cuota(?:s)?\s+adelantada(?:s)?:\s*(\d+)/i);
+
+if (mV) {
+  quotaLabel = `+${mV[1]}`;        // rojo (viene del color de qbRaw)
+} else if (mA) {
+  quotaLabel = `+${mA[1]}`;        // verde (viene del color de qbRaw)
+} else if (/^Cuotas al día$/i.test(qbRaw.label)) {
+  quotaLabel = 'Al día';
+}
+
 
       return (
         <TouchableOpacity

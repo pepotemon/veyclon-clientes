@@ -17,7 +17,6 @@ import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoCliente'>;
 
@@ -36,14 +35,12 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
     telefono1: '',
     telefono2: '',
     genero: '',
-    // ✅ LGPD / privacidad
-    consentimientoContacto: false,
   });
 
   const [errores, setErrores] = useState<Record<string, string>>({});
 
   const camposObligatorios = useMemo(
-    () => ['nombre', 'nit', 'direccion1', 'barrio', 'telefono1', 'genero', 'consentimientoContacto'],
+    () => ['nombre', 'nit', 'direccion1', 'barrio', 'telefono1', 'genero'],
     []
   );
 
@@ -58,7 +55,6 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
     }
   };
 
-  // Normalizadores suaves
   const cleanPhone = (s: string) => s.replace(/[^\d+]/g, '').replace(/^\+?/, '');
   const cleanNit = (s: string) => (s || '').trim().toUpperCase();
 
@@ -66,22 +62,14 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
     const nuevos: Record<string, string> = {};
     for (const campo of camposObligatorios) {
       const v = (cliente as any)[campo];
-      const ok =
-        campo === 'consentimientoContacto'
-          ? !!v
-          : typeof v === 'string'
-          ? v.trim() !== ''
-          : !!v;
-      if (!ok) nuevos[campo] = campo === 'consentimientoContacto'
-        ? 'Debes aceptar el consentimiento para contacto'
-        : 'Campo obligatorio';
+      const ok = typeof v === 'string' ? v.trim() !== '' : !!v;
+      if (!ok) nuevos[campo] = 'Campo obligatorio';
     }
     if (Object.keys(nuevos).length) {
       setErrores(nuevos);
       return;
     }
 
-    // Ensamblar payload “limpio” para el siguiente paso
     const payload = {
       ...cliente,
       nit: cleanNit(cliente.nit),
@@ -92,7 +80,6 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
       direccion1: cliente.direccion1.trim(),
       direccion2: cliente.direccion2.trim(),
       barrio: cliente.barrio.trim(),
-      // consentimientoContacto ya está boolean
     };
 
     navigation.navigate('NuevoPrestamo', { cliente: payload, admin });
@@ -100,7 +87,6 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
-      {/* Header compacto */}
       <View
         style={[
           styles.header,
@@ -113,14 +99,16 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        keyboardVerticalOffset={72}
+        keyboardVerticalOffset={68}
       >
         <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
           <ScrollView
-            contentContainerStyle={styles.container}
+            contentContainerStyle={[
+              styles.container,
+              { paddingBottom: 92 + insets.bottom }, // más espacio inferior
+            ]}
             keyboardShouldPersistTaps="handled"
           >
-            {/* Datos personales */}
             <View
               style={[
                 styles.card,
@@ -140,23 +128,74 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                 palette={palette}
               />
 
+              <View style={styles.row2}>
+                <Field
+                  label="Alias"
+                  value={cliente.alias}
+                  onChangeText={(t) => handleChange('alias', t)}
+                  autoCapitalize="words"
+                  palette={palette}
+                  compact
+                />
+                <Field
+                  label="NIT"
+                  value={cliente.nit}
+                  onChangeText={(t) => handleChange('nit', t)}
+                  error={errores.nit}
+                  autoCapitalize="characters"
+                  palette={palette}
+                  compact
+                />
+              </View>
+
               <Field
-                label="Alias"
-                value={cliente.alias}
-                onChangeText={(t) => handleChange('alias', t)}
+                label="Dirección 1"
+                value={cliente.direccion1}
+                onChangeText={(t) => handleChange('direccion1', t)}
+                error={errores.direccion1}
                 autoCapitalize="words"
                 palette={palette}
               />
 
-              <Field
-                label="NIT"
-                value={cliente.nit}
-                onChangeText={(t) => handleChange('nit', t)}
-                error={errores.nit}
-                keyboardType="default"
-                autoCapitalize="characters"
-                palette={palette}
-              />
+              <View style={styles.row2}>
+                <Field
+                  label="Dirección 2"
+                  value={cliente.direccion2}
+                  onChangeText={(t) => handleChange('direccion2', t)}
+                  autoCapitalize="words"
+                  palette={palette}
+                  compact
+                />
+                <Field
+                  label="Barrio"
+                  value={cliente.barrio}
+                  onChangeText={(t) => handleChange('barrio', t)}
+                  error={errores.barrio}
+                  autoCapitalize="words"
+                  palette={palette}
+                  compact
+                />
+              </View>
+
+              <View style={styles.row2}>
+                <Field
+                  label="Teléfono"
+                  value={cliente.telefono1}
+                  onChangeText={(t) => handleChange('telefono1', t)}
+                  error={errores.telefono1}
+                  keyboardType="phone-pad"
+                  palette={palette}
+                  compact
+                />
+                <Field
+                  label="Teléfono 2"
+                  value={cliente.telefono2}
+                  onChangeText={(t) => handleChange('telefono2', t)}
+                  keyboardType="phone-pad"
+                  palette={palette}
+                  compact
+                />
+              </View>
 
               <Text style={[styles.label, { color: palette.softText }]}>Género</Text>
               <View style={styles.genderRow}>
@@ -191,119 +230,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                 <Text style={[styles.error, { color: '#d32f2f' }]}>{errores.genero}</Text>
               ) : null}
             </View>
-
-            {/* Ubicación y contacto */}
-            <View
-              style={[
-                styles.card,
-                { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
-              ]}
-            >
-              <Text style={[styles.sectionTitle, { color: palette.text }]}>
-                Ubicación y contacto
-              </Text>
-
-              <Field
-                label="Dirección 1"
-                value={cliente.direccion1}
-                onChangeText={(t) => handleChange('direccion1', t)}
-                error={errores.direccion1}
-                autoCapitalize="words"
-                palette={palette}
-              />
-
-              <Field
-                label="Dirección 2"
-                value={cliente.direccion2}
-                onChangeText={(t) => handleChange('direccion2', t)}
-                autoCapitalize="words"
-                palette={palette}
-              />
-
-              <Field
-                label="Barrio"
-                value={cliente.barrio}
-                onChangeText={(t) => handleChange('barrio', t)}
-                error={errores.barrio}
-                autoCapitalize="words"
-                palette={palette}
-              />
-
-              <Field
-                label="Teléfono"
-                value={cliente.telefono1}
-                onChangeText={(t) => handleChange('telefono1', t)}
-                error={errores.telefono1}
-                keyboardType="phone-pad"
-                palette={palette}
-              />
-
-              <Field
-                label="Teléfono 2"
-                value={cliente.telefono2}
-                onChangeText={(t) => handleChange('telefono2', t)}
-                keyboardType="phone-pad"
-                palette={palette}
-              />
-            </View>
-
-            {/* Privacidad / consentimiento (LGPD) */}
-            <View
-              style={[
-                styles.card,
-                { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
-              ]}
-            >
-              <Text style={[styles.sectionTitle, { color: palette.text }]}>
-                Privacidad y consentimiento
-              </Text>
-
-              <TouchableOpacity
-                style={[
-                  styles.consentRow,
-                  { borderColor: errores.consentimientoContacto ? '#d32f2f' : palette.cardBorder },
-                ]}
-                onPress={() =>
-                  handleChange('consentimientoContacto', !cliente.consentimientoContacto)
-                }
-                activeOpacity={0.85}
-              >
-                <View
-                  style={[
-                    styles.checkbox,
-                    {
-                      borderColor: errores.consentimientoContacto ? '#d32f2f' : palette.cardBorder,
-                      backgroundColor: cliente.consentimientoContacto ? palette.accent : 'transparent',
-                    },
-                  ]}
-                >
-                  {cliente.consentimientoContacto ? (
-                    <MIcon name="check-bold" size={14} color="#fff" />
-                  ) : null}
-                </View>
-                <Text style={{ color: palette.text, flex: 1, fontSize: 12 }}>
-                  Acepto ser contactado por WhatsApp y/o llamadas sobre mi préstamo.
-                </Text>
-              </TouchableOpacity>
-              {errores.consentimientoContacto ? (
-                <Text style={[styles.error, { color: '#d32f2f' }]}>
-                  {errores.consentimientoContacto}
-                </Text>
-              ) : null}
-
-              <Text style={{ color: palette.softText, fontSize: 11, marginTop: 6 }}>
-                Guardamos solo los datos necesarios para gestionar el préstamo. Puedes solicitar
-                correcciones o eliminación cuando quieras.
-              </Text>
-            </View>
-
-            {/* Espaciador para que el botón no tape el contenido */}
-            <View style={{ height: 72 + insets.bottom }} />
           </ScrollView>
         </TouchableWithoutFeedback>
       </KeyboardAvoidingView>
 
-      {/* Botón fijo compacto */}
       <View
         style={[
           styles.ctaBar,
@@ -326,7 +256,6 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
   );
 }
 
-/** ---------- Pequeños ---------- */
 function Field({
   label,
   value,
@@ -334,6 +263,7 @@ function Field({
   error,
   keyboardType = 'default',
   autoCapitalize = 'none',
+  compact = false,
   palette,
 }: {
   label: string;
@@ -342,15 +272,18 @@ function Field({
   error?: string;
   keyboardType?: 'default' | 'phone-pad';
   autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
+  compact?: boolean;
   palette: ReturnType<typeof useAppTheme>['palette'];
 }) {
   return (
-    <View style={{ marginBottom: 8 }}>
+    <View style={{ marginBottom: compact ? 12 : 16, flex: compact ? 1 : undefined }}>
       <Text style={[styles.label, { color: palette.softText }]}>{label}</Text>
       <TextInput
         style={[
           styles.input,
           {
+            paddingVertical: compact ? 10 : 12,
+            fontSize: compact ? 15 : 16,
             color: palette.text,
             borderColor: error ? '#d32f2f' : palette.cardBorder,
             backgroundColor: palette.cardBg,
@@ -368,105 +301,85 @@ function Field({
   );
 }
 
-/** ---------- Estilos compactos ---------- */
 const styles = StyleSheet.create({
   header: {
     borderBottomWidth: 1,
-    paddingVertical: 8,
+    paddingVertical: 10,
     alignItems: 'center',
   },
-  headerTitle: { fontSize: 16, fontWeight: '700' },
+  headerTitle: { fontSize: 18, fontWeight: '800' },
 
   container: {
-    padding: 10,
-    paddingBottom: 32,
+    padding: 16, // más respiro
   },
 
   card: {
-    borderRadius: 10,
-    padding: 10,
+    borderRadius: 12,
+    padding: 14,
     borderWidth: 1,
-    marginBottom: 10,
   },
   sectionTitle: {
-    fontSize: 12,
-    fontWeight: '700',
-    marginBottom: 8,
+    fontSize: 14,
+    fontWeight: '900',
+    marginBottom: 12,
     textAlign: 'center',
-    opacity: 0.9,
+    letterSpacing: 0.2,
+  },
+
+  row2: {
+    flexDirection: 'row',
+    gap: 16, // “doble espacio” entre columnas
   },
 
   label: {
-    fontSize: 11,
-    marginBottom: 4,
-    fontWeight: '500',
+    fontSize: 13,
+    marginBottom: 6, // “doble” vs versión compacta
+    fontWeight: '700',
   },
 
   input: {
     borderWidth: 1,
-    borderRadius: 8,
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    fontSize: 13,
+    borderRadius: 10,
+    paddingHorizontal: 12,
   },
 
   error: {
-    fontSize: 10,
-    marginTop: 3,
+    fontSize: 11,
+    marginTop: 6,
   },
 
   genderRow: {
     flexDirection: 'row',
-    gap: 8,
-    marginTop: 2,
-    marginBottom: 4,
+    gap: 16, // doble
+    marginTop: 6,
   },
   genderPill: {
     flex: 1,
-    height: 32,
+    height: 36, // más alto
     borderRadius: 999,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    paddingHorizontal: 8,
-  },
-  genderTxt: { fontSize: 12, fontWeight: '600' },
-
-  consentRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingVertical: 10,
     paddingHorizontal: 10,
-    marginTop: 4,
   },
-  checkbox: {
-    width: 18,
-    height: 18,
-    borderRadius: 4,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  genderTxt: { fontSize: 14, fontWeight: '800' },
 
   ctaBar: {
     position: 'absolute',
     left: 0,
     right: 0,
     borderTopWidth: 1,
-    padding: 8,
-    elevation: 4,
+    padding: 12, // más grande
+    elevation: 6,
     shadowColor: '#000',
-    shadowOpacity: 0.06,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: -3 },
   },
   btn: {
-    paddingVertical: 10,
-    borderRadius: 9,
+    paddingVertical: 14,
+    borderRadius: 10,
     alignItems: 'center',
   },
-  btnTxt: { color: '#fff', fontWeight: '700', fontSize: 14 },
+  btnTxt: { color: '#fff', fontWeight: '900', fontSize: 16, letterSpacing: 0.2 },
 });
