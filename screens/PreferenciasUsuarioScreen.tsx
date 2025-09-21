@@ -5,7 +5,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '../theme/ThemeProvider';
 
-const KEY_SEND_RECEIPT_CONFIRM = 'prefs:sendReceiptConfirm';
+// 👇 Exportamos la clave para usarla en el flujo de registro de pago
+export const KEY_SEND_RECEIPT_CONFIRM = 'prefs:sendReceiptConfirm';
 
 export default function PreferenciasUsuarioScreen() {
   const { palette } = useAppTheme();
@@ -79,7 +80,12 @@ const styles = StyleSheet.create({
   subtitle: { fontSize: 12, marginTop: 4 },
 
   toggle: {
-    borderWidth: 1, borderRadius: 999, paddingVertical: 8, paddingHorizontal: 12, minWidth: 88, alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    minWidth: 88,
+    alignItems: 'center',
   },
   toggleTxt: { fontSize: 12, fontWeight: '800' },
 });
