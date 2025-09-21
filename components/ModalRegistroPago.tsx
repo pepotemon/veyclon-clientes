@@ -15,6 +15,7 @@ import { calcularDiasAtraso } from '../utils/atrasoHelper';
 import { logAudit, pick } from '../utils/auditLogs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { addToOutbox } from '../utils/outbox';
+import { logToCajaDiaria } from '../utils/caja'; // ✅ helper unificado
 
 type Props = {
   visible: boolean;
@@ -30,58 +31,31 @@ type Props = {
 const quotaCache: Record<string, { cuota: number; saldo: number }> = {};
 const KEY_SEND_RECEIPT_CONFIRM = 'prefs:sendReceiptConfirm';
 
+/** ✅ Abrir WhatsApp sin número: deep-link → fallback web.
+ *  Evitamos canOpenURL por restricciones de Android 11+ (package visibility). */
 async function openWhats(text: string) {
-  const url = `whatsapp://send?text=${encodeURIComponent(text)}`;
-  try {
-    const can = await Linking.canOpenURL(url);
-    if (!can) { Alert.alert('WhatsApp no disponible', 'No se pudo abrir WhatsApp en este dispositivo.'); return; }
-    await Linking.openURL(url);
-  } catch {
-    Alert.alert('Error', 'No se pudo abrir WhatsApp.');
-  }
-}
+  const encoded = encodeURIComponent(text || '');
+  const deep = `whatsapp://send?text=${encoded}`;
+  const web  = `https://wa.me/?text=${encoded}`;
 
-async function logToCajaDiaria(params: {
-  admin: string;
-  clienteId: string;
-  prestamoId: string;
-  clienteNombre: string;
-  monto: number;
-  tz: string;
-  operationalDate: string;
-}) {
-  const { admin, clienteId, prestamoId, clienteNombre, monto, tz, operationalDate } = params;
-  const now = Date.now();
+  // 1) Intento directo a la app
   try {
-    const ref = await addDoc(collection(db, 'cajaDiaria'), {
-      tipo: 'abono',
-      admin,
-      clienteId,
-      prestamoId,
-      clienteNombre,
-      monto: Number(monto.toFixed(2)),
-      tz,
-      operationalDate,
-      createdAtMs: now,
-      createdAt: serverTimestamp(),
-      source: 'app',
-    });
-    await logAudit({
-      userId: admin,
-      action: 'create',
-      ref,
-      after: {
-        admin,
-        clienteId,
-        prestamoId,
-        monto: Number(monto.toFixed(2)),
-        operationalDate,
-        tipo: 'abono',
-      },
-    });
-  } catch (e) {
-    console.warn('[cajaDiaria] no se pudo registrar:', e);
-  }
+    await Linking.openURL(deep);
+    return;
+  } catch {}
+
+  // 2) Fallback web (navegador → WhatsApp / Play Store)
+  try {
+    await Linking.openURL(web);
+    return;
+  } catch {}
+
+  Alert.alert(
+    'WhatsApp',
+    Platform.OS === 'android'
+      ? 'No se pudo abrir WhatsApp. Verifica que esté instalado.'
+      : 'No se pudo abrir WhatsApp en este dispositivo.'
+  );
 }
 
 function buildReceiptPT(opts: {
@@ -306,6 +280,7 @@ export default function ModalRegistroPago({
         });
         hasOpenedWhatsRef.current = true;
         setLoading(false);
+        // 👉 abre WhatsApp SIN número, con el mensaje prellenado
         void openWhats(texto);
       }
 
@@ -320,11 +295,20 @@ export default function ModalRegistroPago({
         after: pick(txResult.abonoNuevo, ['monto','operationalDate','tz']),
       });
 
-      // Caja diaria
+      // ✅ Caja diaria (shape unificado)
       await logToCajaDiaria({
-        admin, clienteId: clienteId!, prestamoId: prestamoId!,
+        tipo: 'abono',
+        admin,
+        monto: montoNum,
+        tz: txResult.tz,
+        operationalDate: txResult.operativoHoy,
+        source: 'app',
+        // identidad para informes/UI
+        clienteId: clienteId!,
+        prestamoId: prestamoId!,
         clienteNombre: clienteNombre || txResult.prestamoData?.concepto || 'Cliente',
-        monto: montoNum, tz: txResult.tz, operationalDate: txResult.operativoHoy,
+        // útil para trazabilidad
+        meta: { abonoRefPath: doc(collection(doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!), 'abonos'), abonoRef.id).path },
       });
 
       // Recalcular atraso (con el array abonos actualizado)
@@ -396,7 +380,7 @@ export default function ModalRegistroPago({
       setMonto('');
       onSuccess?.(); // 👉 refresca PagosDelDia y quita del Home el cliente que ya pagó
     } catch (error: any) {
-      console.error('🔥 Error al registrar el abono:', error);
+      console.error('🔥 Error al registrar el abono (online):', error);
       try {
         const tz = pickTZ();
         const operationalDate = todayInTZ(tz);
@@ -410,14 +394,20 @@ export default function ModalRegistroPago({
             monto: parseFloat(montoNum.toFixed(2)),
             tz,
             operationalDate,
+            clienteNombre, // 👈 para mostrar en Pendientes/Informes
             alsoCajaDiaria: true,
             cajaPayload: { tipo: 'abono' as const, clienteNombre },
           },
         });
 
         Alert.alert('Sin conexión', 'El pago se guardó en "Pendientes" y podrás reenviarlo cuando tengas internet.');
-      } catch {
-        Alert.alert('Error', 'No se pudo registrar el pago ni guardarlo en pendientes. Inténtalo nuevamente.');
+      } catch (e: any) {
+        if (e?.name === 'PAGO_PENDIENTE_EXISTE') {
+          Alert.alert('Pendiente existente', 'Este cliente ya tiene un pago pendiente en cola. Reenvíalo antes de agregar otro.');
+        } else {
+          console.error('❌ No se pudo guardar en outbox:', e);
+          Alert.alert('Error', 'No se pudo registrar el pago ni guardarlo en pendientes. Inténtalo nuevamente.');
+        }
       }
     } finally {
       setLoading(false);

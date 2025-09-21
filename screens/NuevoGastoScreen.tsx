@@ -20,10 +20,13 @@ import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
 import { todayInTZ, pickTZ } from '../utils/timezone';
 import { logAudit } from '../utils/auditLogs';
 
+// 👇 NUEVO: outbox para fallback offline
+import { addToOutbox } from '../utils/outbox';
+
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoGasto'>;
 
 const CATEGORIAS = ['Transporte', 'Comisión', 'Comida', 'Suministros', 'Otro'] as const;
-type CategoriaGasto = typeof CATEGORIAS[number];
+type CategoriaGasto = (typeof CATEGORIAS)[number];
 
 export default function NuevoGastoScreen({ route, navigation }: Props) {
   const admin = route.params.admin;
@@ -45,15 +48,17 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
       Alert.alert('Monto inválido', 'Ingresa un monto mayor a 0.');
       return;
     }
+    const montoNum = Math.round(num * 100) / 100;
+
     try {
       setGuardando(true);
 
       const payload = {
-        // ✅ tipo canónico para Fase 2 (coincide con movimientoHelper / consultas)
+        // ✅ tipo canónico (coincide con movimientoHelper/consultas)
         tipo: 'gasto_admin' as const,
         admin,
         categoria,
-        monto: Math.round(num * 100) / 100,
+        monto: montoNum,
         operationalDate: hoy,
         tz: tzSession,
         nota: nota.trim() ? nota.trim() : null,
@@ -84,8 +89,33 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
       Alert.alert('Listo', 'Gasto registrado.');
       navigation.goBack();
     } catch (e) {
-      console.error('Error guardando gasto:', e);
-      Alert.alert('Error', 'No se pudo guardar el gasto.');
+      // —— OFFLINE FALLBACK: Encolar “gasto (admin)” ——
+      try {
+        await addToOutbox({
+          kind: 'otro',
+          payload: {
+            _subkind: 'gasto',       // el procesador lo llevará a cajaDiaria
+            tipo: 'gasto',           // para que en Pendientes se lea “Gasto — …”
+            admin,
+            monto: montoNum,
+            categoria,
+            concepto: categoria,     // mostrado en Pendientes si no hay cliente
+            nota: nota.trim() ? nota.trim() : undefined,
+            tz: tzSession,
+            operationalDate: hoy,
+            createdAtMs: Date.now(),
+            source: 'manual',        // ← MAPEAMOS A gasto_admin en el reenviador
+          },
+        });
+        Alert.alert(
+          'Sin conexión',
+          'El gasto se guardó en Pendientes y se enviará automáticamente cuando haya internet.'
+        );
+        navigation.goBack();
+      } catch (ex) {
+        console.error('Outbox gasto_admin error:', ex);
+        Alert.alert('Error', 'No se pudo guardar el gasto ni en pendientes.');
+      }
     } finally {
       setGuardando(false);
     }

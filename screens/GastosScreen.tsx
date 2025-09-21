@@ -14,6 +14,9 @@ import { addDoc, collection, onSnapshot, query, where, serverTimestamp } from 'f
 import { todayInTZ, pickTZ } from '../utils/timezone';
 import { logAudit } from '../utils/auditLogs';
 
+// 👇 NUEVO: outbox para fallback offline
+import { addToOutbox } from '../utils/outbox';
+
 type Props = NativeStackScreenProps<RootStackParamList, 'Gastos'>;
 
 type MovimientoGasto = {
@@ -23,7 +26,7 @@ type MovimientoGasto = {
   operationalDate: string; // YYYY-MM-DD
   createdAt?: { seconds?: number };
   createdAtMs?: number;
-  // 👇 lectura tolera antiguo y nuevo; escritura usa SIEMPRE el canónico 'gasto_cobrador'
+  // lectura tolera antiguo y nuevo; escritura usa SIEMPRE el canónico 'gasto_cobrador'
   tipo: 'gasto_cobrador' | 'gastoCobrador';
   categoria: string;
   monto: number;
@@ -95,11 +98,12 @@ export default function GastosScreen({ route }: Props) {
     if (!categoria.trim()) return Alert.alert('Falta categoría', 'Escribe el tipo de gasto.');
     if (!isFinite(m) || m <= 0) return Alert.alert('Monto inválido', 'Ingresa un monto válido.');
 
+    const tzNow = pickTZ();
+    const operationalDateNow = todayInTZ(tzNow);
+    const montoNum = Math.round(m * 100) / 100;
+
     try {
       setEnviando(true);
-
-      const tzNow = pickTZ();
-      const operationalDateNow = todayInTZ(tzNow);
 
       const payload: MovimientoGasto = {
         admin,
@@ -107,10 +111,9 @@ export default function GastosScreen({ route }: Props) {
         operationalDate: operationalDateNow,
         createdAt: undefined,         // lo setea serverTimestamp abajo
         createdAtMs: Date.now(),
-        // ✅ canónico fase 2
-        tipo: 'gasto_cobrador',
+        tipo: 'gasto_cobrador',       // ✅ canónico
         categoria: categoria.trim(),
-        monto: Math.round(m * 100) / 100,
+        monto: montoNum,
         nota: nota.trim() ? nota.trim() : null,
       };
 
@@ -142,8 +145,32 @@ export default function GastosScreen({ route }: Props) {
       setTab('lista');
       Alert.alert('✔️ Guardado', 'Gasto registrado.');
     } catch (e) {
-      console.error(e);
-      Alert.alert('❌ Error', 'No se pudo guardar el gasto.');
+      // —— OFFLINE FALLBACK: Encolar “gasto del cobrador” ——
+      try {
+        await addToOutbox({
+          kind: 'otro',
+          payload: {
+            _subkind: 'gasto',     // <-- lo procesará el outbox como movimiento de caja
+            tipo: 'gasto',         // <-- para que Pendientes muestre “Gasto — …”
+            admin,
+            monto: montoNum,
+            categoria: categoria.trim(),
+            nota: nota.trim() ? nota.trim() : undefined,
+            tz: tzNow,
+            operationalDate: operationalDateNow,
+            createdAtMs: Date.now(),
+            source: 'cobrador',
+          },
+        });
+        setCategoria('');
+        setMonto('');
+        setNota('');
+        setTab('lista');
+        Alert.alert('Sin conexión', 'El gasto se guardó en Pendientes y se enviará automáticamente cuando haya internet.');
+      } catch (ex) {
+        console.error('Outbox gasto error:', ex);
+        Alert.alert('❌ Error', 'No se pudo guardar el gasto ni en pendientes.');
+      }
     } finally {
       setEnviando(false);
     }

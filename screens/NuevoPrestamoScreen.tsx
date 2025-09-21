@@ -25,6 +25,7 @@ import { addDoc, collection, doc, setDoc, serverTimestamp } from 'firebase/fires
 import { todayInTZ, pickTZ } from '../utils/timezone';
 import { useAppTheme } from '../theme/ThemeProvider';
 import { logAudit, pick } from '../utils/auditLogs';
+import { addToOutbox } from '../utils/outbox';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoPrestamo'>;
 
@@ -151,7 +152,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         };
         await setDoc(clienteRef, updatePayload, { merge: true });
 
-        // 🔍 AUDIT: update cliente (best-effort, solo after)
         await logAudit({
           userId: admin,
           action: 'update',
@@ -169,7 +169,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         };
         await setDoc(clienteRef, createPayload);
 
-        // 🔍 AUDIT: create cliente
         await logAudit({
           userId: admin,
           action: 'create',
@@ -196,13 +195,12 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         cobradorId: admin,
         montoTotal: total,
         restante: total,
-        // ⛔️ no almacenar arrays de abonos en el doc del préstamo
-        // abonos: [],
+        // abonos: [],  // (no guardamos arrays en el doc)
 
         creadoPor: admin,
         creadoEn: serverTimestamp(),
         createdAtMs: Date.now(),
-        createdDate: hoyIso, // ✅ YYYY-MM-DD en TZ del préstamo
+        createdDate: hoyIso,
 
         // denormalizados
         clienteNombre: concepto,
@@ -225,14 +223,12 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         feriados: [],
         pausas: [],
 
-        // atraso y adelanto
         modoAtraso: 'porPresencia',
         permitirAdelantar: true,
       };
 
       const prestamoRef = await addDoc(collection(clienteRef, 'prestamos'), prestamoPayload);
 
-      // 🔍 AUDIT: create préstamo (incluye createdDate)
       await logAudit({
         userId: admin,
         action: 'create',
@@ -258,7 +254,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       };
       await setDoc(idxRef, idxPayload, { merge: true });
 
-      // 🔍 AUDIT: upsert índice
       await logAudit({
         userId: admin,
         action: 'update',
@@ -269,8 +264,72 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       Alert.alert('Guardado', 'Préstamo registrado correctamente.');
       navigation.popToTop();
     } catch (e) {
-      console.error('❌ Error al guardar:', e);
-      Alert.alert('Error', 'No se pudo guardar el préstamo.');
+      console.error('❌ Error al guardar (online). Encolando para offline…', e);
+
+      try {
+        // —— OFFLINE FALLBACK: Encolar “venta” —— //
+        const tz = pickTZ((cliente as any)?.tz);
+        const hoyIso = todayInTZ(tz);
+        const diasHabiles = [1, 2, 3, 4, 5, 6];
+        const fechaInicioOperativa = nextOperativeDayStr(hoyIso, diasHabiles);
+
+        // Si no teníamos cliente existente, pre-generamos un id local seguro para futura escritura
+        const targetClienteId: string = existingClienteId ?? doc(collection(db, 'clientes')).id;
+
+        const concepto = String(cliente?.nombre ?? '').trim() || 'Sin nombre';
+        const total = totalCalc;
+        const vCuota = cuotaCalc;
+
+        await addToOutbox({
+          kind: 'otro',
+          payload: {
+            _subkind: 'venta',
+            admin,
+            targetClienteId,
+            clienteData: {
+              nombre: cliente?.nombre ?? '',
+              alias: cliente?.alias ?? '',
+              direccion1: cliente?.direccion1 ?? '',
+              telefono1: cliente?.telefono1 ?? '',
+              barrio: cliente?.barrio ?? '',
+            },
+            prestamoData: {
+              concepto,
+              cobradorId: admin,
+              montoTotal: total,
+              restante: total,
+              clienteNombre: concepto,
+              clienteId: targetClienteId,
+              modalidad: prestamo.modalidad,
+              interes: interesPct,
+              valorNeto: valor,
+              totalPrestamo: total,
+              cuotas: cuotasNum,
+              valorCuota: vCuota,
+              fechaInicio: fechaInicioOperativa,
+              diasHabiles,
+              feriados: [],
+              pausas: [],
+              modoAtraso: 'porPresencia',
+              permitirAdelantar: true,
+            },
+            // Para asiento de caja (venta = valor neto desembolsado)
+            caja: {
+              monto: valor,
+              clienteNombre: concepto,
+            },
+            tz,
+            operationalDate: hoyIso,
+            createdAtMs: Date.now(),
+          },
+        });
+
+        Alert.alert('Sin conexión', 'Se guardó en "Pendientes". Cuando haya internet, se enviará automáticamente.');
+        // Volvemos a Home (opcional) o nos quedamos; aquí no forzamos navegación
+      } catch (ex) {
+        console.error('❌ Error encolando venta offline:', ex);
+        Alert.alert('Error', 'No se pudo guardar el préstamo ni en pendientes.');
+      }
     } finally {
       setGuardando(false);
     }
@@ -497,7 +556,6 @@ function Field({
         onChangeText={onChangeText}
         keyboardType={keyboardType}
         editable={editable}
-        // 🔕 sin placeholder para no mostrar texto de ejemplo
       />
     </View>
   );

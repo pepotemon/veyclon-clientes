@@ -1,6 +1,7 @@
 // utils/movimientoHelper.ts
 export type MovimientoTipo =
   | 'abono'
+  | 'venta'          // 👈 añadido
   | 'gasto_admin'
   | 'gasto_cobrador'
   | 'ingreso'
@@ -28,6 +29,9 @@ export function canonicalTipo(raw: any): MovimientoTipo | null {
   // Abonos / pagos
   if (['abono', 'pago', 'pago_diario', 'payment', 'pay'].includes(t)) return 'abono';
 
+  // Ventas / nuevos préstamos
+  if (['venta', 'prestamo', 'nuevo_prestamo', 'nueva_venta', 'prestamo_nuevo'].includes(t)) return 'venta';
+
   // Gastos administrativos (preferencia al cierre si era ambiguo "gasto")
   if (['gasto_admin', 'gasto', 'gasto_caja', 'gasto_administrativo', 'gasto_admin_manual'].includes(t)) {
     return 'gasto_admin';
@@ -52,6 +56,7 @@ export function canonicalTipo(raw: any): MovimientoTipo | null {
 export function labelFor(tipo: MovimientoTipo): string {
   switch (tipo) {
     case 'abono': return 'Abono';
+    case 'venta': return 'Venta'; // 👈 añadido
     case 'gasto_admin': return 'Gasto (admin)';
     case 'gasto_cobrador': return 'Gasto (cobrador)';
     case 'ingreso': return 'Ingreso';
@@ -65,6 +70,7 @@ export function iconFor(tipo: MovimientoTipo): { name: string } {
   // MaterialCommunityIcons
   switch (tipo) {
     case 'abono': return { name: 'check-circle' };
+    case 'venta': return { name: 'cash-plus' }; // 👈 añadido
     case 'gasto_admin': return { name: 'receipt' };
     case 'gasto_cobrador': return { name: 'account-cash' };
     case 'ingreso': return { name: 'arrow-down-circle' };
@@ -77,6 +83,7 @@ export function iconFor(tipo: MovimientoTipo): { name: string } {
 export function toneFor(tipo: MovimientoTipo): string {
   switch (tipo) {
     case 'abono': return '#2E7D32';
+    case 'venta': return '#1565C0'; // 👈 añadido (azul para diferenciar)
     case 'ingreso': return '#2E7D32';
     case 'retiro': return '#C62828';
     case 'gasto_admin': return '#6D4C41';

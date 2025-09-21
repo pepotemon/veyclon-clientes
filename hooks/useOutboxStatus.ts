@@ -1,7 +1,6 @@
 // hooks/useOutboxStatus.ts
 import { useEffect, useMemo, useState } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { subscribeOutbox, getOutboxCounts, OutboxKind, OutboxStatusCounts } from '../utils/outbox';
+import { subscribeOutbox, getOutboxCounts, OutboxStatusCounts } from '../utils/outbox';
 
 export type UseOutboxStatusResult = {
   pendingTotal: number;

@@ -19,7 +19,10 @@ import { todayInTZ, pickTZ, normYYYYMMDD } from '../utils/timezone';
 import { logAudit, pick } from '../utils/auditLogs';
 import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';
 
-// 👇 NUEVO: helper de movimientos (tipos/iconos/labels/colores)
+// 👇 NUEVO: outbox para fallback offline
+import { addToOutbox } from '../utils/outbox';
+
+// 👇 helper de movimientos (tipos/iconos/labels/colores)
 import {
   canonicalTipo,
   iconFor,
@@ -123,7 +126,6 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   useEffect(() => {
     setCargando(true);
     try {
-      // admin ==, operationalDate ==, orderBy createdAt asc
       const qDia = query(
         collection(db, 'cajaDiaria'),
         where('admin', '==', admin),
@@ -312,7 +314,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     try {
       setGuardandoMov(true);
       const payload = {
-        tipo: modalOpen, // 'ingreso' | 'retiro' (ya canónico)
+        tipo: modalOpen, // 'ingreso' | 'retiro' (canónico)
         admin,
         monto: Math.round(num * 100) / 100,
         operationalDate: hoy,
@@ -336,8 +338,33 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
       closeModal();
       Alert.alert('Listo', modalOpen === 'ingreso' ? 'Ingreso registrado.' : 'Retiro registrado.');
     } catch (e) {
-      console.error('[CajaDiaria] guardarMovimiento:', e);
-      Alert.alert('Error', 'No se pudo guardar el movimiento.');
+      // —— OFFLINE FALLBACK: encolar ingreso/retiro ——
+      try {
+        const monto = Math.round(parseFloat(montoTxt.replace(',', '.')) * 100) / 100;
+        await addToOutbox({
+          kind: 'otro',
+          payload: {
+            _subkind: modalOpen, // 'ingreso' | 'retiro'
+            admin,
+            monto,
+            nota: notaTxt.trim() ? notaTxt.trim() : undefined,
+            tz,
+            operationalDate: hoy,
+            createdAtMs: Date.now(),
+            source: 'manual',
+          },
+        });
+        closeModal();
+        Alert.alert(
+          'Sin conexión',
+          modalOpen === 'ingreso'
+            ? 'El ingreso se guardó en Pendientes. Se enviará automáticamente cuando haya internet.'
+            : 'El retiro se guardó en Pendientes. Se enviará automáticamente cuando haya internet.'
+        );
+      } catch (ex) {
+        console.error('[CajaDiaria] outbox enqueue failed:', ex);
+        Alert.alert('Error', 'No se pudo guardar el movimiento ni en pendientes.');
+      }
     } finally {
       setGuardandoMov(false);
     }

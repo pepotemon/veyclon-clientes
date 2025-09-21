@@ -55,8 +55,8 @@ function normalizeKind(kind: OutboxKind): KindEs {
   return kind; // ya es 'abono' | 'no_pago' | 'otro'
 }
 
-/** Etiqueta para UI */
-function kindLabel(kind: OutboxKind): 'Abono' | 'No pago' | 'Otro' {
+/** Etiqueta base para UI (columna izquierda) */
+function kindBaseLabel(kind: OutboxKind): 'Abono' | 'No pago' | 'Otro' {
   const k = normalizeKind(kind);
   if (k === 'abono') return 'Abono';
   if (k === 'no_pago') return 'No pago';
@@ -108,12 +108,12 @@ export default function PendientesScreen() {
 
   // estados
   const [items, setItems] = useState<OutboxItem[]>([]);
-  const [loadingInitial, setLoadingInitial] = useState(true); // 👈 carga inicial
-  const [refreshing, setRefreshing] = useState(false);        // 👈 solo pull-to-refresh
+  const [loadingInitial, setLoadingInitial] = useState(true); // carga inicial
+  const [refreshing, setRefreshing] = useState(false);        // pull-to-refresh
   const [processing, setProcessing] = useState(false);
   const [filter, setFilter] = useState<FilterKey>('todos');
 
-  // Carga lista desde AsyncStorage (con migración de kind)
+  // Lee la lista desde AsyncStorage (con migración de kind)
   const readFromStorage = useCallback(async (): Promise<OutboxItem[]> => {
     try {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
@@ -133,7 +133,7 @@ export default function PendientesScreen() {
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
       }
       // ordenar recientes primero
-      migrated.sort((a, b) => b.createdAtMs - a.createdAtMs);
+      migrated.sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
       return migrated;
     } catch {
       return [];
@@ -168,7 +168,6 @@ export default function PendientesScreen() {
     let unsubEvt: (() => void) | null = null;
     try {
       unsubEvt = subscribeOutbox(() => {
-        // refresco silencioso: no mostrar spinner
         load('silent');
       });
     } catch {
@@ -180,7 +179,6 @@ export default function PendientesScreen() {
     if (!unsubEvt) {
       try {
         unsubPoll = subscribeCount(() => {
-          // No confiamos en el número aquí, solo disparamos una recarga silenciosa
           load('silent');
         });
       } catch {
@@ -199,7 +197,7 @@ export default function PendientesScreen() {
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
   };
 
-  // Reintentar uno (preferir motor nuevo; si falla, quitar ítem o marcar error local)
+  // Reintentar uno (preferir motor nuevo)
   const retryOne = async (id: string) => {
     setProcessing(true);
     try {
@@ -210,7 +208,6 @@ export default function PendientesScreen() {
       }
       await load('silent');
     } catch (e: any) {
-      // Si el motor lanzó, no tocamos la lista; el motor ya dejó lastError/backoff
       Alert.alert('Reintento', 'No se pudo reenviar este elemento.');
     } finally {
       setProcessing(false);
@@ -223,9 +220,9 @@ export default function PendientesScreen() {
     try {
       await processOutboxBatch(100);
       await load('silent');
-      Alert.alert('Pendientes', 'Se intentó reenviar la cola.');
+      Alert.alert('Pendientes', 'Se intentó enviar la cola.');
     } catch {
-      Alert.alert('Error', 'Ocurrió un error al reintentar la cola.');
+      Alert.alert('Error', 'Ocurrió un error al enviar la cola.');
     } finally {
       setProcessing(false);
     }
@@ -278,6 +275,92 @@ export default function PendientesScreen() {
     [palette]
   );
 
+  // ======== Formateo Display por ítem (Título + detalles) ========
+  function getDisplayTexts(it: OutboxItem): {
+    title: string;
+    line1?: string;
+    line2?: string;
+    icon: string; // usar string para evitar fricciones de tipos con glyphMap
+  } {
+    const k = normalizeKind(it.kind);
+    const p = it.payload || {};
+    const tipo = (p.tipo || p._subkind || k) as string // 'venta' | 'retiro' | 'ingreso' | 'gasto' | 'abono' | 'no_pago' | 'otro'
+    const monto: number | undefined =
+      typeof p.monto === 'number'
+        ? p.monto
+        : typeof p.valor === 'number'
+        ? p.valor
+        : undefined;
+
+    const money =
+      typeof monto === 'number' && Number.isFinite(monto)
+        ? `Monto: R$ ${monto.toFixed(2)}`
+        : undefined;
+
+    const fecha = it.createdAtMs ? new Date(it.createdAtMs).toLocaleString() : undefined;
+    const cliente = p.clienteNombre || p.nombre || p.cliente || undefined;
+    const concepto = p.concepto || p.nota || p.descripcion || p.detalle;
+
+    if (tipo === 'abono') {
+      return {
+        title: `Pago — ${cliente || '—'}`,
+        line1: money,
+        line2: fecha,
+        icon: 'check-circle',
+      };
+    }
+    if (tipo === 'venta') {
+      return {
+        title: `Venta — ${cliente || '—'}`,
+        line1: money ?? (concepto ? `Concepto: ${concepto}` : undefined),
+        line2: fecha,
+        icon: 'cart-arrow-down',
+      };
+    }
+    if (tipo === 'retiro') {
+      return {
+        title: `Retiro — ${cliente || '—'}`,
+        line1: money,
+        line2: fecha,
+        icon: 'cash-minus',
+      };
+    }
+    if (tipo === 'ingreso') {
+      const who = cliente || concepto || '—';
+      return {
+        title: `Ingreso — ${who}`,
+        line1: money,
+        line2: fecha,
+        icon: 'cash-plus',
+      };
+    }
+    if (tipo === 'gasto') {
+      const who = cliente || concepto || '—';
+      return {
+        title: `Gasto — ${who}`,
+        line1: money,
+        line2: fecha,
+        icon: 'cash-remove',
+      };
+    }
+    if (tipo === 'no_pago') {
+      return {
+        title: `No pago — ${cliente || '—'}`,
+        line1: p.reason ? `Motivo: ${p.reason}` : undefined,
+        line2: fecha,
+        icon: 'alert-circle-outline',
+      };
+    }
+
+    // Fallback genérico
+    return {
+      title: `${kindBaseLabel(k)} — ${cliente || concepto || '—'}`,
+      line1: money,
+      line2: fecha,
+      icon: 'dots-horizontal',
+    };
+  }
+
   const renderItem = ({ item }: { item: OutboxItem }) => {
     const statusKey: OutboxStatus =
       item.status === 'processing'
@@ -292,6 +375,8 @@ export default function PendientesScreen() {
     const nextRetryTxt = formatNextRetry(item.nextRetryAt);
     const attempts = item.attempts ?? 0;
 
+    const display = getDisplayTexts(item);
+
     return (
       <View
         style={[
@@ -304,27 +389,39 @@ export default function PendientesScreen() {
       >
         <View style={{ flex: 1 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-            <Text style={[styles.title, { color: palette.text }]}>{kindLabel(item.kind)}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <MIcon name={display.icon as any} size={18} color={palette.text} />
+              <Text style={[styles.title, { color: palette.text }]} numberOfLines={1}>
+                {display.title}
+              </Text>
+            </View>
             <StatusPill status={statusKey} colorSet={statusColors} />
           </View>
 
-          <Text style={[styles.sub, { color: palette.softText }]}>
-            {new Date(item.createdAtMs).toLocaleString()}
-          </Text>
+          {!!display.line1 && (
+            <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+              {display.line1}
+            </Text>
+          )}
+          {!!display.line2 && (
+            <Text style={[styles.sub, { color: palette.softText }]} numberOfLines={1}>
+              {display.line2}
+            </Text>
+          )}
 
           <View style={{ marginTop: 4 }}>
-            <Text style={[styles.meta, { color: palette.softText }]}>
+            <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
               Intentos: {attempts}
             </Text>
             {!!nextRetryTxt && (
-              <Text style={[styles.meta, { color: palette.softText }]}>
+              <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
                 Próximo intento: {nextRetryTxt}
               </Text>
             )}
           </View>
 
           {!!(item.lastError || item.error) && (
-            <Text style={[styles.err, { color: '#c62828' }]}>
+            <Text style={[styles.err, { color: '#c62828' }]} numberOfLines={2}>
               Último error: {item.lastError || item.error}
             </Text>
           )}
@@ -395,7 +492,7 @@ export default function PendientesScreen() {
           activeOpacity={0.85}
         >
           <MIcon name="backup-restore" size={18} color={palette.text} />
-          <Text style={[styles.headerBtnTxt, { color: palette.text }]}>Reintentar todos</Text>
+          <Text style={[styles.headerBtnTxt, { color: palette.text }]}>Enviar todos</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
@@ -488,7 +585,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
   },
-  title: { fontSize: 15, fontWeight: '800' },
+  title: { fontSize: 15, fontWeight: '800', maxWidth: 220 },
   sub: { fontSize: 12, marginTop: 2 },
   meta: { fontSize: 12, marginTop: 2 },
   err: { fontSize: 12, marginTop: 6 },

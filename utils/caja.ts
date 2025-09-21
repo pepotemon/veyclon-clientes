@@ -38,7 +38,12 @@ export type MovimientoCaja = {
   createdAtMs?: number;
   meta?: Record<string, any>;
   categoria?: string;      // para gasto_admin / gasto_cobrador
-  source?: 'manual' | 'auto' | 'system';
+  source?: 'manual' | 'auto' | 'system' | 'app' | 'cobrador'; // 👈 añade 'cobrador'
+
+  // 👇 Campos de identidad del movimiento (para informes/UI)
+  clienteId?: string;
+  prestamoId?: string;
+  clienteNombre?: string;
 };
 
 const MIN_AMOUNT = 0.01;
@@ -66,7 +71,13 @@ function sanitizeInput(_admin: string, data: {
   categoria?: string;
   meta?: Record<string, any>;
   source?: MovimientoCaja['source'];
+
+  // 👇 opcionales para informes/UI
+  clienteId?: string;
+  prestamoId?: string;
+  clienteNombre?: string;
 }) {
+  // mapear legacy → canónico (p.ej. 'pago' → 'abono')
   const tip = canonicalTipo(String(data.tipo));
   if (!tip) throw new Error(`Tipo de movimiento inválido: ${String(data.tipo)}`);
 
@@ -82,12 +93,18 @@ function sanitizeInput(_admin: string, data: {
   const admin = (data.admin || _admin || '').trim();
   if (!admin) throw new Error('admin requerido');
 
-  const nota = (data.nota ?? '').toString().trim() || null;          // null OK en Firestore
-  const categoria = (data.categoria ?? '').toString().trim() || undefined; // undefined será removido
+  const nota = (data.nota ?? '').toString().trim() || null;                 // null OK en Firestore
+  const categoria = (data.categoria ?? '').toString().trim() || undefined;  // undefined será removido
   const meta = data.meta && typeof data.meta === 'object' ? data.meta : undefined;
   const source: MovimientoCaja['source'] = data.source || 'manual';
 
-  return { tip, admin, monto, operationalDate, tz, nota, categoria, meta, source };
+  // identidad opcional (se persiste en top-level para UI/consultas)
+  const clienteId = (data.clienteId ?? '').toString().trim() || undefined;
+  const prestamoId = (data.prestamoId ?? '').toString().trim() || undefined;
+  const clienteNombreRaw = (data.clienteNombre ?? '').toString().trim();
+  const clienteNombre = clienteNombreRaw ? clienteNombreRaw : undefined;
+
+  return { tip, admin, monto, operationalDate, tz, nota, categoria, meta, source, clienteId, prestamoId, clienteNombre };
 }
 
 // =============== Escritura clásica (no idempotente) ===============
@@ -112,6 +129,11 @@ export async function addMovimiento(
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
     source: s.source,
+
+    // identidad para UI/informes
+    clienteId: s.clienteId,
+    prestamoId: s.prestamoId,
+    clienteNombre: s.clienteNombre,
   };
 
   const docRef = await addDoc(refCol, stripUndefined(payload));
@@ -122,7 +144,7 @@ export async function addMovimiento(
     action: 'create',
     ref: doc(db, 'cajaDiaria', docRef.id),
     before: null,
-    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source']),
+    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source','clienteId','prestamoId','clienteNombre']),
   });
 
   return docRef.id;
@@ -161,6 +183,11 @@ export async function addMovimientoIdempotente(
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
     source: s.source,
+
+    // identidad para UI/informes
+    clienteId: s.clienteId,
+    prestamoId: s.prestamoId,
+    clienteNombre: s.clienteNombre,
   };
 
   await setDoc(ref, stripUndefined(payload));
@@ -171,17 +198,17 @@ export async function addMovimientoIdempotente(
     action: 'create',
     ref,
     before: null,
-    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source']),
+    after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source','clienteId','prestamoId','clienteNombre']),
   });
 
   return { created: true, id: ref.id };
 }
 
 /**
- * Helper para registrar un ABONO proveniente de la outbox:
+ * ✅ Helper canónico para registrar un ABONO (desde outbox).
  * - Acepta 'pago' o 'abono' (alias legacy admitido).
  * - ID determinístico: 'ox_<outboxId>'.
- * - Adjunta meta útil (clienteId, prestamoId, monto, etc.)
+ * - Escribe `clienteId`, `prestamoId`, `clienteNombre` en top-level (además de `meta`).
  */
 export async function recordAbonoFromOutbox(params: {
   admin: string;
@@ -194,29 +221,49 @@ export async function recordAbonoFromOutbox(params: {
 }): Promise<{ created: boolean; id: string }> {
   const { admin, outboxId, monto, operationalDate, tz, meta, tipo = 'abono' } = params;
 
-  // Mapear a canónico + reutilizar saneo
-  const { tip, admin: adm, monto: m, operationalDate: od, tz: tzOk } = sanitizeInput(admin, {
-    tipo,
-    admin,
-    monto,
-    operationalDate,
-    tz,
-    meta,
-    source: 'system',
-  });
+  // Extraer identidad útil (si vino en meta)
+  const clienteId = meta?.clienteId ? String(meta.clienteId) : undefined;
+  const prestamoId = meta?.prestamoId ? String(meta.prestamoId) : undefined;
+  const clienteNombre = meta?.clienteNombre ? String(meta.clienteNombre) : undefined;
 
   return addMovimientoIdempotente(
-    adm,
+    admin,
     {
-      tipo: tip,        // 'abono' canónico
-      monto: m,
-      operationalDate: od,
-      tz: tzOk,
+      tipo,            // 'pago' → será mapeado a 'abono'
+      monto,
+      operationalDate,
+      tz,
       meta: { fromOutboxId: outboxId, ...(meta || {}) },
       source: 'system',
+      clienteId,
+      prestamoId,
+      clienteNombre,
     },
     `ox_${outboxId}`
   );
+}
+
+/**
+ * ✅ Helper genérico para escribir en cajaDiaria con shape unificado.
+ *    (Recomendado para reemplazar implementaciones locales como en ModalRegistroPago)
+ */
+export async function logToCajaDiaria(data: {
+  tipo: AnyMovimientoTipo;
+  admin: string;
+  monto: number;
+  operationalDate: string;
+  tz: string;
+  nota?: string | null;
+  categoria?: string;
+  meta?: Record<string, any>;
+  source?: MovimientoCaja['source'];
+
+  // identidad opcional
+  clienteId?: string;
+  prestamoId?: string;
+  clienteNombre?: string;
+}) {
+  return addMovimiento(data.admin, data);
 }
 
 // =============== Lecturas ===============
@@ -232,7 +279,7 @@ export async function fetchGastosAdminDelDia(admin: string, hoy: string) {
   );
   const snap = await getDocs(qy);
 
-  const rows = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) })) as MovimientoCaja[];
+  const rows = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
   return rows
     .map(r => ({ ...r, tipo: (canonicalTipo((r as any).tipo) || (r as any).tipo) as MovimientoTipo }))
     .filter(r => canonicalTipo((r as any).tipo) === 'gasto_admin');
@@ -247,7 +294,7 @@ export async function fetchGastosDelCobradorDelDia(admin: string, hoy: string) {
   );
   const snap = await getDocs(qy);
 
-  const rows = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) })) as MovimientoCaja[];
+  const rows = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
   return rows
     .map(r => ({ ...r, tipo: (canonicalTipo((r as any).tipo) || (r as any).tipo) as MovimientoTipo }))
     .filter(r => canonicalTipo((r as any).tipo) === 'gasto_cobrador');

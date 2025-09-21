@@ -43,6 +43,10 @@ type Result = {
 
 function tsFromData(d: any): number {
   if (typeof d?.createdAtMs === 'number') return d.createdAtMs;
+  if (typeof d?.createdAtIso === 'string') {           // NEW: soporta createdAtIso
+    const t = Date.parse(d.createdAtIso);
+    if (!Number.isNaN(t)) return t;
+  }
   if (typeof d?.createdAt?.seconds === 'number') return d.createdAt.seconds * 1000;
   if (typeof d?.fechaInicio?.seconds === 'number') return d.fechaInicio.seconds * 1000; // prestamos
   return 0;
@@ -53,6 +57,10 @@ function ymdFromAny(dateLike: any, tz: string): string | null {
     const dt = (() => {
       if (!dateLike) return null;
       if (typeof dateLike === 'number') return new Date(dateLike);
+      if (typeof dateLike === 'string') {
+        const t = Date.parse(dateLike);
+        return Number.isNaN(t) ? null : new Date(t);
+      }
       if (typeof dateLike?.seconds === 'number') return new Date(dateLike.seconds * 1000);
       if (typeof dateLike?.toDate === 'function') return dateLike.toDate();
       if (dateLike instanceof Date) return dateLike;
@@ -131,7 +139,7 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
       } else if (t === 'abono' || t === 'pago') {
-        // 👇 Mostrar nombre del cliente como título (si existe)
+        // Mostrar nombre del cliente como título (si existe)
         title = cliente.trim() || 'Pago';
         // usar concepto/nota como descripción secundaria si existe
         if (!nota && concepto) nota = concepto;
@@ -165,8 +173,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = snap.docs.map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
+            (tsFromData(b.raw) ?? 0) -
+            (tsFromData(a.raw) ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
@@ -192,8 +200,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = [...s1.docs, ...s2.docs].map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
+            (tsFromData(b.raw) ?? 0) -
+            (tsFromData(a.raw) ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
@@ -225,8 +233,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = [...s1.docs, ...s2.docs, ...s3.docs].map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
+            (tsFromData(b.raw) ?? 0) -
+            (tsFromData(a.raw) ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
@@ -252,15 +260,15 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = [...s1.docs, ...s2.docs].map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
+            (tsFromData(b.raw) ?? 0) -
+            (tsFromData(a.raw) ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
         return;
       }
 
-      // 3) Ventas (préstamos creados hoy por el admin)  👇 **AQUÍ CAMBIAMOS**
+      // 3) Ventas (préstamos creados hoy por el admin)
       if (tipo === 'venta') {
         const qPrest = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin));
         const snap = await getDocs(qPrest);
@@ -295,11 +303,9 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
           const monto = Number(data?.valorNeto ?? data?.capital ?? 0);
           arr.push({
             id: d.id,
-            // 👇 título = cliente (si existe), si no 'Préstamo'
             title: (cliente || '').trim() || 'Préstamo',
             monto: Number.isFinite(monto) ? monto : 0,
             hora,
-            // 👇 nota = concepto si viene (si no, null)
             nota: concepto || null,
             raw: data,
           });
