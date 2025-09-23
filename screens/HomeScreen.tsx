@@ -151,7 +151,7 @@ export default function HomeScreen({ route, navigation }: Props) {
   // 💰 Caja diaria KPI
   const [cobradoHoy, setCobradoHoy] = useState(0);
   const [tieneCajaSnapshot, setTieneCajaSnapshot] = useState(false);
-
+const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
   // 🔄 Refresh manual: fuerza re-suscripción de snapshots
   const [refreshKey, setRefreshKey] = useState(0);
   const handleManualRefresh = () => {
@@ -315,46 +315,56 @@ export default function HomeScreen({ route, navigation }: Props) {
     return () => { alive = false; };
   }, [admin]);
 
-  // 🧾 Suscripción a cajaDiaria para KPI “cobrado hoy”
-  useEffect(() => {
-    if (!admin) return; // 👈 evita query sin admin
+ // 🧾 Suscripción a cajaDiaria para KPI “cobrado hoy” + marcar visitados por prestamoId
+useEffect(() => {
+  if (!admin) return; // evita query sin admin
 
-    setTieneCajaSnapshot(false);
-    setCobradoHoy(0);
+  setTieneCajaSnapshot(false);
+  setCobradoHoy(0);
+  setCajaVisitados(new Set()); // ✅ reset al cambiar de día/admin
 
-    try {
-      const qCaja = query(
-        collection(db, 'cajaDiaria'),
-        where('admin', '==', admin),
-        where('operationalDate', '==', hoyApp)
-      );
-      const unsub = onSnapshot(
-        qCaja,
-        (snap) => {
-          let total = 0;
-          snap.forEach((d) => {
-            const data = d.data() as any;
-            const m = Number(data?.monto || 0);
-            const tipo = String(data?.tipo || '');
-            // 👇 Solo los movimientos tipo 'abono' cuentan como cobrado
-            if (tipo === 'abono' && Number.isFinite(m)) {
-              total += m;
-            }
-          });
-          setCobradoHoy(total);
-          setTieneCajaSnapshot(true);
-        },
-        (err) => {
-          console.warn('[cajaDiaria] snapshot error:', err?.code || err?.message || err);
-          // Fallback legacy (tieneCajaSnapshot permanece false)
-        }
-      );
-      return () => unsub();
-    } catch (e) {
-      console.warn('[cajaDiaria] suscripción no disponible:', e);
-      return () => {};
-    }
-  }, [admin, hoyApp, refreshKey]); // 👈 incluye refreshKey para “Actualizar ahora”
+  try {
+    const qCaja = query(
+      collection(db, 'cajaDiaria'),
+      where('admin', '==', admin),
+      where('operationalDate', '==', hoyApp)
+    );
+    const unsub = onSnapshot(
+      qCaja,
+      (snap) => {
+        let total = 0;
+        const ids = new Set<string>();
+
+        snap.forEach((d) => {
+          const data = d.data() as any;
+          const m = Number(data?.monto || 0);
+          const tipo = String(data?.tipo || '');
+          // Solo los 'abono' cuentan y marcan visitado
+          if (tipo === 'abono' && Number.isFinite(m)) {
+            total += m;
+
+            // 👉 recordAbonoFromOutbox y pagos online deben guardar prestamoId top-level
+            const pid = typeof data?.prestamoId === 'string' ? data.prestamoId : undefined;
+            if (pid) ids.add(pid);
+          }
+        });
+
+        setCobradoHoy(total);
+        setCajaVisitados(ids);
+        setTieneCajaSnapshot(true);
+      },
+      (err) => {
+        console.warn('[cajaDiaria] snapshot error:', err?.code || err?.message || err);
+        // Fallback: deja tieneCajaSnapshot=false y usaremos el legacy
+      }
+    );
+    return () => unsub();
+  } catch (e) {
+    console.warn('[cajaDiaria] suscripción no disponible:', e);
+    return () => {};
+  }
+}, [admin, hoyApp, refreshKey]);
+
 
   // 👤 Suscripción en tiempo real a /clientes → mapa por id
   useEffect(() => {
@@ -628,17 +638,22 @@ export default function HomeScreen({ route, navigation }: Props) {
     });
   }, [prestamosAdmin, clientesMap, routeOrderIds]);
 
-  function esVisitadoHoy(p: Prestamo, tzFallback = tzSession, hoyStr?: string) {
-    const tzPrestamo = pickTZ(p.tz, tzFallback);
-    const hoyPrestamo = hoyStr ?? todayInTZ(tzPrestamo);
-    return (
-      Array.isArray(p.abonos) &&
-      p.abonos.some((a) => {
-        const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
-        return dia === hoyPrestamo;
-      })
-    );
-  }
+ function esVisitadoHoy(p: Prestamo, tzFallback = tzSession, hoyStr?: string) {
+  // ✅ Si caja de hoy tiene un abono para este préstamo, ya está visitado
+  if (cajaVisitados.has(p.id)) return true;
+
+  // ↘️ Respaldo por array denormalizado ‘abonos’
+  const tzPrestamo = pickTZ(p.tz, tzFallback);
+  const hoyPrestamo = hoyStr ?? todayInTZ(tzPrestamo);
+  return (
+    Array.isArray(p.abonos) &&
+    p.abonos.some((a) => {
+      const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
+      return dia === hoyPrestamo;
+    })
+  );
+}
+
 
   function getHoyTZ(p: Prestamo) {
     const tzPrestamo = pickTZ(p.tz, tzSession);

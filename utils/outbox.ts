@@ -11,6 +11,7 @@ import {
   serverTimestamp,
   getDoc,
   getDocs,
+  arrayUnion,               // 👈 Necesario para espejar en el array "abonos"
 } from 'firebase/firestore';
 import { logAudit, pick } from './auditLogs';
 import { pickTZ, todayInTZ } from './timezone';
@@ -384,13 +385,29 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
     const nextRestante = Math.max(0, Number(restanteActual) - Number(monto));
     nuevoRestante = nextRestante;
 
+    // 1) Actualiza restante
     tx.update(prestamoRef, {
       restante: nextRestante,
       updatedAt: serverTimestamp(),
     });
 
-    // Crear el abono con ID determinístico
+    // 2) Crea el subdocumento del abono (idempotente)
     tx.set(abonoDocRef, abonoDoc);
+
+    // 3) 🔁 ESPEJO LEGACY: empuja también al array "abonos" del doc (para Home/PagosDiarios)
+    //    Esta rama solo corre cuando se crea por primera vez (evita duplicados).
+    tx.update(prestamoRef, {
+      abonos: arrayUnion({
+        monto: Number(monto),
+        operationalDate,         // YYYY-MM-DD (lo que tus pantallas consultan)
+        tz,
+        registradoPor: admin,
+        createdAtMs: Date.now(),
+        source: 'outbox',
+        fromOutboxId: item.id,
+      }),
+      lastAbonoAt: serverTimestamp(),
+    });
 
     return true as const;
   });
