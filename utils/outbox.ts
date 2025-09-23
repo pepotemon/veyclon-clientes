@@ -1,5 +1,6 @@
 // utils/outbox.ts
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { DeviceEventEmitter } from 'react-native';
 
 // ➕ IMPORTS para reenvío real
 import { db } from '../firebase/firebaseConfig';
@@ -10,7 +11,6 @@ import {
   serverTimestamp,
   getDoc,
   getDocs,
-  setDoc,
 } from 'firebase/firestore';
 import { logAudit, pick } from './auditLogs';
 import { pickTZ, todayInTZ } from './timezone';
@@ -142,12 +142,17 @@ export function emitOutboxChanged() {
   }
 }
 
+/* 🔔 Evento global para que Home/Pagos recarguen al terminar un envío */
+export const OUTBOX_FLUSHED = 'outbox:flushed';
+export function emitOutboxFlushed() {
+  try { DeviceEventEmitter.emit(OUTBOX_FLUSHED); } catch {}
+}
+
 /* ============ Storage helpers ============ */
 export async function loadOutbox(): Promise<OutboxItem[]> {
   try {
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
     const parsed: any[] = raw ? JSON.parse(raw) : [];
-    // sanity: filtra objetos malformados
     return Array.isArray(parsed) ? (parsed as OutboxItem[]) : [];
   } catch {
     return [];
@@ -168,16 +173,12 @@ export async function listOutbox(): Promise<OutboxItem[]> {
 /* ============ Contadores para badge ============ */
 export async function getOutboxCounts(): Promise<OutboxStatusCounts> {
   const list = await loadOutbox();
-  // Contamos todo lo que no esté "done" (normalmente nunca guardas 'done', se elimina)
   const pending = list.filter((x) => (x.status ?? 'pending') !== 'done');
   const byKind: Record<OutboxKind, number> = { abono: 0, venta: 0, no_pago: 0, mov: 0, otro: 0 };
   for (const it of pending) {
     const k = it.kind as OutboxKind;
-    if (byKind[k] != null) {
-      byKind[k] += 1;
-    } else {
-      byKind.otro += 1; // fallback por si aparece algo raro
-    }
+    if (byKind[k] != null) byKind[k] += 1;
+    else byKind.otro += 1;
   }
   return { totalPending: pending.length, byKind };
 }
@@ -216,23 +217,19 @@ export async function addToOutbox(
     id: genLocalId(),
     createdAtMs: Date.now(),
     attempts: 0,
-    status: 'pending' as OutboxStatus, // 👈 evita widening
+    status: 'pending' as OutboxStatus,
   };
 
   let full: OutboxItem;
 
   if (params.kind === 'abono') {
-    // 1) Validar duplicados por cliente
     const clienteId = params.payload?.clienteId;
-    if (!clienteId) {
-      throw new Error('Falta clienteId en el payload de abono.');
-    }
+    if (!clienteId) throw new Error('Falta clienteId en el payload de abono.');
     const current = await loadOutbox();
     if (hasBlockingAbonoForCliente(current, clienteId)) {
       throw new Error('Este cliente ya tiene un pago pendiente sin enviar.');
     }
 
-    // 2) Normalizar clienteNombre top-level
     const clienteNombreNorm =
       params.payload?.clienteNombre ?? params.payload?.cajaPayload?.clienteNombre ?? undefined;
 
@@ -248,7 +245,6 @@ export async function addToOutbox(
     list.push(full);
     await saveOutbox(list);
   } else if (params.kind === 'venta') {
-    // Normaliza nombre cliente si llega vacío
     const clienteNombreNorm = params.payload?.clienteNombre ?? undefined;
     full = {
       ...base,
@@ -268,7 +264,6 @@ export async function addToOutbox(
     list.push(full);
     await saveOutbox(list);
   } else if (params.kind === 'mov') {
-    // Validación mínima
     const sk = params.payload.subkind;
     if (!['ingreso', 'retiro', 'gasto_admin', 'gasto_cobrador'].includes(sk)) {
       throw new Error(`Movimiento subkind inválido: ${sk}`);
@@ -358,10 +353,12 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
 
   const abonoDoc = {
     monto: Number(monto),
-    creadoPor: admin,
+    registradoPor: admin,
     tz,
     operationalDate, // YYYY-MM-DD
     createdAt: serverTimestamp(),
+    createdAtMs: Date.now(),
+    source: 'outbox',
     fromOutboxId: item.id, // trazabilidad
   };
 
@@ -379,8 +376,12 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
     if (!snapPrestamo.exists()) throw new Error('Préstamo no existe (abono)');
 
     const data = snapPrestamo.data() as any;
-    const restanteActual = Number(data?.restante ?? 0);
-    const nextRestante = Math.max(0, restanteActual - Number(monto));
+    const restanteActual =
+      typeof data.restante === 'number'
+        ? data.restante
+        : (data.montoTotal || data.totalPrestamo || 0);
+
+    const nextRestante = Math.max(0, Number(restanteActual) - Number(monto));
     nuevoRestante = nextRestante;
 
     tx.update(prestamoRef, {
@@ -445,6 +446,7 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
           diasAtraso: res.atraso,
           faltas: res.faltas || [],
           ultimaReconciliacion: serverTimestamp(),
+          lastAbonoAt: serverTimestamp(),
         };
         if (typeof nuevoRestante === 'number') {
           updates.restante = nuevoRestante;
@@ -533,7 +535,7 @@ async function reenviarVenta(item: OutboxVenta): Promise<void> {
     const payloadPrestamo: any = {
       creadoPor: admin,
       clienteId,
-      concepto: (clienteNombre || '').trim(),
+      concepto: (clienteNombre || '').trim() || 'Sin nombre',
       valorCuota: Number(valorCuota),
       cuotas: Number(cuotas),
       totalPrestamo: Number(total),
@@ -565,7 +567,6 @@ async function reenviarVenta(item: OutboxVenta): Promise<void> {
         monto: Number(retiroCaja || total),
         operationalDate,
         tz,
-        // top-level (si tu helper ya los persiste) + meta
         clienteId,
         prestamoId,
         clienteNombre,
@@ -636,6 +637,7 @@ async function reenviarNoPago(item: OutboxNoPago): Promise<void> {
     saldo: Number(data?.restante || 0),
     createdAt: serverTimestamp(),
     fromOutboxId: item.id,
+    source: 'outbox',
   };
   if (nota && nota.trim()) base.nota = nota.trim();
   if (promesaFecha && promesaFecha.trim()) base.promesaFecha = promesaFecha.trim();
@@ -674,7 +676,6 @@ async function reenviarMov(item: OutboxMov): Promise<void> {
     throw new Error(`Movimiento subkind inválido: ${subkind}`);
   }
 
-  // Doc idempotente con subkind
   const docId = `oxmov_${subkind}_${item.id}`;
 
   await addMovimientoIdempotente(
@@ -687,13 +688,9 @@ async function reenviarMov(item: OutboxMov): Promise<void> {
       tz,
       nota: (nota ?? null) || null,
       categoria: subkind === 'gasto_admin' ? (categoria || undefined) : undefined,
-
-      // 👉 top-level para informes (si tu helper ya los persiste)
       clienteId: clienteId || undefined,
       prestamoId: prestamoId || undefined,
       clienteNombre: clienteNombre || undefined,
-
-      // y meta adicional con trazabilidad
       meta: {
         ...(meta || {}),
         fromOutboxId: item.id,
@@ -707,7 +704,6 @@ async function reenviarMov(item: OutboxMov): Promise<void> {
     docId
   );
 
-  // AUDIT
   await logAudit({
     userId: admin,
     action: 'mov_outbox',
@@ -763,7 +759,7 @@ const BACKOFF_MAX_MS = 60_000;
 const MAX_ATTEMPTS = 8;
 
 function computeNextBackoff(attempts: number): number {
-  const exp = Math.max(0, attempts - 1); // 0,1,2...
+  const exp = Math.max(0, attempts - 1);
   const ms = BACKOFF_BASE_MS * Math.pow(2, exp);
   return Math.min(BACKOFF_MAX_MS, ms);
 }
@@ -784,6 +780,8 @@ async function applyResult(
   if (result.ok) {
     const filtered: OutboxItem[] = list.filter((x) => x.id !== id);
     await saveOutbox(filtered);
+    // 🔔 notifica a la UI (Home/Pagos) para refrescar KPIs/listas
+    emitOutboxFlushed();
     return filtered;
   }
   // fallo → marcar error + backoff (o detener si excede MAX_ATTEMPTS)
@@ -799,7 +797,7 @@ async function applyResult(
       attempts,
       status: 'error',
       lastError: result.errorMsg || 'Fallo al reenviar (límite de intentos)',
-      nextRetryAt: undefined, // se detiene el backoff
+      nextRetryAt: undefined,
     };
   } else {
     const backoff = computeNextBackoff(attempts);
@@ -853,7 +851,7 @@ export async function processOutboxBatch(maxItems: number): Promise<void> {
   // Ejecutar secuencialmente (simple y seguro)
   for (const it of toRun) {
     const currentSnapshot = state.find((x) => x.id === it.id);
-    if (!currentSnapshot) continue; // pudo ser eliminado por otra corrida
+    if (!currentSnapshot) continue;
     const result = await safeProcessOne(currentSnapshot);
     state = await applyResult(state, it.id, result);
   }

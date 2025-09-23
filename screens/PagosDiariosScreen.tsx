@@ -16,11 +16,12 @@ import {
   Keyboard,
   NativeSyntheticEvent,
   GestureResponderEvent,
+  DeviceEventEmitter,
 } from 'react-native';
-import { useNavigation, useFocusEffect } from '@react-navigation/native'; // 👈 añadido useFocusEffect
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { db } from '../firebase/firebaseConfig';
-import { getDocs, collection, collectionGroup, onSnapshot } from 'firebase/firestore';
+import { getDocs, collection, collectionGroup, onSnapshot, doc } from 'firebase/firestore';
 import ModalRegistroPago from '../components/ModalRegistroPago';
 import InstantOpcionesCliente from '../components/InstantOpcionesCliente';
 import { RootStackParamList } from '../App';
@@ -33,8 +34,11 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // ✅ Solo cuotas vencidas
 import { computeQuotaBadge } from '../utils/alerts';
 
-// 👇 añadido: util para garantizar orden de ruta
-import { ensureRouteOrder, loadRutaOrder } from '../utils/ruta'; // 👈 añadí loadRutaOrder
+// 👇 orden de ruta
+import { ensureRouteOrder, loadRutaOrder } from '../utils/ruta';
+
+// 👇 evento de outbox para refrescar UI tras flush
+import { OUTBOX_FLUSHED } from '../utils/outbox';
 
 type Cliente = {
   id: string;
@@ -44,7 +48,6 @@ type Cliente = {
   telefono1?: string;
   telefono2?: string;
   genero?: 'M' | 'F' | 'O';
-  // 👇 añadido: orden de ruta
   routeOrder?: number;
 };
 
@@ -85,6 +88,9 @@ type Prestamo = {
   feriados?: string[];
   pausas?: { desde: string; hasta: string; motivo?: string }[];
   modoAtraso?: 'porPresencia' | 'porCuota';
+
+  // 👇 añadido: para detectar visita de hoy cuando el abono viene de subcolección (outbox)
+  lastAbonoAt?: any;
 };
 
 type Filtro = 'todos' | 'pendientes' | 'visitados';
@@ -109,8 +115,11 @@ export default function PagosDiariosScreen({ route }: any) {
   const [dayTick, setDayTick] = useState(0);
   const [mensajeExito, setMensajeExito] = useState('');
 
-  // 👇 añadido: orden guardado en AsyncStorage por admin
-  const [routeOrderIds, setRouteOrderIds] = useState<string[]>([]); // ← ids de clientes ordenados
+  // 👇 orden guardado en AsyncStorage por admin
+  const [routeOrderIds, setRouteOrderIds] = useState<string[]>([]);
+
+  // 👇 pulso para forzar re-render al flush del outbox (snapshot igual traerá cambios)
+  const [outboxPulse, setOutboxPulse] = useState(0);
 
   const tzSession = 'America/Sao_Paulo';
 
@@ -214,7 +223,7 @@ export default function PagosDiariosScreen({ route }: any) {
       momentumRef.current = false;
       justHandledCaptureRef.current = true;
       requestAnimationFrame(() => {
-        openPagoDirecto(item); // 👈 tap durante inercia = pago directo
+        openPagoDirecto(item); // tap durante inercia = pago directo
         requestAnimationFrame(() => { justHandledCaptureRef.current = false; });
       });
     },
@@ -222,20 +231,21 @@ export default function PagosDiariosScreen({ route }: any) {
   );
   // ========================================================
 
+  // Redirección si no hay sesión
+  useFocusEffect(
+    useCallback(() => {
+      let alive = true;
+      (async () => {
+        const u = await AsyncStorage.getItem('usuarioSesion');
+        if (alive && !u) {
+          navigation.reset({ index: 0, routes: [{ name: 'Login' }] });
+        }
+      })();
+      return () => { alive = false; };
+    }, [navigation])
+  );
 
-useFocusEffect(
-  useCallback(() => {
-    let alive = true;
-    (async () => {
-      const u = await AsyncStorage.getItem('usuarioSesion');
-      if (alive && !u) {
-        navigation.reset({ index: 0, routes: [{ name: 'Login' }] });
-      }
-    })();
-    return () => { alive = false; };
-  }, [navigation])
-);
-
+  // Tique de medianoche en TZ
   useEffect(() => {
     let t: ReturnType<typeof setTimeout>;
     const schedule = () => {
@@ -255,7 +265,17 @@ useFocusEffect(
     return () => sub.remove();
   }, []);
 
-  // 👇 añadido: recargar orden cuando la pantalla gana foco
+  // 👉 escuchar flush del outbox (cuando un abono/no_pago/venta/mov se sube)
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener(OUTBOX_FLUSHED, () => {
+      // no necesitamos refetchear manual: el onSnapshot disparará
+      // forzamos un rerender suave para que la UI responda instantáneamente
+      setOutboxPulse((n) => n + 1);
+    });
+    return () => sub.remove();
+  }, []);
+
+  // recargar orden cuando gana foco
   useFocusEffect(
     useCallback(() => {
       let alive = true;
@@ -267,30 +287,39 @@ useFocusEffect(
     }, [admin])
   );
 
-  const hoySession = useMemo(() => todayInTZ(tzSession), [tzSession, dayTick]);
+  const hoySession = useMemo(() => todayInTZ(tzSession), [tzSession, dayTick, outboxPulse]);
 
+  // 🟢 visitado hoy: por abonos en doc (legacy) o por lastAbonoAt (subcolección / outbox)
   const esVisitadoHoy = useCallback(
     (p: Prestamo) => {
       const tz = pickTZ(p.tz, tzSession);
       const hoy = todayInTZ(tz);
-      return (
+
+      // 1) Legacy: arreglo embebido en el documento (todavía puede existir)
+      const viaArray =
         Array.isArray(p.abonos) &&
         p.abonos.some((a) => {
           const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
           return dia === hoy;
-        })
-      );
+        });
+
+      if (viaArray) return true;
+
+      // 2) Nuevo: marcamos lastAbonoAt en el préstamo cuando se reenvía un abono (subcolección)
+      const lastYmd = anyDateToYYYYMMDD(p.lastAbonoAt, tz);
+      return lastYmd === hoy;
     },
     [tzSession]
   );
 
+  // Carga de clientes + stream de préstamos
   useEffect(() => {
     let unsub: any;
     const cargar = async () => {
       try {
         setCargando(true);
 
-        // 👇 añadido: garantizar que todos los clientes del admin tengan routeOrder (compat)
+        // Asegura routeOrder
         try {
           await ensureRouteOrder(admin);
         } catch (e) {
@@ -308,7 +337,6 @@ useFocusEffect(
             telefono1: data?.telefono1,
             telefono2: data?.telefono2,
             genero: data?.genero,
-            // 👇 traemos routeOrder si existe (backup)
             routeOrder: typeof data?.routeOrder === 'number' ? data.routeOrder : undefined,
           } as Cliente;
         });
@@ -341,13 +369,16 @@ useFocusEffect(
               createdAtMs: (data as any)?.createdAtMs,
               fechaInicio: (data as any)?.fechaInicio,
 
-              // ⬇️ para cálculo de cuotas vencidas y “adelantado”
+              // cálculo robusto
               permitirAdelantar: data.permitirAdelantar,
               cuotas: data.cuotas,
               diasHabiles: data.diasHabiles,
               feriados: data.feriados,
               pausas: data.pausas,
               modoAtraso: data.modoAtraso,
+
+              // 👇 NUEVO: viene del reenviador de outbox
+              lastAbonoAt: (data as any)?.lastAbonoAt,
             });
           });
           setPrestamos(lista);
@@ -367,24 +398,22 @@ useFocusEffect(
     for (const c of clientes) idx[c.id] = c;
 
     const BIG = 1e9;
-    const pos = new Map<string, number>(routeOrderIds.map((id, i) => [id, i])); // 👈 posiciones según AsyncStorage
+    const pos = new Map<string, number>(routeOrderIds.map((id, i) => [id, i]));
 
     return prestamos
       .filter((p) => p.creadoPor === admin)
       .map((p) => ({ ...p, cliente: idx[p.clienteId || ''] }))
-      // 👇 ordenar por orden de ruta (ids de cliente); si no está en la lista, al final
       .sort((a, b) => {
         const pa = a.clienteId ? (pos.has(a.clienteId) ? (pos.get(a.clienteId) as number) : BIG) : BIG;
         const pb = b.clienteId ? (pos.has(b.clienteId) ? (pos.get(b.clienteId) as number) : BIG) : BIG;
         if (pa !== pb) return pa - pb;
 
-        // backup: si ninguno está en lista, usamos routeOrder Firestore si existe, luego nombre
         const ra = typeof a.cliente?.routeOrder === 'number' ? a.cliente!.routeOrder! : BIG;
         const rb = typeof b.cliente?.routeOrder === 'number' ? b.cliente!.routeOrder! : BIG;
         if (ra !== rb) return ra - rb;
         return (a.concepto || '').localeCompare(b.concepto || '');
       });
-  }, [clientes, prestamos, admin, routeOrderIds]); // 👈 dependemos de routeOrderIds
+  }, [clientes, prestamos, admin, routeOrderIds, outboxPulse]);
 
   const filasBuscadas = useMemo(() => {
     const q = busqueda.trim().toLowerCase();
@@ -446,21 +475,16 @@ useFocusEffect(
       const c = item.cliente;
       const visitado = esVisitadoHoy(item);
       const esNuevo = !visitado && esNuevoHoyOPas48h(item);
-const qbRaw = computeQuotaBadge(item);
-let quotaLabel = qbRaw.label;
 
-// Compactar a “+N” tanto para vencidas como adelantadas
-const mV = qbRaw.label.match(/^Cuota(?:s)?\s+vencida(?:s)?:\s*(\d+)/i);
-const mA = qbRaw.label.match(/^Cuota(?:s)?\s+adelantada(?:s)?:\s*(\d+)/i);
+      const qbRaw = computeQuotaBadge(item);
+      let quotaLabel = qbRaw.label;
 
-if (mV) {
-  quotaLabel = `+${mV[1]}`;        // rojo (viene del color de qbRaw)
-} else if (mA) {
-  quotaLabel = `+${mA[1]}`;        // verde (viene del color de qbRaw)
-} else if (/^Cuotas al día$/i.test(qbRaw.label)) {
-  quotaLabel = 'Al día';
-}
-
+      // compactar a +N
+      const mV = qbRaw.label.match(/^Cuota(?:s)?\s+vencida(?:s)?:\s*(\d+)/i);
+      const mA = qbRaw.label.match(/^Cuota(?:s)?\s+adelantada(?:s)?:\s*(\d+)/i);
+      if (mV) quotaLabel = `+${mV[1]}`;
+      else if (mA) quotaLabel = `+${mA[1]}`;
+      else if (/^Cuotas al día$/i.test(qbRaw.label)) quotaLabel = 'Al día';
 
       return (
         <TouchableOpacity
@@ -653,6 +677,7 @@ if (mV) {
           onMomentumScrollBegin={() => { momentumRef.current = true; }}
           onMomentumScrollEnd={() => { momentumRef.current = false; }}
           onTouchEndCapture={handleTouchEndCapture}
+          extraData={outboxPulse}
         />
       )}
 
@@ -681,17 +706,40 @@ if (mV) {
             comercio: prestamoSeleccionado.clienteAlias ?? '',
           }}
           onCerrar={() => setOpcionesVisible(false)}
-          onSeleccionarOpcion={(opcion) => {
+          onSeleccionarOpcion={async (opcion) => {
             if (opcion === 'pago') {
               setOpcionesVisible(false);
               setModalPagoVisible(true);
             } else if (opcion === 'historial') {
               setOpcionesVisible(false);
-              const abonosCompat = (prestamoSeleccionado.abonos || []).map((a: any) => ({
-                monto: Number(a.monto) || 0,
-                fecha:
-                  a.operationalDate ?? normYYYYMMDD(a.fecha) ?? todayInTZ(pickTZ(prestamoSeleccionado.tz)),
-              }));
+
+              // 🔎 Traer abonos desde SUBCOLECCIÓN para que el historial incluya offline/outbox
+              let abonosCompat: { monto: number; fecha: string }[] = [];
+              try {
+                if (prestamoSeleccionado?.clienteId && prestamoSeleccionado?.id) {
+                  const colRef = collection(
+                    doc(db, 'clientes', prestamoSeleccionado.clienteId),
+                    'prestamos',
+                    prestamoSeleccionado.id,
+                    'abonos'
+                  );
+                  const snap = await getDocs(colRef);
+                  abonosCompat = snap.docs
+                    .map((d) => d.data() as any)
+                    .map((a) => ({
+                      monto: Number(a?.monto) || 0,
+                      fecha: a?.operationalDate ?? normYYYYMMDD(a?.fecha) ?? todayInTZ(pickTZ(prestamoSeleccionado.tz)),
+                    }));
+                }
+              } catch {
+                // Fallback al arreglo legacy del doc si algo falla
+                abonosCompat = (prestamoSeleccionado.abonos || []).map((a: any) => ({
+                  monto: Number(a.monto) || 0,
+                  fecha:
+                    a.operationalDate ?? normYYYYMMDD(a.fecha) ?? todayInTZ(pickTZ(prestamoSeleccionado.tz)),
+                }));
+              }
+
               navigation.navigate('HistorialPagos', {
                 abonos: abonosCompat,
                 nombreCliente: prestamoSeleccionado.concepto ?? 'Cliente',
