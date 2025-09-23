@@ -11,7 +11,7 @@ import {
   serverTimestamp,
   getDoc,
   getDocs,
-  arrayUnion,               // 👈 Necesario para espejar en el array "abonos"
+  arrayUnion,               // 👈 espejo en array "abonos"
 } from 'firebase/firestore';
 import { logAudit, pick } from './auditLogs';
 import { pickTZ, todayInTZ } from './timezone';
@@ -361,9 +361,10 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
     createdAtMs: Date.now(),
     source: 'outbox',
     fromOutboxId: item.id, // trazabilidad
+    // (si quieres homogeneidad con “online”) createdAtIso: new Date().toISOString(),
   };
 
-  // 1) Transacción idempotente: si ya existe el abono, no hacer nada.
+  // 1) Transacción idempotente
   let nuevoRestante: number | null = null;
   const created = await runTransaction(db, async (tx) => {
     const existing = await tx.get(abonoDocRef);
@@ -394,12 +395,11 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
     // 2) Crea el subdocumento del abono (idempotente)
     tx.set(abonoDocRef, abonoDoc);
 
-    // 3) 🔁 ESPEJO LEGACY: empuja también al array "abonos" del doc (para Home/PagosDiarios)
-    //    Esta rama solo corre cuando se crea por primera vez (evita duplicados).
+    // 3) 🔁 ESPEJO LEGACY: empuja también al array "abonos" del doc
     tx.update(prestamoRef, {
       abonos: arrayUnion({
         monto: Number(monto),
-        operationalDate,         // YYYY-MM-DD (lo que tus pantallas consultan)
+        operationalDate,         // YYYY-MM-DD
         tz,
         registradoPor: admin,
         createdAtMs: Date.now(),
@@ -412,8 +412,24 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
     return true as const;
   });
 
-  // 2) Si NO se creó (ya existía), salir sin duplicar caja ni auditoría.
-  if (!created) return;
+  // 2) Si NO se creó (ya existía), **igual** garantiza caja idempotente y sal:
+  if (!created) {
+    await recordAbonoFromOutbox({
+      admin,
+      outboxId: item.id,
+      monto: Number(monto),
+      operationalDate,
+      tz,
+      clienteNombre: clienteNombre ?? cajaPayload?.clienteNombre,
+      clienteId,
+      prestamoId,
+      meta: {
+        abonoRefPath: abonoDocRef.path,
+        alreadyExisted: true,
+      },
+    });
+    return;
+  }
 
   // 3) Recalcular y actualizar diasAtraso/faltas en el préstamo (best-effort)
   try {
@@ -472,7 +488,7 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
       });
     }
   } catch {
-    // tolerante a fallos de recálculo; el restante ya quedó consistente
+    // tolerante a fallos de recálculo
   }
 
   // 4) Caja — idempotente con 'ox_<outboxId>' (con top-level nombre/ids)
@@ -597,7 +613,7 @@ async function reenviarVenta(item: OutboxVenta): Promise<void> {
       `oxsale_${item.id}`
     );
   } catch {
-    // best-effort: si caja falla, el préstamo igualmente quedó creado idempotentemente
+    // best-effort
   }
 
   await logAudit({
@@ -660,7 +676,7 @@ async function reenviarNoPago(item: OutboxNoPago): Promise<void> {
   if (promesaFecha && promesaFecha.trim()) base.promesaFecha = promesaFecha.trim();
   if (typeof promesaMonto === 'number' && isFinite(promesaMonto)) base.promesaMonto = promesaMonto;
 
-  // Transacción idempotente: si ya existe, no recrear
+  // Transacción idempotente
   const created = await runTransaction(db, async (tx) => {
     const existing = await tx.get(noPagoRef);
     if (existing.exists()) return false as const;
