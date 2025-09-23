@@ -119,12 +119,12 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
         const cData = cSnap.exists() ? ({ id: cSnap.id, ...(cSnap.data() as any) } as Cliente) : null;
         setCliente(cData);
 
-        // 2) Préstamos activos
+        // 2) Préstamos activos (base)
         const pSnap = await getDocs(collection(db, 'clientes', clienteId, 'prestamos'));
-        const activos: Prestamo[] = [];
+        const activosBase: Prestamo[] = [];
         pSnap.forEach((d) => {
           const data = d.data() as any;
-          activos.push({
+          activosBase.push({
             id: d.id,
             clienteId,
             concepto: (data.concepto ?? '').trim() || 'Sin nombre',
@@ -132,7 +132,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
             restante: Number(data.restante ?? 0),
             valorCuota: Number(data.valorCuota ?? 0),
             modalidad: data.modalidad ?? 'Diaria',
-            abonos: Array.isArray(data.abonos) ? data.abonos : [],
+            abonos: Array.isArray(data.abonos) ? data.abonos : [], // legacy
             tz: data.tz || 'America/Sao_Paulo',
             fechaInicio: data.fechaInicio,
 
@@ -144,9 +144,57 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
             cuotas: typeof data.cuotas === 'number' ? data.cuotas : undefined,
           });
         });
+
+        // 2.b) ⬅️ Completar con subcolección 'abonos' (nueva fuente idempotente del outbox)
+        const activos: Prestamo[] = await Promise.all(
+          activosBase.map(async (p) => {
+            try {
+              const subSnap = await getDocs(collection(db, 'clientes', clienteId, 'prestamos', p.id, 'abonos'));
+              const fromSub = subSnap.docs.map((dd) => {
+                const a = dd.data() as any;
+                // Normalizamos a nuestro tipo Abono
+                const createdMs =
+                  typeof a?.createdAt?.seconds === 'number'
+                    ? a.createdAt.seconds * 1000
+                    : (typeof a?.createdAtMs === 'number' ? a.createdAtMs : undefined);
+
+                const fechaIso = createdMs ? new Date(createdMs).toISOString() : undefined;
+
+                return {
+                  monto: Number(a?.monto || 0),
+                  operationalDate: a?.operationalDate, // YYYY-MM-DD (preferido para “abonos hoy”)
+                  fecha: fechaIso,                     // ISO para historial/orden
+                  tz: a?.tz,
+                  registradoPor: a?.creadoPor,
+                } as Abono;
+              });
+
+              // Merge con legacy array, si existiera
+              const legacy = Array.isArray(p.abonos) ? p.abonos : [];
+              const merged = [...legacy, ...fromSub];
+
+              // Ordenar por fecha con preferencia a operationalDate, luego created
+              merged.sort((a, b) => {
+                const aa =
+                  (a.operationalDate ? Date.parse(a.operationalDate + 'T12:00:00Z') : NaN) ||
+                  (a.fecha ? Date.parse(a.fecha) : NaN) || 0;
+                const bb =
+                  (b.operationalDate ? Date.parse(b.operationalDate + 'T12:00:00Z') : NaN) ||
+                  (b.fecha ? Date.parse(b.fecha) : NaN) || 0;
+                return bb - aa;
+              });
+
+              return { ...p, abonos: merged };
+            } catch {
+              // si falla subcolección, seguimos con legacy
+              return p;
+            }
+          })
+        );
+
         setPrestamosActivos(activos);
 
-        // 3) Historial
+        // 3) Historial de préstamos
         const hSnap = await getDocs(collection(db, 'clientes', clienteId, 'historialPrestamos'));
         const hist: HistorialItem[] = [];
         hSnap.forEach((d) => {
@@ -355,7 +403,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                           Modalidad: {p.modalidad || 'Diaria'} • Cuota: R$ {Number(p.valorCuota || 0).toFixed(2)}
                         </Text>
                         <Text style={[styles.loanMeta, { color: palette.softText }]}>
-                          Saldo:{' '}
+                          Saldo{' '}
                           <Text style={[styles.kpiStrong, { color: palette.text }]}>
                             R$ {Number(p.restante || 0).toFixed(2)}
                           </Text>
@@ -384,7 +432,6 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                             Abonos hoy: {abHoy.length}
                           </Text>
 
-                          {/* KPIs corregidos */}
                           <Text
                             style={[
                               styles.badge,
@@ -410,6 +457,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                             onPress={() => {
                               const abonosCompat = (p.abonos || []).map((a: any) => ({
                                 monto: Number(a.monto) || 0,
+                                // preferimos operationalDate para la UI diaria; si no, ISO → YYYY-MM-DD
                                 fecha: a.operationalDate ?? normYYYYMMDD(a.fecha) ?? hoySession,
                               }));
                               navigation.navigate('HistorialPagos', {

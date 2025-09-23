@@ -56,9 +56,10 @@ export default function MenuPrincipalScreen({ navigation }: Props) {
 
     (async () => {
       try {
-        const tz = pickTZ();
+        // 🔒 TZ fija para caja (evita cierres con TZs distintas y fechas raras)
+        const tz = pickTZ('America/Sao_Paulo');
         const hoy = todayInTZ(tz);
-        await closeMissingDays(admin, hoy, tz);
+        await closeMissingDays(admin, hoy, tz, 7);
         await ensureAperturaDeHoy(admin, hoy, tz);
       } catch (e: any) {
         console.warn('[MenuPrincipal] saneador error:', e?.message || e);

@@ -1,32 +1,56 @@
 // hooks/useOutboxStatus.ts
 import { useEffect, useMemo, useState } from 'react';
-import { subscribeOutbox, getOutboxCounts, OutboxStatusCounts } from '../utils/outbox';
+import {
+  subscribeOutbox,
+  getOutboxCounts,
+  OutboxStatusCounts,
+  OutboxKind, // 👈 importamos la unión real para mantenernos en sync
+} from '../utils/outbox';
 
 export type UseOutboxStatusResult = {
   pendingTotal: number;
-  byKind: Record<'abono' | 'no_pago' | 'otro', number>;
+  byKind: Record<OutboxKind, number>;
   refresh: () => Promise<void>;
 };
 
 export default function useOutboxStatus(): UseOutboxStatusResult {
   const [counts, setCounts] = useState<OutboxStatusCounts>({
     totalPending: 0,
-    byKind: { abono: 0, no_pago: 0, otro: 0 },
+    // 👇 incluimos TODAS las llaves de OutboxKind (abono, venta, no_pago, mov, otro)
+    byKind: {
+      abono: 0,
+      venta: 0,
+      no_pago: 0,
+      mov: 0,
+      otro: 0,
+    } as Record<OutboxKind, number>,
   });
 
   const refresh = async () => {
-    const c = await getOutboxCounts();
-    setCounts(c);
+    try {
+      const c = await getOutboxCounts();
+      setCounts(c);
+    } catch {
+      // noop
+    }
   };
 
   useEffect(() => {
     // carga inicial
-    refresh().catch(() => {});
+    void refresh();
+
     // escucha cambios del outbox
-    const unsub = subscribeOutbox(() => {
-      refresh().catch(() => {});
-    });
-    return () => unsub();
+    let unsub: (() => void) | undefined;
+    try {
+      unsub = subscribeOutbox(() => {
+        void refresh();
+      });
+    } catch {
+      unsub = undefined;
+    }
+    return () => {
+      try { unsub && unsub(); } catch {}
+    };
   }, []);
 
   return useMemo(

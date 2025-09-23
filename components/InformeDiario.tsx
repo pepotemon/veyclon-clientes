@@ -40,29 +40,8 @@ export default function InformeDiario({
   const openPicker = () => setMostrarPicker(true);
   const closePicker = () => setMostrarPicker(false);
   const onConfirm = (d: Date) => {
-    // Normalizamos a YYYY-MM-DD (util ya existente)
     onChangeFecha(normYYYYMMDD(d.toISOString()));
     closePicker();
-  };
-
-  // Helper: nombre a mostrar priorizando clienteNombre
-  const displayNameOf = (item: any): string => {
-    return (
-      item?.clienteNombre ??
-      item?.title ??
-      item?.concepto ??
-      item?.nota ??
-      '—'
-    );
-  };
-
-  // Helper: meta secundaria (hora + nota/concepto si hay)
-  const displayMetaOf = (item: any): string => {
-    const hora = item?.hora ? String(item.hora) : '';
-    const notaOConcepto = item?.nota ?? item?.concepto ?? '';
-    if (hora && notaOConcepto) return `${hora} • ${notaOConcepto}`;
-    if (hora) return `Hora: ${hora}`;
-    return notaOConcepto ? String(notaOConcepto) : '';
   };
 
   return (
@@ -80,7 +59,7 @@ export default function InformeDiario({
         </View>
         <View style={styles.kpiRow}>
           <Text style={[styles.kpiLabel, { color: palette.softText }]}>{kpiLabel}</Text>
-          <Text style={[styles.kpiValue, { color: palette.text }]}>R$ {Number(total || 0).toFixed(2)}</Text>
+          <Text style={[styles.kpiValue, { color: palette.text }]}>R$ {total.toFixed(2)}</Text>
         </View>
 
         <TouchableOpacity
@@ -102,30 +81,22 @@ export default function InformeDiario({
           keyExtractor={(it) => it.id}
           contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 16 + insets.bottom }}
           ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
-          renderItem={({ item }) => {
-            const nombre = displayNameOf(item);
-            const meta = displayMetaOf(item);
-            const monto = Number(item?.monto || 0);
-
-            return (
-              <View style={[styles.card, { backgroundColor: palette.cardBg, shadowColor: palette.text }]}>
-                <View style={[styles.iconBox, { borderColor: palette.cardBorder, backgroundColor: palette.kpiTrack }]}>
-                  <Icon name={icon} size={18} color={palette.accent} />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.nombre, { color: palette.text }]} numberOfLines={1}>
-                    {nombre}
-                  </Text>
-                  {!!meta && (
-                    <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
-                      {meta}
-                    </Text>
-                  )}
-                </View>
-                <Text style={[styles.monto, { color: palette.text }]}>R$ {monto.toFixed(2)}</Text>
+          renderItem={({ item }) => (
+            <View style={[styles.card, { backgroundColor: palette.cardBg, shadowColor: palette.text }]}>
+              <View style={[styles.iconBox, { borderColor: palette.cardBorder, backgroundColor: palette.kpiTrack }]}>
+                <Icon name={icon} size={18} color={palette.accent} />
               </View>
-            );
-          }}
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.nombre, { color: palette.text }]} numberOfLines={1}>
+                  {item.title}
+                </Text>
+                <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+                  {item.nota ? `${item.hora} • ${item.nota}` : `Hora: ${item.hora}`}
+                </Text>
+              </View>
+              <Text style={[styles.monto, { color: palette.text }]}>R$ {Number(item.monto || 0).toFixed(2)}</Text>
+            </View>
+          )}
           ListEmptyComponent={
             <View style={{ alignItems: 'center', marginTop: 24 }}>
               <Text style={{ color: palette.softText }}>{emptyText}</Text>

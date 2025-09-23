@@ -19,10 +19,7 @@ import { todayInTZ, pickTZ, normYYYYMMDD } from '../utils/timezone';
 import { logAudit, pick } from '../utils/auditLogs';
 import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';
 
-// 👇 NUEVO: outbox para fallback offline
-import { addToOutbox } from '../utils/outbox';
-
-// 👇 helper de movimientos (tipos/iconos/labels/colores)
+// 👇 NUEVO: helper de movimientos (tipos/iconos/labels/colores)
 import {
   canonicalTipo,
   iconFor,
@@ -99,8 +96,8 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   // KPIs desde cajaDiaria
   const [apertura, setApertura] = useState(0);
   const [abonos, setAbonos] = useState(0);     // cobrado (abono/pago)
-  const [ingresos, setIngresos] = useState(0); // manuales
-  const [retiros, setRetiros] = useState(0);
+  const [ingresos, setIngresos] = useState(0); // manuales (⚠️ ventas NO suman aquí)
+  const [retiros, setRetiros] = useState(0);   // incluye retiros manuales y ventas (retiro por entrega)
 
   // Movimientos combinados (ingresos + retiros + gastos admin)
   const [movsCaja, setMovsCaja] = useState<MovimientoCaja[]>([]);
@@ -116,7 +113,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     [movsCaja]
   );
 
-  // Balance operativo del día (incluye préstamos)
+  // Balance operativo del día (incluye préstamos como salida de caja)
   const balance = useMemo(
     () => apertura + ingresos + abonos - retiros - totalGastos - prestamosDelDia,
     [apertura, ingresos, abonos, retiros, totalGastos, prestamosDelDia]
@@ -126,6 +123,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   useEffect(() => {
     setCargando(true);
     try {
+      // admin ==, operationalDate ==, orderBy createdAt asc
       const qDia = query(
         collection(db, 'cajaDiaria'),
         where('admin', '==', admin),
@@ -172,6 +170,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                 break;
 
               case 'ingreso':
+                // ✅ Ingreso manual únicamente (ventas NO cuentan como ingreso)
                 _ingresos += m;
                 _movsCaja.push({
                   id: d.id, tipo: 'ingreso', monto: m,
@@ -185,6 +184,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                 break;
 
               case 'retiro':
+                // ✅ Retiro: incluye retiros manuales y ventas (retiro por entrega de préstamo)
                 _retiros += m;
                 _movsCaja.push({
                   id: d.id, tipo: 'retiro', monto: m,
@@ -216,6 +216,8 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                 // Gasto del cobrador: NO se muestra aquí (caja del admin)
                 break;
 
+              // ⚠️ 'venta' no es un tipo canónico de caja: la venta se registra como 'retiro'
+              // y el KPI de préstamos se calcula leyendo la colección de préstamos del día.
               case 'cierre':
               default:
                 // no suma a KPIs mostrados
@@ -252,7 +254,9 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     }
   }, [admin, hoy]);
 
-  // Cálculo de PRÉSTAMOS DEL DÍA
+  // Cálculo de PRÉSTAMOS DEL DÍA (KPI préstamos)
+  // ✅ Se suman los préstamos creados hoy por este admin (valorNeto/capital),
+  // y NO se suman como ingreso (la salida de efectivo ya quedó como retiro).
   useEffect(() => {
     let active = true;
     (async () => {
@@ -314,7 +318,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     try {
       setGuardandoMov(true);
       const payload = {
-        tipo: modalOpen, // 'ingreso' | 'retiro' (canónico)
+        tipo: modalOpen, // 'ingreso' | 'retiro' (canónico). Las ventas NUNCA van como 'ingreso'.
         admin,
         monto: Math.round(num * 100) / 100,
         operationalDate: hoy,
@@ -338,33 +342,8 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
       closeModal();
       Alert.alert('Listo', modalOpen === 'ingreso' ? 'Ingreso registrado.' : 'Retiro registrado.');
     } catch (e) {
-      // —— OFFLINE FALLBACK: encolar ingreso/retiro ——
-      try {
-        const monto = Math.round(parseFloat(montoTxt.replace(',', '.')) * 100) / 100;
-        await addToOutbox({
-          kind: 'otro',
-          payload: {
-            _subkind: modalOpen, // 'ingreso' | 'retiro'
-            admin,
-            monto,
-            nota: notaTxt.trim() ? notaTxt.trim() : undefined,
-            tz,
-            operationalDate: hoy,
-            createdAtMs: Date.now(),
-            source: 'manual',
-          },
-        });
-        closeModal();
-        Alert.alert(
-          'Sin conexión',
-          modalOpen === 'ingreso'
-            ? 'El ingreso se guardó en Pendientes. Se enviará automáticamente cuando haya internet.'
-            : 'El retiro se guardó en Pendientes. Se enviará automáticamente cuando haya internet.'
-        );
-      } catch (ex) {
-        console.error('[CajaDiaria] outbox enqueue failed:', ex);
-        Alert.alert('Error', 'No se pudo guardar el movimiento ni en pendientes.');
-      }
+      console.error('[CajaDiaria] guardarMovimiento:', e);
+      Alert.alert('Error', 'No se pudo guardar el movimiento.');
     } finally {
       setGuardandoMov(false);
     }

@@ -8,6 +8,8 @@ type AuditAction =
   | 'add_abono' | 'no_pago' | 'create_cliente' | 'create_prestamo'
   | 'outbox_enqueue' | 'outbox_flush'
   | 'abono_outbox' | 'no_pago_outbox'
+  // 👇 NUEVAS para resolver tipos usados en outbox.ts
+  | 'venta_outbox' | 'mov_outbox'
   // 👇 NUEVAS para caja
   | 'caja_apertura' | 'caja_apertura_auto'
   | 'caja_ingreso'  | 'caja_retiro'

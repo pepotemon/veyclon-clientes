@@ -31,6 +31,9 @@ import {
 // 👇 Cache local tras la descarga
 import { saveCatalogSnapshot } from './catalogCache';
 
+// ✅ Cálculo de atraso (para aplicar tras actualizar 'restante')
+import { calcularDiasAtraso } from './atrasoHelper';
+
 /* ========== Legacy (mantener por compat, ya no se usa) ========== */
 export const MAX_ATTEMPTS = 5; // ya no se usa aquí, lo maneja outbox.ts
 export function computeNextRetry(attempts: number): number {
@@ -105,6 +108,7 @@ async function handleAbono(item: OutboxAbono) {
         ? data.restante
         : (data.montoTotal || data.totalPrestamo || 0);
 
+    // ✅ Protección: nunca dejar 'restante' negativo
     const nuevoRestante = Math.max(0, restanteActual - p.monto);
 
     const abonoCompact = pick(abono, ['monto', 'operationalDate', 'tz', 'createdAtMs']);
@@ -125,9 +129,72 @@ async function handleAbono(item: OutboxAbono) {
         'totalPrestamo',
         'clienteId',
         'concepto',
+        'fechaInicio',
+        'operationalDate',
+        'diasHabiles',
+        'feriados',
+        'pausas',
+        'modoAtraso',
+        'permitirAdelantar',
+        'cuotas',
+        'montoTotal',
       ]),
     };
   });
+
+  // ✅ Recalcular atraso con datos actualizados (best-effort)
+  try {
+    // Leer préstamo y abonos reales de la subcolección para el cálculo
+    const prestamoSnap = await getDoc(prestamoRef);
+    if (prestamoSnap.exists()) {
+      const d = prestamoSnap.data() as any;
+
+      const abonosSnap = await getDocs(collection(prestamoRef, 'abonos'));
+      const abonos = abonosSnap.docs.map((docu) => {
+        const a = docu.data() as any;
+        return {
+          monto: Number(a?.monto) || 0,
+          operationalDate: a?.operationalDate,
+          fecha: a?.fecha, // compat si existiera
+        };
+      });
+
+      const tzDoc = pickTZ(d?.tz);
+      const hoy = d?.operationalDate || todayInTZ(tzDoc);
+      const diasHabiles = Array.isArray(d?.diasHabiles) && d.diasHabiles.length ? d.diasHabiles : [1, 2, 3, 4, 5, 6];
+      const feriados = Array.isArray(d?.feriados) ? d.feriados : [];
+      const pausas = Array.isArray(d?.pausas) ? d.pausas : [];
+      const modo = (d?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
+      const permitirAdelantar = !!d?.permitirAdelantar;
+      const cuotas =
+        Number(d?.cuotas || 0) ||
+        Math.ceil(Number(d?.totalPrestamo || d?.montoTotal || 0) / (Number(d?.valorCuota) || 1));
+
+      const calc = calcularDiasAtraso({
+        fechaInicio: d?.fechaInicio || hoy,
+        hoy,
+        cuotas,
+        valorCuota: Number(d?.valorCuota || 0),
+        abonos,
+        diasHabiles,
+        feriados,
+        pausas,
+        modo,
+        permitirAdelantar,
+      });
+
+      // ✅ Actualizar atraso/faltas y reafirmar 'restante' no-negativo
+      await updateDoc(prestamoRef, {
+        diasAtraso: calc.atraso,
+        faltas: calc.faltas || [],
+        ultimaReconciliacion: serverTimestamp(),
+        // res.nuevoRestante ya estaba clamped, pero reafirmamos por seguridad:
+        restante: Math.max(0, Number(res.nuevoRestante || 0)),
+      });
+    }
+  } catch {
+    // tolerante a fallos de recálculo
+  }
 
   if (p.alsoCajaDiaria) {
     try {
@@ -136,7 +203,7 @@ async function handleAbono(item: OutboxAbono) {
         admin: p.admin,
         clienteId: p.clienteId,
         prestamoId: p.prestamoId,
-        clienteNombre: p.cajaPayload?.clienteNombre || 'Cliente',
+        clienteNombre: p.cajaPayload?.clienteNombre || p.clienteNombre || 'Cliente',
         monto: Number(p.monto.toFixed(2)),
         tz: res.tz,
         operationalDate: res.hoy,

@@ -1,4 +1,3 @@
-// screens/PendientesScreen.tsx
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   SafeAreaView,
@@ -26,7 +25,7 @@ import {
 type OutboxStatus = 'pending' | 'processing' | 'done' | 'error';
 
 /** ==== TIPOS: aceptar legacy y normalizar ==== */
-type KindEs = 'abono' | 'no_pago' | 'otro';
+type KindEs = 'abono' | 'venta' | 'no_pago' | 'otro';
 type KindLegacy = 'payment' | 'other';
 type OutboxKind = KindEs | KindLegacy;
 
@@ -52,13 +51,16 @@ const STORAGE_KEY = 'outbox:pending';
 function normalizeKind(kind: OutboxKind): KindEs {
   if (kind === 'payment') return 'abono';
   if (kind === 'other') return 'otro';
-  return kind; // ya es 'abono' | 'no_pago' | 'otro'
+  // si el motor nuevo encoló 'venta', respétalo
+  if (kind === 'venta') return 'venta';
+  return kind as KindEs; // ya es 'abono' | 'no_pago' | 'otro'
 }
 
-/** Etiqueta base para UI (columna izquierda) */
-function kindBaseLabel(kind: OutboxKind): 'Abono' | 'No pago' | 'Otro' {
+/** Etiqueta base (fallback) */
+function kindLabel(kind: OutboxKind): 'Abono' | 'Venta' | 'No pago' | 'Otro' {
   const k = normalizeKind(kind);
   if (k === 'abono') return 'Abono';
+  if (k === 'venta') return 'Venta';
   if (k === 'no_pago') return 'No pago';
   return 'Otro';
 }
@@ -103,17 +105,60 @@ function StatusPill({
 
 type FilterKey = 'todos' | 'abono' | 'no_pago' | 'otro';
 
+/** Título “inteligente” con nombre del cliente si existe */
+function getDisplayTexts(item: OutboxItem): { title: string; subtitle?: string } {
+  const k = normalizeKind(item.kind);
+  const p = item.payload || {};
+
+  // nombre del cliente (varios fallbacks comunes en la app)
+  const nombre =
+    (p.clienteNombre?.trim?.() ||
+      p.cajaPayload?.clienteNombre?.trim?.() ||
+      p.concepto?.trim?.() ||
+      p.nombre?.trim?.() ||
+      '') as string;
+
+  const fallbackId =
+    (typeof p.clienteId === 'string' && p.clienteId
+      ? `ID ${p.clienteId.slice(-6)}`
+      : '') || 'Cliente';
+
+  const who = nombre || fallbackId;
+
+  // subkind para movimientos genéricos (ingreso/retiro/gasto_admin/gasto_cobrador/apertura/cierre)
+  const sub: string | undefined = p.subkind;
+  const subLabelMap: Record<string, string> = {
+    ingreso: 'Ingreso',
+    retiro: 'Retiro',
+    gasto_admin: 'Gasto (admin)',
+    gasto_cobrador: 'Gasto (cobrador)',
+    apertura: 'Apertura',
+    cierre: 'Cierre',
+  };
+
+  if (k === 'abono') return { title: `Pago — ${who}` };
+  if (k === 'venta') return { title: `Venta — ${who}` };
+  if (k === 'no_pago') return { title: `No pago — ${who}` };
+
+  if (sub && subLabelMap[sub]) {
+    return { title: `${subLabelMap[sub]} — ${who}` };
+  }
+
+  // fallback genérico
+  return { title: `${kindLabel(item.kind)}${nombre ? ` — ${who}` : ''}` };
+}
+
 export default function PendientesScreen() {
   const { palette } = useAppTheme();
 
   // estados
   const [items, setItems] = useState<OutboxItem[]>([]);
-  const [loadingInitial, setLoadingInitial] = useState(true); // carga inicial
-  const [refreshing, setRefreshing] = useState(false);        // pull-to-refresh
+  const [loadingInitial, setLoadingInitial] = useState(true); // 👈 carga inicial
+  const [refreshing, setRefreshing] = useState(false);        // 👈 solo pull-to-refresh
   const [processing, setProcessing] = useState(false);
   const [filter, setFilter] = useState<FilterKey>('todos');
 
-  // Lee la lista desde AsyncStorage (con migración de kind)
+  // Carga lista desde AsyncStorage (con migración de kind)
   const readFromStorage = useCallback(async (): Promise<OutboxItem[]> => {
     try {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
@@ -133,7 +178,7 @@ export default function PendientesScreen() {
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
       }
       // ordenar recientes primero
-      migrated.sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0));
+      migrated.sort((a, b) => b.createdAtMs - a.createdAtMs);
       return migrated;
     } catch {
       return [];
@@ -168,6 +213,7 @@ export default function PendientesScreen() {
     let unsubEvt: (() => void) | null = null;
     try {
       unsubEvt = subscribeOutbox(() => {
+        // refresco silencioso: no mostrar spinner
         load('silent');
       });
     } catch {
@@ -179,6 +225,7 @@ export default function PendientesScreen() {
     if (!unsubEvt) {
       try {
         unsubPoll = subscribeCount(() => {
+          // No confiamos en el número aquí, solo disparamos una recarga silenciosa
           load('silent');
         });
       } catch {
@@ -197,7 +244,7 @@ export default function PendientesScreen() {
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
   };
 
-  // Reintentar uno (preferir motor nuevo)
+  // Reintentar uno (preferir motor nuevo; si falla, quitar ítem o marcar error local)
   const retryOne = async (id: string) => {
     setProcessing(true);
     try {
@@ -208,6 +255,7 @@ export default function PendientesScreen() {
       }
       await load('silent');
     } catch (e: any) {
+      // Si el motor lanzó, no tocamos la lista; el motor ya dejó lastError/backoff
       Alert.alert('Reintento', 'No se pudo reenviar este elemento.');
     } finally {
       setProcessing(false);
@@ -220,9 +268,9 @@ export default function PendientesScreen() {
     try {
       await processOutboxBatch(100);
       await load('silent');
-      Alert.alert('Pendientes', 'Se intentó enviar la cola.');
+      Alert.alert('Pendientes', 'Se intentó reenviar la cola.');
     } catch {
-      Alert.alert('Error', 'Ocurrió un error al enviar la cola.');
+      Alert.alert('Error', 'Ocurrió un error al reintentar la cola.');
     } finally {
       setProcessing(false);
     }
@@ -246,7 +294,7 @@ export default function PendientesScreen() {
     ]);
   };
 
-  // Filtro
+  // Filtro (mantener intactos)
   const filtered = useMemo(() => {
     if (filter === 'todos') return items;
     return items.filter((it) => normalizeKind(it.kind) === filter);
@@ -275,92 +323,6 @@ export default function PendientesScreen() {
     [palette]
   );
 
-  // ======== Formateo Display por ítem (Título + detalles) ========
-  function getDisplayTexts(it: OutboxItem): {
-    title: string;
-    line1?: string;
-    line2?: string;
-    icon: string; // usar string para evitar fricciones de tipos con glyphMap
-  } {
-    const k = normalizeKind(it.kind);
-    const p = it.payload || {};
-    const tipo = (p.tipo || p._subkind || k) as string // 'venta' | 'retiro' | 'ingreso' | 'gasto' | 'abono' | 'no_pago' | 'otro'
-    const monto: number | undefined =
-      typeof p.monto === 'number'
-        ? p.monto
-        : typeof p.valor === 'number'
-        ? p.valor
-        : undefined;
-
-    const money =
-      typeof monto === 'number' && Number.isFinite(monto)
-        ? `Monto: R$ ${monto.toFixed(2)}`
-        : undefined;
-
-    const fecha = it.createdAtMs ? new Date(it.createdAtMs).toLocaleString() : undefined;
-    const cliente = p.clienteNombre || p.nombre || p.cliente || undefined;
-    const concepto = p.concepto || p.nota || p.descripcion || p.detalle;
-
-    if (tipo === 'abono') {
-      return {
-        title: `Pago — ${cliente || '—'}`,
-        line1: money,
-        line2: fecha,
-        icon: 'check-circle',
-      };
-    }
-    if (tipo === 'venta') {
-      return {
-        title: `Venta — ${cliente || '—'}`,
-        line1: money ?? (concepto ? `Concepto: ${concepto}` : undefined),
-        line2: fecha,
-        icon: 'cart-arrow-down',
-      };
-    }
-    if (tipo === 'retiro') {
-      return {
-        title: `Retiro — ${cliente || '—'}`,
-        line1: money,
-        line2: fecha,
-        icon: 'cash-minus',
-      };
-    }
-    if (tipo === 'ingreso') {
-      const who = cliente || concepto || '—';
-      return {
-        title: `Ingreso — ${who}`,
-        line1: money,
-        line2: fecha,
-        icon: 'cash-plus',
-      };
-    }
-    if (tipo === 'gasto') {
-      const who = cliente || concepto || '—';
-      return {
-        title: `Gasto — ${who}`,
-        line1: money,
-        line2: fecha,
-        icon: 'cash-remove',
-      };
-    }
-    if (tipo === 'no_pago') {
-      return {
-        title: `No pago — ${cliente || '—'}`,
-        line1: p.reason ? `Motivo: ${p.reason}` : undefined,
-        line2: fecha,
-        icon: 'alert-circle-outline',
-      };
-    }
-
-    // Fallback genérico
-    return {
-      title: `${kindBaseLabel(k)} — ${cliente || concepto || '—'}`,
-      line1: money,
-      line2: fecha,
-      icon: 'dots-horizontal',
-    };
-  }
-
   const renderItem = ({ item }: { item: OutboxItem }) => {
     const statusKey: OutboxStatus =
       item.status === 'processing'
@@ -375,7 +337,7 @@ export default function PendientesScreen() {
     const nextRetryTxt = formatNextRetry(item.nextRetryAt);
     const attempts = item.attempts ?? 0;
 
-    const display = getDisplayTexts(item);
+    const { title } = getDisplayTexts(item);
 
     return (
       <View
@@ -389,39 +351,27 @@ export default function PendientesScreen() {
       >
         <View style={{ flex: 1 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-              <MIcon name={display.icon as any} size={18} color={palette.text} />
-              <Text style={[styles.title, { color: palette.text }]} numberOfLines={1}>
-                {display.title}
-              </Text>
-            </View>
+            <Text style={[styles.title, { color: palette.text }]}>{title}</Text>
             <StatusPill status={statusKey} colorSet={statusColors} />
           </View>
 
-          {!!display.line1 && (
-            <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
-              {display.line1}
-            </Text>
-          )}
-          {!!display.line2 && (
-            <Text style={[styles.sub, { color: palette.softText }]} numberOfLines={1}>
-              {display.line2}
-            </Text>
-          )}
+          <Text style={[styles.sub, { color: palette.softText }]}>
+            {new Date(item.createdAtMs).toLocaleString()}
+          </Text>
 
           <View style={{ marginTop: 4 }}>
-            <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+            <Text style={[styles.meta, { color: palette.softText }]}>
               Intentos: {attempts}
             </Text>
             {!!nextRetryTxt && (
-              <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+              <Text style={[styles.meta, { color: palette.softText }]}>
                 Próximo intento: {nextRetryTxt}
               </Text>
             )}
           </View>
 
           {!!(item.lastError || item.error) && (
-            <Text style={[styles.err, { color: '#c62828' }]} numberOfLines={2}>
+            <Text style={[styles.err, { color: '#c62828' }]}>
               Último error: {item.lastError || item.error}
             </Text>
           )}
@@ -448,7 +398,7 @@ export default function PendientesScreen() {
     );
   };
 
-  // Barra de filtros (chips)
+  // Barra de filtros (chips) — sin cambios
   const FilterChip = ({ value, label, icon }: { value: FilterKey; label: string; icon: string }) => {
     const active = filter === value;
     return (
@@ -482,7 +432,7 @@ export default function PendientesScreen() {
       <View
         style={[
           styles.header,
-          { borderBottomColor: palette.topBorder, backgroundColor: palette.topBg },
+        { borderBottomColor: palette.topBorder, backgroundColor: palette.topBg },
         ]}
       >
         <TouchableOpacity
@@ -492,7 +442,7 @@ export default function PendientesScreen() {
           activeOpacity={0.85}
         >
           <MIcon name="backup-restore" size={18} color={palette.text} />
-          <Text style={[styles.headerBtnTxt, { color: palette.text }]}>Enviar todos</Text>
+          <Text style={[styles.headerBtnTxt, { color: palette.text }]}>Reintentar todos</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
@@ -585,7 +535,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
   },
-  title: { fontSize: 15, fontWeight: '800', maxWidth: 220 },
+  title: { fontSize: 15, fontWeight: '800' },
   sub: { fontSize: 12, marginTop: 2 },
   meta: { fontSize: 12, marginTop: 2 },
   err: { fontSize: 12, marginTop: 6 },

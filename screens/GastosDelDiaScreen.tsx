@@ -22,7 +22,7 @@ export default function GastosDelDiaScreen({ route }: Props) {
   const { items, total, loading, reload } = useMovimientos({
     admin,
     fecha,
-    tipo: 'gastoAdmin', // <- TS de tu hook espera este literal
+    tipo: 'gastoAdmin', // ← el hook espera este literal
   });
 
   return (
@@ -34,7 +34,7 @@ export default function GastosDelDiaScreen({ route }: Props) {
       items={items}
       total={total}
       loading={loading}
-      emptyText="No hay retiros para esta fecha."
+      emptyText="No hay gastos para esta fecha."
       onRefresh={reload}
     />
   );

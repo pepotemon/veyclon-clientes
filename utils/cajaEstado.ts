@@ -1,4 +1,4 @@
-// utils/cajaEstado.ts (versión corregida sin anyDateToYYYYMMDD)
+// utils/cajaEstado.ts
 import {
   doc, getDoc, setDoc, serverTimestamp, collection, query, where, getDocs, addDoc, collectionGroup,
 } from 'firebase/firestore';
@@ -12,6 +12,29 @@ export type CajaEstado = {
   saldoActual: number;
   updatedAt?: any;
   tz?: string | null;
+};
+
+/** Tipos de documentos en cajaDiaria (payloads) */
+type CierreDoc = {
+  tipo: 'cierre';
+  admin: string;
+  balance: number;
+  operationalDate: string;
+  tz: string | null | undefined;
+  createdAt: any;
+  createdAtMs: number;
+  source: 'auto' | 'manual';
+};
+
+type AperturaDoc = {
+  tipo: 'apertura';
+  admin: string;
+  monto: number;
+  operationalDate: string;
+  tz: string | null | undefined;
+  createdAt: any;
+  createdAtMs: number;
+  source: 'auto' | 'manual';
 };
 
 // ——————————— Helpers de fecha ———————————
@@ -107,10 +130,60 @@ export async function setSaldoActual(admin: string, nuevoSaldo: number, tz?: str
   });
 }
 
+/** ==========================================================
+ *  CIERRE IDEMPOTENTE
+ *  - DocId determinístico: cierre_${admin}_${operationalDate}
+ *  - Evita duplicados y marca source (auto/manual)
+ * ========================================================== */
+export async function ensureCierreIdempotente({
+  admin,
+  operationalDate,
+  balance,
+  tz,
+  source = 'auto',
+}: {
+  admin: string;
+  operationalDate: string; // YYYY-MM-DD
+  balance: number;
+  tz?: string | null;
+  source?: 'auto' | 'manual';
+}) {
+  const docId = `cierre_${admin}_${operationalDate}`;
+  const ref = doc(db, 'cajaDiaria', docId);
+
+  const already = await getDoc(ref);
+  if (already.exists()) {
+    // ya existe, nada que hacer
+    return ref;
+  }
+
+  const payload: CierreDoc = {
+    tipo: 'cierre',
+    admin,
+    balance: Math.round(Number(balance || 0) * 100) / 100,
+    operationalDate,
+    tz: tz ?? null,
+    createdAt: serverTimestamp(),
+    createdAtMs: Date.now(),
+    source: source,
+  };
+
+  await setDoc(ref, payload);
+
+  await logAudit({
+    userId: admin,
+    action: 'caja_cierre_auto',
+    ref,
+    before: null,
+    after: pick(payload, ['tipo', 'balance', 'operationalDate', 'tz', 'source']),
+  });
+
+  return ref;
+}
+
 /**
  * ——————————————————————————————————————————————
- * Crea el CIERRE del día y ACTUALIZA cajaEstado.saldoActual
- * para que el día siguiente arranque con ese mismo saldo.
+ * Crea (idempotente) el CIERRE del día y ACTUALIZA cajaEstado.saldoActual
  * ——————————————————————————————————————————————
  */
 export async function registrarCierre(
@@ -119,37 +192,31 @@ export async function registrarCierre(
   balanceFinal: number,   // saldo final calculado del día
   tz?: string
 ) {
-  const cierrePayload = {
-    tipo: 'cierre' as const, // canónico
+  // ⚠️ ahora es idempotente y marca source: 'auto'
+  await ensureCierreIdempotente({
     admin,
-    balance: Math.round(Number(balanceFinal || 0) * 100) / 100,
     operationalDate: hoy,
+    balance: balanceFinal,
     tz: tz ?? null,
-    createdAt: serverTimestamp(),
-    createdAtMs: Date.now(),
-    source: 'manual' as const,
-  };
-
-  const cierreRef = await addDoc(collection(db, 'cajaDiaria'), cierrePayload);
-
-  await logAudit({
-    userId: admin,
-    action: 'caja_cierre_auto',
-    ref: cierreRef,
-    before: null,
-    after: pick(cierrePayload, ['tipo', 'balance', 'operationalDate', 'tz', 'source']),
+    source: 'auto',
   });
 
   // ► ACTUALIZA el estado persistente para el día siguiente
-  await setSaldoActual(admin, cierrePayload.balance, tz);
+  await setSaldoActual(admin, Math.round(Number(balanceFinal || 0) * 100) / 100, tz);
 }
 
 /**
- * Cierra en CADENA todos los días pendientes (hasta 30 días atrás) ANTES de abrir HOY.
+ * Cierra en CADENA todos los días pendientes (hasta 7 días atrás) ANTES de abrir HOY.
  * - Si un día no tiene "apertura", toma como caja inicial el saldo persistente vigente.
  * - KPIs del día: apertura + ingresos + abonos − retiros − gastosAdmin − prestamosDelDia.
+ * - ⚠️ Si no hubo actividad ese día, NO crea cierre.
  */
-export async function closeMissingDays(admin: string, hoy: string, tz: string, maxDaysBack = 30) {
+export async function closeMissingDays(
+  admin: string,
+  hoy: string,
+  tz: string,
+  maxDaysBack = 7 // ← ventana reducida
+) {
   const tzUse = pickTZ(tz);
 
   // Construye lista YYYY-MM-DD desde (hoy-1) hacia atrás
@@ -211,6 +278,13 @@ export async function closeMissingDays(admin: string, hoy: string, tz: string, m
       prestamosDelDia = 0;
     }
 
+    // ⚠️ Si no hubo nada ese día, no creamos cierre
+    const huboAlgo = [r.apertura, r.ingresos, r.abonos, r.retiros, r.gastos, prestamosDelDia]
+      .some((v) => Number(v) > 0);
+    if (!huboAlgo) {
+      continue;
+    }
+
     // 3) Caja inicial del día: si no hubo apertura ese día, usa saldo persistente
     let cajaInicialDelDia = r.apertura;
     if (!Number.isFinite(cajaInicialDelDia) || cajaInicialDelDia <= 0) {
@@ -223,7 +297,7 @@ export async function closeMissingDays(admin: string, hoy: string, tz: string, m
       (cajaInicialDelDia + r.ingresos + r.abonos - r.retiros - r.gastos - prestamosDelDia) * 100
     ) / 100;
 
-    await registrarCierre(admin, ymd, cajaFinal, tzUse); // esto también actualiza cajaEstado
+    await registrarCierre(admin, ymd, cajaFinal, tzUse); // ahora idempotente
   }
 }
 
@@ -295,15 +369,15 @@ export async function ensureAperturaDeHoy(admin: string, hoy: string, tz: string
   }
 
   // Crear apertura automática (tipo canónico)
-  const aperturaPayload = {
-    tipo: 'apertura' as const,
+  const aperturaPayload: AperturaDoc = {
+    tipo: 'apertura',
     admin,
     monto: Math.round(montoApertura * 100) / 100,
     operationalDate: hoy,
     tz,
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
-    source: 'auto' as const,
+    source: 'auto',
   };
 
   const aperturaRef = await addDoc(collection(db, 'cajaDiaria'), aperturaPayload);

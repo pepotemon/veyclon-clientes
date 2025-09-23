@@ -9,6 +9,7 @@ import {
 } from 'firebase/firestore';
 import { db } from '../firebase/firebaseConfig';
 import { pickTZ } from '../utils/timezone';
+import { canonicalTipo } from '../utils/movimientoHelper';
 
 export type TipoMovimiento =
   | 'ingreso'
@@ -43,10 +44,6 @@ type Result = {
 
 function tsFromData(d: any): number {
   if (typeof d?.createdAtMs === 'number') return d.createdAtMs;
-  if (typeof d?.createdAtIso === 'string') {           // NEW: soporta createdAtIso
-    const t = Date.parse(d.createdAtIso);
-    if (!Number.isNaN(t)) return t;
-  }
   if (typeof d?.createdAt?.seconds === 'number') return d.createdAt.seconds * 1000;
   if (typeof d?.fechaInicio?.seconds === 'number') return d.fechaInicio.seconds * 1000; // prestamos
   return 0;
@@ -57,10 +54,6 @@ function ymdFromAny(dateLike: any, tz: string): string | null {
     const dt = (() => {
       if (!dateLike) return null;
       if (typeof dateLike === 'number') return new Date(dateLike);
-      if (typeof dateLike === 'string') {
-        const t = Date.parse(dateLike);
-        return Number.isNaN(t) ? null : new Date(t);
-      }
       if (typeof dateLike?.seconds === 'number') return new Date(dateLike.seconds * 1000);
       if (typeof dateLike?.toDate === 'function') return dateLike.toDate();
       if (dateLike instanceof Date) return dateLike;
@@ -110,39 +103,44 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         timeZone: tz,
       }).format(new Date(ts));
 
-      // posibles campos para nombre del cliente
+      // nombre de cliente (con varios fallbacks)
       const cliente: string =
         (data?.clienteNombre ??
           data?.cliente?.nombre ??
           data?.clienteName ??
-          data?.clienteId ??
           '') as string;
 
-      // títulos por tipo (con fallback por categoría si viene)
-      let title = 'Movimiento';
+      // Nota/concepto auxiliares
       let nota: string | null = (data?.nota ?? '').toString().trim() || null;
       const concepto: string = (data?.concepto ?? '').toString().trim();
 
-      const t = String(data?.tipo || '');
-      if (t === 'ingreso') {
+      // 👇 Tipo canónico SIEMPRE
+      const tCanon = canonicalTipo(data?.tipo);
+
+      let title = 'Movimiento';
+
+      if (tCanon === 'ingreso') {
         title = 'Ingreso';
         if (!nota && concepto) nota = concepto;
-      } else if (t === 'retiro') {
+      } else if (tCanon === 'retiro') {
         title = 'Retiro';
         if (!nota && concepto) nota = concepto;
-      } else if (t === 'gastoAdmin' || t === 'gasto_admin') {
+      } else if (tCanon === 'gasto_admin') {
         title = (data?.categoria ?? '').toString().trim() || 'Gasto admin';
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
-      } else if (t === 'gastoCobrador' || t === 'gasto' || t === 'gasto_cobrador') {
+      } else if (tCanon === 'gasto_cobrador') {
         title = (data?.categoria ?? '').toString().trim() || 'Gasto cobrador';
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
-      } else if (t === 'abono' || t === 'pago') {
-        // Mostrar nombre del cliente como título (si existe)
-        title = cliente.trim() || 'Pago';
-        // usar concepto/nota como descripción secundaria si existe
+      } else if (tCanon === 'abono') {
+        // ✅ “Pago — {cliente}” si hay nombre
+        title = (cliente?.trim() ? `Pago — ${cliente.trim()}` : 'Pago');
         if (!nota && concepto) nota = concepto;
+      } else if (tCanon === 'apertura') {
+        title = 'Apertura';
+      } else if (tCanon === 'cierre') {
+        title = 'Cierre';
       }
 
       return {
@@ -173,8 +171,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = snap.docs.map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (tsFromData(b.raw) ?? 0) -
-            (tsFromData(a.raw) ?? 0)
+            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
+            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
@@ -183,7 +181,6 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
 
       // 1.b) Gasto Admin: soporta 'gastoAdmin' (actual) y 'gasto_admin' (legacy)
       if (tipo === 'gastoAdmin') {
-        // Hacemos 2 queries y merge para evitar índice compuesto con IN
         const qNew = query(
           collection(db, 'cajaDiaria'),
           where('admin', '==', admin),
@@ -200,8 +197,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = [...s1.docs, ...s2.docs].map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (tsFromData(b.raw) ?? 0) -
-            (tsFromData(a.raw) ?? 0)
+            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
+            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
@@ -233,8 +230,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = [...s1.docs, ...s2.docs, ...s3.docs].map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (tsFromData(b.raw) ?? 0) -
-            (tsFromData(a.raw) ?? 0)
+            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
+            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
@@ -243,7 +240,6 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
 
       // 2) Pagos: incluir 'abono' + 'pago'
       if (tipo === 'pago') {
-        // Para evitar índices compuestos con 'in', hacemos 2 queries y merge
         const qAbono = query(
           collection(db, 'cajaDiaria'),
           where('admin', '==', admin),
@@ -260,8 +256,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         const arr = [...s1.docs, ...s2.docs].map(d => mapDocToItem(d.id, d.data()));
         arr.sort(
           (a, b) =>
-            (tsFromData(b.raw) ?? 0) -
-            (tsFromData(a.raw) ?? 0)
+            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
+            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
         );
         setItems(arr);
         setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
@@ -291,19 +287,18 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
             hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: tz,
           }).format(new Date(ts));
 
-          // nombre cliente + concepto
           const cliente: string =
             (data?.clienteNombre ??
               data?.cliente?.nombre ??
               data?.clienteName ??
-              data?.clienteId ??
               '') as string;
           const concepto: string = (data?.concepto ?? data?.producto ?? '').toString().trim();
 
           const monto = Number(data?.valorNeto ?? data?.capital ?? 0);
           arr.push({
             id: d.id,
-            title: (cliente || '').trim() || 'Préstamo',
+            // ✅ título con nombre si existe
+            title: (cliente?.trim() ? `Venta — ${cliente.trim()}` : 'Préstamo'),
             monto: Number.isFinite(monto) ? monto : 0,
             hora,
             nota: concepto || null,

@@ -36,7 +36,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '../theme/ThemeProvider';
 import { logAudit, pick } from '../utils/auditLogs';
 // Outbox (icono de reenviar si hay pendientes)
-import { subscribeCount } from '../utils/outbox';
+import { subscribeCount, subscribeOutbox } from '../utils/outbox';
 import { addToOutbox } from '../utils/outbox';
 
 // Badges: cuotas y presencia
@@ -146,6 +146,7 @@ export default function HomeScreen({ route, navigation }: Props) {
   // Outbox
   const [outboxCount, setOutboxCount] = useState(0);
   const showResendIcon = outboxCount > 0;
+  const prevOutboxCountRef = useRef<number>(0);
 
   // 💰 Caja diaria KPI
   const [cobradoHoy, setCobradoHoy] = useState(0);
@@ -189,11 +190,33 @@ export default function HomeScreen({ route, navigation }: Props) {
     }, [navigation, route.params?.admin])
   );
 
+  // 🔔 Refresco ligero cuando cambie la cola (pendientes procesados/añadidos)
   useEffect(() => {
-    const unsub = subscribeCount(setOutboxCount);
-    return unsub;
-  }, []);
+    // 1) Emitter "en vivo": cuando el outbox cambie, refrescamos silenciosamente
+    let unsubEvt: (() => void) | null = null;
+    try {
+      unsubEvt = subscribeOutbox(() => {
+        setRefreshKey((k) => k + 1); // fuerza re-suscripción (prestamos/caja)
+      });
+    } catch {
+      unsubEvt = null;
+    }
 
+    // 2) Contador + fallback: mantiene el badge y también refresca si hay cambio real
+    const unsubCount = subscribeCount((n) => {
+      const prev = prevOutboxCountRef.current;
+      setOutboxCount(n);
+      if (n !== prev) {
+        prevOutboxCountRef.current = n;
+        setRefreshKey((k) => k + 1); // refresco solo cuando cambia el tamaño
+     }
+    });
+
+    return () => {
+      if (unsubEvt) unsubEvt();
+      unsubCount && unsubCount();
+    };
+  }, []);
   const { storageKeyV, storageKeyO } = useMemo(() => {
     const d = hoyApp;
     return {
@@ -554,7 +577,7 @@ export default function HomeScreen({ route, navigation }: Props) {
       try {
         const tz = pickTZ(undefined, tzSession);
         const hoy = todayInTZ(tz);
-        await closeMissingDays(admin, hoy, tz);
+        await closeMissingDays(admin, hoy, tz, 7);
         await ensureAperturaDeHoy(admin, hoy, tz);
       } catch (e: any) {
         console.warn('[Home] saneador error:', e?.message || e);

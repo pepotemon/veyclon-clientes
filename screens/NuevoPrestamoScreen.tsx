@@ -18,6 +18,7 @@ import {
   ActivityIndicator,
   SafeAreaView,
 } from 'react-native';
+import NetInfo from '@react-native-community/netinfo';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { db } from '../firebase/firebaseConfig';
@@ -139,6 +140,73 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
     try {
       setGuardando(true);
 
+      // --------- Detectar conectividad ----------
+      let isOnline = true;
+      try {
+        const state = await NetInfo.fetch();
+        isOnline = !!state.isConnected;
+      } catch {
+        isOnline = true; // si falla NetInfo, intentamos online
+      }
+
+      // --------- Datos comunes ----------
+      const tz = pickTZ((cliente as any)?.tz);
+      const hoyIso = todayInTZ(tz);
+      const diasHabiles = [1, 2, 3, 4, 5, 6]; // Lun–Sáb
+      const fechaInicioOperativa = nextOperativeDayStr(hoyIso, diasHabiles);
+      const total = totalCalc;
+      const vCuota = cuotaCalc;
+      const concepto = String(cliente?.nombre ?? '').trim() || 'Sin nombre';
+
+      // ========== OFFLINE: encolar venta ==========
+      if (!isOnline) {
+        if (!existingClienteId) {
+          Alert.alert(
+            'Sin conexión',
+            'Para crear un cliente nuevo necesitas internet. Si ya existe el cliente, selecciónalo e intenta de nuevo.'
+          );
+          return;
+        }
+
+        try {
+          await addToOutbox({
+            kind: 'venta',
+            payload: {
+              admin,
+              clienteId: existingClienteId,
+              clienteNombre: concepto,
+              valorCuota: vCuota,
+              cuotas: cuotasNum,
+              totalPrestamo: total,
+              fechaInicio: fechaInicioOperativa,
+              tz,
+              operationalDate: hoyIso,
+              // Dinero que sale de caja al entregar el préstamo (retiro)
+              retiroCaja: valor,
+              meta: {
+                modalidad: prestamo.modalidad,
+                interesPct,
+                valorNeto: valor,
+              },
+            },
+          });
+
+          Alert.alert(
+            'Sin conexión',
+            'El nuevo préstamo se guardó en "Pendientes" y se enviará cuando vuelvas a tener internet.'
+          );
+          navigation.popToTop();
+          return;
+        } catch (err) {
+          console.error('❌ No se pudo encolar venta:', err);
+          Alert.alert('Error', 'No se pudo guardar en pendientes. Inténtalo nuevamente.');
+          return;
+        } finally {
+          setGuardando(false);
+        }
+      }
+
+      // ========== ONLINE: flujo actual ==========
       // 1) Crear/actualizar cliente en /clientes
       let clienteRef;
       if (existingClienteId) {
@@ -152,6 +220,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         };
         await setDoc(clienteRef, updatePayload, { merge: true });
 
+        // 🔍 AUDIT: update cliente (best-effort, solo after)
         await logAudit({
           userId: admin,
           action: 'update',
@@ -169,6 +238,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         };
         await setDoc(clienteRef, createPayload);
 
+        // 🔍 AUDIT: create cliente
         await logAudit({
           userId: admin,
           action: 'create',
@@ -177,30 +247,16 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         });
       }
 
-      // 2) Datos del préstamo
-      const tz = pickTZ((cliente as any)?.tz);
-      const hoyIso = todayInTZ(tz);
-
-      const diasHabiles = [1, 2, 3, 4, 5, 6]; // Lun–Sáb
-      const fechaInicioOperativa = nextOperativeDayStr(hoyIso, diasHabiles);
-
-      const total = totalCalc;
-      const vCuota = cuotaCalc;
-
-      const concepto = String(cliente?.nombre ?? '').trim() || 'Sin nombre';
-
       // 3) Crear /clientes/{id}/prestamos
       const prestamoPayload = {
         concepto,
         cobradorId: admin,
         montoTotal: total,
         restante: total,
-        // abonos: [],  // (no guardamos arrays en el doc)
-
         creadoPor: admin,
         creadoEn: serverTimestamp(),
         createdAtMs: Date.now(),
-        createdDate: hoyIso,
+        createdDate: hoyIso, // ✅ YYYY-MM-DD en TZ del préstamo
 
         // denormalizados
         clienteNombre: concepto,
@@ -223,12 +279,14 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         feriados: [],
         pausas: [],
 
+        // atraso y adelanto
         modoAtraso: 'porPresencia',
         permitirAdelantar: true,
       };
 
       const prestamoRef = await addDoc(collection(clienteRef, 'prestamos'), prestamoPayload);
 
+      // 🔍 AUDIT: create préstamo (incluye createdDate)
       await logAudit({
         userId: admin,
         action: 'create',
@@ -254,6 +312,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       };
       await setDoc(idxRef, idxPayload, { merge: true });
 
+      // 🔍 AUDIT: upsert índice
       await logAudit({
         userId: admin,
         action: 'update',
@@ -264,72 +323,8 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       Alert.alert('Guardado', 'Préstamo registrado correctamente.');
       navigation.popToTop();
     } catch (e) {
-      console.error('❌ Error al guardar (online). Encolando para offline…', e);
-
-      try {
-        // —— OFFLINE FALLBACK: Encolar “venta” —— //
-        const tz = pickTZ((cliente as any)?.tz);
-        const hoyIso = todayInTZ(tz);
-        const diasHabiles = [1, 2, 3, 4, 5, 6];
-        const fechaInicioOperativa = nextOperativeDayStr(hoyIso, diasHabiles);
-
-        // Si no teníamos cliente existente, pre-generamos un id local seguro para futura escritura
-        const targetClienteId: string = existingClienteId ?? doc(collection(db, 'clientes')).id;
-
-        const concepto = String(cliente?.nombre ?? '').trim() || 'Sin nombre';
-        const total = totalCalc;
-        const vCuota = cuotaCalc;
-
-        await addToOutbox({
-          kind: 'otro',
-          payload: {
-            _subkind: 'venta',
-            admin,
-            targetClienteId,
-            clienteData: {
-              nombre: cliente?.nombre ?? '',
-              alias: cliente?.alias ?? '',
-              direccion1: cliente?.direccion1 ?? '',
-              telefono1: cliente?.telefono1 ?? '',
-              barrio: cliente?.barrio ?? '',
-            },
-            prestamoData: {
-              concepto,
-              cobradorId: admin,
-              montoTotal: total,
-              restante: total,
-              clienteNombre: concepto,
-              clienteId: targetClienteId,
-              modalidad: prestamo.modalidad,
-              interes: interesPct,
-              valorNeto: valor,
-              totalPrestamo: total,
-              cuotas: cuotasNum,
-              valorCuota: vCuota,
-              fechaInicio: fechaInicioOperativa,
-              diasHabiles,
-              feriados: [],
-              pausas: [],
-              modoAtraso: 'porPresencia',
-              permitirAdelantar: true,
-            },
-            // Para asiento de caja (venta = valor neto desembolsado)
-            caja: {
-              monto: valor,
-              clienteNombre: concepto,
-            },
-            tz,
-            operationalDate: hoyIso,
-            createdAtMs: Date.now(),
-          },
-        });
-
-        Alert.alert('Sin conexión', 'Se guardó en "Pendientes". Cuando haya internet, se enviará automáticamente.');
-        // Volvemos a Home (opcional) o nos quedamos; aquí no forzamos navegación
-      } catch (ex) {
-        console.error('❌ Error encolando venta offline:', ex);
-        Alert.alert('Error', 'No se pudo guardar el préstamo ni en pendientes.');
-      }
+      console.error('❌ Error al guardar:', e);
+      Alert.alert('Error', 'No se pudo guardar el préstamo.');
     } finally {
       setGuardando(false);
     }
@@ -556,6 +551,7 @@ function Field({
         onChangeText={onChangeText}
         keyboardType={keyboardType}
         editable={editable}
+        // 🔕 sin placeholder para no mostrar texto de ejemplo
       />
     </View>
   );

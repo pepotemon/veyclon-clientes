@@ -15,7 +15,6 @@ import { calcularDiasAtraso } from '../utils/atrasoHelper';
 import { logAudit, pick } from '../utils/auditLogs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { addToOutbox } from '../utils/outbox';
-import { logToCajaDiaria } from '../utils/caja'; // ✅ helper unificado
 
 type Props = {
   visible: boolean;
@@ -56,6 +55,49 @@ async function openWhats(text: string) {
       ? 'No se pudo abrir WhatsApp. Verifica que esté instalado.'
       : 'No se pudo abrir WhatsApp en este dispositivo.'
   );
+}
+
+async function logToCajaDiaria(params: {
+  admin: string;
+  clienteId: string;
+  prestamoId: string;
+  clienteNombre: string;
+  monto: number;
+  tz: string;
+  operationalDate: string;
+}) {
+  const { admin, clienteId, prestamoId, clienteNombre, monto, tz, operationalDate } = params;
+  const now = Date.now();
+  try {
+    const ref = await addDoc(collection(db, 'cajaDiaria'), {
+      tipo: 'abono',
+      admin,
+      clienteId,
+      prestamoId,
+      clienteNombre,
+      monto: Number(monto.toFixed(2)),
+      tz,
+      operationalDate,
+      createdAtMs: now,
+      createdAt: serverTimestamp(),
+      source: 'app',
+    });
+    await logAudit({
+      userId: admin,
+      action: 'create',
+      ref,
+      after: {
+        admin,
+        clienteId,
+        prestamoId,
+        monto: Number(monto.toFixed(2)),
+        operationalDate,
+        tipo: 'abono',
+      },
+    });
+  } catch (e) {
+    console.warn('[cajaDiaria] no se pudo registrar:', e);
+  }
 }
 
 function buildReceiptPT(opts: {
@@ -295,20 +337,11 @@ export default function ModalRegistroPago({
         after: pick(txResult.abonoNuevo, ['monto','operationalDate','tz']),
       });
 
-      // ✅ Caja diaria (shape unificado)
+      // Caja diaria
       await logToCajaDiaria({
-        tipo: 'abono',
-        admin,
-        monto: montoNum,
-        tz: txResult.tz,
-        operationalDate: txResult.operativoHoy,
-        source: 'app',
-        // identidad para informes/UI
-        clienteId: clienteId!,
-        prestamoId: prestamoId!,
+        admin, clienteId: clienteId!, prestamoId: prestamoId!,
         clienteNombre: clienteNombre || txResult.prestamoData?.concepto || 'Cliente',
-        // útil para trazabilidad
-        meta: { abonoRefPath: doc(collection(doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!), 'abonos'), abonoRef.id).path },
+        monto: montoNum, tz: txResult.tz, operationalDate: txResult.operativoHoy,
       });
 
       // Recalcular atraso (con el array abonos actualizado)
@@ -380,7 +413,7 @@ export default function ModalRegistroPago({
       setMonto('');
       onSuccess?.(); // 👉 refresca PagosDelDia y quita del Home el cliente que ya pagó
     } catch (error: any) {
-      console.error('🔥 Error al registrar el abono (online):', error);
+      // 🔌 Offline o fallo en la escritura remota → encolar en OUTBOX
       try {
         const tz = pickTZ();
         const operationalDate = todayInTZ(tz);
@@ -394,18 +427,20 @@ export default function ModalRegistroPago({
             monto: parseFloat(montoNum.toFixed(2)),
             tz,
             operationalDate,
-            clienteNombre, // 👈 para mostrar en Pendientes/Informes
+            // ✅ clienteNombre top-level (además del que va en cajaPayload)
+            clienteNombre: clienteNombre || 'Cliente',
             alsoCajaDiaria: true,
             cajaPayload: { tipo: 'abono' as const, clienteNombre },
           },
         });
 
         Alert.alert('Sin conexión', 'El pago se guardó en "Pendientes" y podrás reenviarlo cuando tengas internet.');
-      } catch (e: any) {
-        if (e?.name === 'PAGO_PENDIENTE_EXISTE') {
-          Alert.alert('Pendiente existente', 'Este cliente ya tiene un pago pendiente en cola. Reenvíalo antes de agregar otro.');
+      } catch (enqueueErr: any) {
+        const msg = (enqueueErr?.message || '').toString();
+        if (msg.includes('ya tiene un pago pendiente')) {
+          // ✅ Mensaje amigable cuando la validación del outbox bloquea el 2º abono
+          Alert.alert('Pago ya pendiente', 'Este cliente ya tiene un pago pendiente sin enviar.');
         } else {
-          console.error('❌ No se pudo guardar en outbox:', e);
           Alert.alert('Error', 'No se pudo registrar el pago ni guardarlo en pendientes. Inténtalo nuevamente.');
         }
       }
