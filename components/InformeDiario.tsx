@@ -81,22 +81,31 @@ export default function InformeDiario({
           keyExtractor={(it) => it.id}
           contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 16 + insets.bottom }}
           ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
-          renderItem={({ item }) => (
-            <View style={[styles.card, { backgroundColor: palette.cardBg, shadowColor: palette.text }]}>
-              <View style={[styles.iconBox, { borderColor: palette.cardBorder, backgroundColor: palette.kpiTrack }]}>
-                <Icon name={icon} size={18} color={palette.accent} />
+          renderItem={({ item }) => {
+            const metaRight =
+              item.nota?.trim()
+                ? `${item.hora} • ${item.nota.trim()}`
+                : (item.categoria?.trim()
+                    ? `${item.hora} • ${item.categoria.trim()}`
+                    : `Hora: ${item.hora}`);
+
+            return (
+              <View style={[styles.card, { backgroundColor: palette.cardBg, shadowColor: palette.text }]}>
+                <View style={[styles.iconBox, { borderColor: palette.cardBorder, backgroundColor: palette.kpiTrack }]}>
+                  <Icon name={icon} size={18} color={palette.accent} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.nombre, { color: palette.text }]} numberOfLines={1}>
+                    {item.title}
+                  </Text>
+                  <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+                    {metaRight}
+                  </Text>
+                </View>
+                <Text style={[styles.monto, { color: palette.text }]}>R$ {Number(item.monto || 0).toFixed(2)}</Text>
               </View>
-              <View style={{ flex: 1 }}>
-                <Text style={[styles.nombre, { color: palette.text }]} numberOfLines={1}>
-                  {item.title}
-                </Text>
-                <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
-                  {item.nota ? `${item.hora} • ${item.nota}` : `Hora: ${item.hora}`}
-                </Text>
-              </View>
-              <Text style={[styles.monto, { color: palette.text }]}>R$ {Number(item.monto || 0).toFixed(2)}</Text>
-            </View>
-          )}
+            );
+          }}
           ListEmptyComponent={
             <View style={{ alignItems: 'center', marginTop: 24 }}>
               <Text style={{ color: palette.softText }}>{emptyText}</Text>

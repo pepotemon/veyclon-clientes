@@ -21,7 +21,7 @@ export type TipoMovimiento =
 
 export type MovimientoItem = {
   id: string;
-  title: string;         // texto corto para la fila
+  title: string;         // texto corto para la fila (solo nombre de cliente si aplica)
   monto: number;
   hora: string;          // HH:mm:ss (formateado en la TZ del doc o fallback)
   nota?: string | null;
@@ -120,22 +120,23 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
       let title = 'Movimiento';
 
       if (tCanon === 'ingreso') {
-        title = 'Ingreso';
+        title = cliente?.trim() || 'Ingreso';
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'retiro') {
-        title = 'Retiro';
+        title = cliente?.trim() || 'Retiro';
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'gasto_admin') {
-        title = (data?.categoria ?? '').toString().trim() || 'Gasto admin';
+        // Gastos suelen NO tener cliente => mantenemos categoría o fallback
+        title = cliente?.trim() || (data?.categoria ?? '').toString().trim() || 'Gasto admin';
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'gasto_cobrador') {
-        title = (data?.categoria ?? '').toString().trim() || 'Gasto cobrador';
+        title = cliente?.trim() || (data?.categoria ?? '').toString().trim() || 'Gasto cobrador';
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'abono') {
-        // ✅ “Pago — {cliente}” si hay nombre
-        title = (cliente?.trim() ? `Pago — ${cliente.trim()}` : 'Pago');
+        // ✅ SOLO nombre (sin “Pago — ”)
+        title = cliente?.trim() || 'Cliente';
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'apertura') {
         title = 'Apertura';
@@ -297,8 +298,8 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
           const monto = Number(data?.valorNeto ?? data?.capital ?? 0);
           arr.push({
             id: d.id,
-            // ✅ título con nombre si existe
-            title: (cliente?.trim() ? `Venta — ${cliente.trim()}` : 'Préstamo'),
+            // ✅ SOLO nombre (sin “Venta — ”). Fallback genérico si no hay nombre.
+            title: cliente?.trim() || 'Préstamo',
             monto: Number.isFinite(monto) ? monto : 0,
             hora,
             nota: concepto || null,

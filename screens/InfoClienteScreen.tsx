@@ -39,10 +39,15 @@ type Cliente = {
 
 type Abono = {
   monto: number;
-  fecha?: string;
-  operationalDate?: string;
+  fecha?: string;                 // ISO opcional
+  operationalDate?: string;       // YYYY-MM-DD (preferido para “hoy”)
   tz?: string;
   registradoPor?: string;
+  // 👇 extras útiles para dedupe
+  createdAtMs?: number;
+  fromOutboxId?: string;
+  _idSubdoc?: string;             // id del doc en subcolección (si viene de ahí)
+  source?: string;
 };
 
 type Prestamo = {
@@ -97,6 +102,18 @@ const iconoPorGenero = (g?: 'F' | 'M' | 'O') => {
   return 'account-circle-outline' as const;
 };
 
+/** Huella estable para deduplicar un abono proveniente de distintas fuentes */
+function fingerprintAbono(a: Abono) {
+  const dia = a.operationalDate || (a.fecha ? normYYYYMMDD(a.fecha) : '');
+  const monto2 = Number(a.monto || 0).toFixed(2);
+  const ox = a.fromOutboxId || '';
+  const ms = a.createdAtMs ? String(a.createdAtMs) : '';
+  const iso = a.fecha || '';
+  // Prefiere fromOutboxId; si no hay, usa createdAtMs; si no, ISO.
+  const disambiguator = ox || ms || iso || '';
+  return `d=${dia}|m=${monto2}|k=${disambiguator}`;
+}
+
 export default function InfoClienteScreen({ route, navigation }: Props) {
   const { clienteId, nombreCliente, admin } = route.params;
   const { palette } = useAppTheme();
@@ -124,6 +141,19 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
         const activosBase: Prestamo[] = [];
         pSnap.forEach((d) => {
           const data = d.data() as any;
+          const legacyArr = Array.isArray(data.abonos) ? data.abonos : [];
+          // normalizar legacy con extras por si están
+          const legacyNorm: Abono[] = legacyArr.map((a: any) => ({
+            monto: Number(a?.monto || 0),
+            operationalDate: a?.operationalDate,
+            fecha: a?.fecha, // podría venir ISO en algunos históricos
+            tz: a?.tz,
+            registradoPor: a?.registradoPor || a?.creadoPor,
+            createdAtMs: typeof a?.createdAtMs === 'number' ? a.createdAtMs : undefined,
+            fromOutboxId: a?.fromOutboxId,
+            source: a?.source,
+          }));
+
           activosBase.push({
             id: d.id,
             clienteId,
@@ -132,7 +162,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
             restante: Number(data.restante ?? 0),
             valorCuota: Number(data.valorCuota ?? 0),
             modalidad: data.modalidad ?? 'Diaria',
-            abonos: Array.isArray(data.abonos) ? data.abonos : [], // legacy
+            abonos: legacyNorm, // legacy normalizado
             tz: data.tz || 'America/Sao_Paulo',
             fechaInicio: data.fechaInicio,
 
@@ -145,43 +175,67 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
           });
         });
 
-        // 2.b) ⬅️ Completar con subcolección 'abonos' (nueva fuente idempotente del outbox)
+        // 2.b) Completar con subcolección 'abonos' y DEDUPLICAR
         const activos: Prestamo[] = await Promise.all(
           activosBase.map(async (p) => {
             try {
-              const subSnap = await getDocs(collection(db, 'clientes', clienteId, 'prestamos', p.id, 'abonos'));
-              const fromSub = subSnap.docs.map((dd) => {
+              const subSnap = await getDocs(
+                collection(db, 'clientes', clienteId, 'prestamos', p.id, 'abonos')
+              );
+              const fromSub: Abono[] = subSnap.docs.map((dd) => {
                 const a = dd.data() as any;
-                // Normalizamos a nuestro tipo Abono
                 const createdMs =
                   typeof a?.createdAt?.seconds === 'number'
                     ? a.createdAt.seconds * 1000
                     : (typeof a?.createdAtMs === 'number' ? a.createdAtMs : undefined);
-
                 const fechaIso = createdMs ? new Date(createdMs).toISOString() : undefined;
 
                 return {
                   monto: Number(a?.monto || 0),
-                  operationalDate: a?.operationalDate, // YYYY-MM-DD (preferido para “abonos hoy”)
-                  fecha: fechaIso,                     // ISO para historial/orden
+                  operationalDate: a?.operationalDate, // YYYY-MM-DD
+                  fecha: fechaIso,                     // ISO (para orden)
                   tz: a?.tz,
-                  registradoPor: a?.creadoPor,
+                  // ✅ leer el campo correcto:
+                  registradoPor: a?.registradoPor || a?.creadoPor,
+                  createdAtMs: typeof a?.createdAtMs === 'number' ? a.createdAtMs : createdMs,
+                  fromOutboxId: a?.fromOutboxId,
+                  source: a?.source,
+                  _idSubdoc: dd.id,
                 } as Abono;
               });
 
-              // Merge con legacy array, si existiera
-              const legacy = Array.isArray(p.abonos) ? p.abonos : [];
-              const merged = [...legacy, ...fromSub];
+              // MERGE + DEDUPE: preferimos subcolección ante choque
+              const byKey = new Map<string, Abono>();
 
-              // Ordenar por fecha con preferencia a operationalDate, luego created
+              // Primero legacy
+              for (const a of p.abonos || []) {
+                const k = fingerprintAbono(a);
+                byKey.set(k, a);
+              }
+              // Luego subcolección (pisan a legacy si coincide huella)
+              for (const a of fromSub) {
+                const k = fingerprintAbono(a);
+                byKey.set(k, a);
+              }
+
+              const merged = Array.from(byKey.values());
+
+              // Ordenar por fecha con preferencia a operationalDate, luego createdAtMs, luego ISO
               merged.sort((a, b) => {
-                const aa =
-                  (a.operationalDate ? Date.parse(a.operationalDate + 'T12:00:00Z') : NaN) ||
-                  (a.fecha ? Date.parse(a.fecha) : NaN) || 0;
-                const bb =
-                  (b.operationalDate ? Date.parse(b.operationalDate + 'T12:00:00Z') : NaN) ||
-                  (b.fecha ? Date.parse(b.fecha) : NaN) || 0;
-                return bb - aa;
+                const aDia = a.operationalDate ? Date.parse(a.operationalDate + 'T12:00:00Z') : NaN;
+                const bDia = b.operationalDate ? Date.parse(b.operationalDate + 'T12:00:00Z') : NaN;
+
+                const aTime =
+                  (isFinite(aDia) ? aDia : 0) ||
+                  (typeof a.createdAtMs === 'number' ? a.createdAtMs : 0) ||
+                  (a.fecha ? Date.parse(a.fecha) : 0);
+
+                const bTime =
+                  (isFinite(bDia) ? bDia : 0) ||
+                  (typeof b.createdAtMs === 'number' ? b.createdAtMs : 0) ||
+                  (b.fecha ? Date.parse(b.fecha) : 0);
+
+                return bTime - aTime;
               });
 
               return { ...p, abonos: merged };
