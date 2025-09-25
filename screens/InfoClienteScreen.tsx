@@ -43,10 +43,9 @@ type Abono = {
   operationalDate?: string;       // YYYY-MM-DD (preferido para “hoy”)
   tz?: string;
   registradoPor?: string;
-  // 👇 extras útiles para dedupe
   createdAtMs?: number;
   fromOutboxId?: string;
-  _idSubdoc?: string;             // id del doc en subcolección (si viene de ahí)
+  _idSubdoc?: string;
   source?: string;
 };
 
@@ -109,7 +108,6 @@ function fingerprintAbono(a: Abono) {
   const ox = a.fromOutboxId || '';
   const ms = a.createdAtMs ? String(a.createdAtMs) : '';
   const iso = a.fecha || '';
-  // Prefiere fromOutboxId; si no hay, usa createdAtMs; si no, ISO.
   const disambiguator = ox || ms || iso || '';
   return `d=${dia}|m=${monto2}|k=${disambiguator}`;
 }
@@ -142,11 +140,10 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
         pSnap.forEach((d) => {
           const data = d.data() as any;
           const legacyArr = Array.isArray(data.abonos) ? data.abonos : [];
-          // normalizar legacy con extras por si están
           const legacyNorm: Abono[] = legacyArr.map((a: any) => ({
             monto: Number(a?.monto || 0),
             operationalDate: a?.operationalDate,
-            fecha: a?.fecha, // podría venir ISO en algunos históricos
+            fecha: a?.fecha,
             tz: a?.tz,
             registradoPor: a?.registradoPor || a?.creadoPor,
             createdAtMs: typeof a?.createdAtMs === 'number' ? a.createdAtMs : undefined,
@@ -162,7 +159,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
             restante: Number(data.restante ?? 0),
             valorCuota: Number(data.valorCuota ?? 0),
             modalidad: data.modalidad ?? 'Diaria',
-            abonos: legacyNorm, // legacy normalizado
+            abonos: legacyNorm,
             tz: data.tz || 'America/Sao_Paulo',
             fechaInicio: data.fechaInicio,
 
@@ -195,7 +192,6 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                   operationalDate: a?.operationalDate, // YYYY-MM-DD
                   fecha: fechaIso,                     // ISO (para orden)
                   tz: a?.tz,
-                  // ✅ leer el campo correcto:
                   registradoPor: a?.registradoPor || a?.creadoPor,
                   createdAtMs: typeof a?.createdAtMs === 'number' ? a.createdAtMs : createdMs,
                   fromOutboxId: a?.fromOutboxId,
@@ -204,23 +200,12 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                 } as Abono;
               });
 
-              // MERGE + DEDUPE: preferimos subcolección ante choque
+              // MERGE + DEDUPE (subcolección pisa legacy si coincide huella)
               const byKey = new Map<string, Abono>();
-
-              // Primero legacy
-              for (const a of p.abonos || []) {
-                const k = fingerprintAbono(a);
-                byKey.set(k, a);
-              }
-              // Luego subcolección (pisan a legacy si coincide huella)
-              for (const a of fromSub) {
-                const k = fingerprintAbono(a);
-                byKey.set(k, a);
-              }
+              for (const a of p.abonos || []) byKey.set(fingerprintAbono(a), a);
+              for (const a of fromSub) byKey.set(fingerprintAbono(a), a);
 
               const merged = Array.from(byKey.values());
-
-              // Ordenar por fecha con preferencia a operationalDate, luego createdAtMs, luego ISO
               merged.sort((a, b) => {
                 const aDia = a.operationalDate ? Date.parse(a.operationalDate + 'T12:00:00Z') : NaN;
                 const bDia = b.operationalDate ? Date.parse(b.operationalDate + 'T12:00:00Z') : NaN;
@@ -240,7 +225,6 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
 
               return { ...p, abonos: merged };
             } catch {
-              // si falla subcolección, seguimos con legacy
               return p;
             }
           })
@@ -278,70 +262,76 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
     cargar();
   }, [clienteId, admin]);
 
-  // abonos de hoy (por préstamo)
-  const abonosHoyDe = (p: Prestamo) => {
-    const tz = pickTZ(p.tz, 'America/Sao_Paulo');
-    const hoy = todayInTZ(tz);
-    return (p.abonos || []).filter((a) => {
-      const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
-      return dia === hoy;
-    });
-  };
+  /** ===== Memo: abonos de hoy por préstamo ===== */
+  const abonosHoyMap = useMemo(() => {
+    const map: Record<string, Abono[]> = {};
+    for (const p of prestamosActivos) {
+      const tz = pickTZ(p.tz, 'America/Sao_Paulo');
+      const hoy = todayInTZ(tz);
+      map[p.id] = (p.abonos || []).filter((a) => {
+        const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
+        return dia === hoy;
+      });
+    }
+    return map;
+  }, [prestamosActivos]);
 
-  // KPIs por préstamo (mismos criterios que en Home)
-  const kpisDePrestamo = (p: Prestamo) => {
-    const tz = pickTZ(p.tz, 'America/Sao_Paulo');
-    const hoy = todayInTZ(tz);
+  /** ===== Memo: KPIs por préstamo ===== */
+  const kpisMap = useMemo(() => {
+    const map: Record<string, { diasAtraso: number; cuotasVencidas: number }> = {};
+    for (const p of prestamosActivos) {
+      const tz = pickTZ(p.tz, 'America/Sao_Paulo');
+      const hoy = todayInTZ(tz);
 
-    const diasHabiles =
-      Array.isArray(p?.diasHabiles) && p.diasHabiles.length
-        ? p.diasHabiles
-        : [1, 2, 3, 4, 5, 6];
-    const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
-    const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
-    const cuotas =
-      Number(p?.cuotas || 0) ||
-      Math.ceil(
-        Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
-      );
+      const diasHabiles =
+        Array.isArray(p?.diasHabiles) && p.diasHabiles.length
+          ? p.diasHabiles
+          : [1, 2, 3, 4, 5, 6];
+      const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
+      const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
+      const cuotas =
+        Number(p?.cuotas || 0) ||
+        Math.ceil(Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1));
 
-    const abonosNorm = (p.abonos || []).map((a) => ({
-      monto: Number(a.monto) || 0,
-      operationalDate: a.operationalDate,
-      fecha: a.fecha,
-    }));
+      const abonosNorm = (p.abonos || []).map((a) => ({
+        monto: Number(a.monto) || 0,
+        operationalDate: a.operationalDate,
+        fecha: a.fecha,
+      }));
 
-    const pres = calcularDiasAtraso({
-      fechaInicio: p.fechaInicio || hoy,
-      hoy,
-      cuotas,
-      valorCuota: Number(p.valorCuota || 0),
-      abonos: abonosNorm,
-      diasHabiles,
-      feriados,
-      pausas,
-      modo: (p?.modoAtraso as any) === 'porCuota' ? 'porCuota' : 'porPresencia',
-      permitirAdelantar: !!p?.permitirAdelantar,
-    });
+      const pres = calcularDiasAtraso({
+        fechaInicio: p.fechaInicio || hoy,
+        hoy,
+        cuotas,
+        valorCuota: Number(p.valorCuota || 0),
+        abonos: abonosNorm,
+        diasHabiles,
+        feriados,
+        pausas,
+        modo: (p?.modoAtraso as any) === 'porCuota' ? 'porCuota' : 'porPresencia',
+        permitirAdelantar: !!p?.permitirAdelantar,
+      });
 
-    const cuota = calcularDiasAtraso({
-      fechaInicio: p.fechaInicio || hoy,
-      hoy,
-      cuotas,
-      valorCuota: Number(p.valorCuota || 0),
-      abonos: abonosNorm,
-      diasHabiles,
-      feriados,
-      pausas,
-      modo: 'porCuota',
-      permitirAdelantar: true,
-    });
+      const cuota = calcularDiasAtraso({
+        fechaInicio: p.fechaInicio || hoy,
+        hoy,
+        cuotas,
+        valorCuota: Number(p.valorCuota || 0),
+        abonos: abonosNorm,
+        diasHabiles,
+        feriados,
+        pausas,
+        modo: 'porCuota',
+        permitirAdelantar: true,
+      });
 
-    return {
-      diasAtraso: Number(pres?.atraso || 0),
-      cuotasVencidas: Math.max(0, Array.isArray(cuota?.faltas) ? cuota.faltas.length : 0),
-    };
-  };
+      map[p.id] = {
+        diasAtraso: Number(pres?.atraso || 0),
+        cuotasVencidas: Math.max(0, Array.isArray(cuota?.faltas) ? cuota.faltas.length : 0),
+      };
+    }
+    return map;
+  }, [prestamosActivos]);
 
   return (
     <View
@@ -441,8 +431,8 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                   <Text style={[styles.empty, { color: palette.softText }]}>No hay préstamos activos.</Text>
                 ) : (
                   prestamosActivos.map((p) => {
-                    const abHoy = abonosHoyDe(p);
-                    const { cuotasVencidas, diasAtraso } = kpisDePrestamo(p);
+                    const abHoy = abonosHoyMap[p.id] || [];
+                    const kpis = kpisMap[p.id] || { cuotasVencidas: 0, diasAtraso: 0 };
 
                     return (
                       <View
@@ -492,7 +482,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                               { backgroundColor: palette.topBg, color: '#C62828', borderColor: palette.topBorder, borderWidth: 1 },
                             ]}
                           >
-                            Vencidas: {cuotasVencidas}
+                            Vencidas: {kpis.cuotasVencidas}
                           </Text>
                           <Text
                             style={[
@@ -500,7 +490,7 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                               { backgroundColor: palette.topBg, color: '#1565C0', borderColor: palette.topBorder, borderWidth: 1 },
                             ]}
                           >
-                            Atraso: {diasAtraso} d
+                            Atraso: {kpis.diasAtraso} d
                           </Text>
                         </View>
 
@@ -511,7 +501,6 @@ export default function InfoClienteScreen({ route, navigation }: Props) {
                             onPress={() => {
                               const abonosCompat = (p.abonos || []).map((a: any) => ({
                                 monto: Number(a.monto) || 0,
-                                // preferimos operationalDate para la UI diaria; si no, ISO → YYYY-MM-DD
                                 fecha: a.operationalDate ?? normYYYYMMDD(a.fecha) ?? hoySession,
                               }));
                               navigation.navigate('HistorialPagos', {

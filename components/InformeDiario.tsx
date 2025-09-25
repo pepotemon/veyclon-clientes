@@ -1,6 +1,6 @@
 // components/InformeDiario.tsx
-import React, { useState } from 'react';
-import { View, Text, FlatList, ActivityIndicator, TouchableOpacity, StyleSheet } from 'react-native';
+import React, { memo, useCallback, useMemo, useState } from 'react';
+import { View, Text, FlatList, ActivityIndicator, TouchableOpacity, StyleSheet, ListRenderItem } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import DateTimePickerModal from 'react-native-modal-datetime-picker';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
@@ -19,7 +19,42 @@ type Props = {
   loading: boolean;
   emptyText?: string;            // texto vacío opcional
   onRefresh?: () => void | Promise<void>; // pull-to-refresh opcional
+  onEndReached?: () => void | Promise<void>; // paginado opcional
 };
+
+/** ===== Row (memorizada) ===== */
+type RowProps = {
+  item: MovimientoItem;
+  iconName: string;
+  palette: ReturnType<typeof useAppTheme>['palette'];
+};
+
+const Row = memo(function Row({ item, iconName, palette }: RowProps) {
+  const metaRight = useMemo(() => {
+    const nota = item.nota?.trim();
+    const cat  = item.categoria?.trim();
+    if (nota) return `${item.hora} • ${nota}`;
+    if (cat)  return `${item.hora} • ${cat}`;
+    return `Hora: ${item.hora}`;
+  }, [item.hora, item.nota, item.categoria]);
+
+  return (
+    <View style={[styles.card, { backgroundColor: palette.cardBg, shadowColor: palette.text }]}>
+      <View style={[styles.iconBox, { borderColor: palette.cardBorder, backgroundColor: palette.kpiTrack }]}>
+        <Icon name={iconName} size={18} color={palette.accent} />
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text style={[styles.nombre, { color: palette.text }]} numberOfLines={1}>
+          {item.title}
+        </Text>
+        <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+          {metaRight}
+        </Text>
+      </View>
+      <Text style={[styles.monto, { color: palette.text }]}>R$ {Number(item.monto || 0).toFixed(2)}</Text>
+    </View>
+  );
+});
 
 export default function InformeDiario({
   titulo,
@@ -32,6 +67,7 @@ export default function InformeDiario({
   loading,
   emptyText = 'No hay registros para esta fecha.',
   onRefresh,
+  onEndReached,
 }: Props) {
   const { palette } = useAppTheme();
   const insets = useSafeAreaInsets();
@@ -43,6 +79,23 @@ export default function InformeDiario({
     onChangeFecha(normYYYYMMDD(d.toISOString()));
     closePicker();
   };
+
+  // memo: keyExtractor y renderItem
+  const keyExtractor = useCallback((it: MovimientoItem) => it.id, []);
+
+  const renderItem = useCallback<ListRenderItem<MovimientoItem>>(
+    ({ item }) => <Row item={item} iconName={icon} palette={palette} />,
+    [icon, palette]
+  );
+
+  const ListEmpty = useMemo(
+    () => (
+      <View style={{ alignItems: 'center', marginTop: 24 }}>
+        <Text style={{ color: palette.softText }}>{emptyText}</Text>
+      </View>
+    ),
+    [emptyText, palette.softText]
+  );
 
   return (
     <View style={{ flex: 1, backgroundColor: palette.screenBg }}>
@@ -78,42 +131,23 @@ export default function InformeDiario({
       ) : (
         <FlatList
           data={items}
-          keyExtractor={(it) => it.id}
-          contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 16 + insets.bottom }}
+          keyExtractor={keyExtractor}
+          renderItem={renderItem}
+          ListEmptyComponent={ListEmpty}
           ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
-          renderItem={({ item }) => {
-            const metaRight =
-              item.nota?.trim()
-                ? `${item.hora} • ${item.nota.trim()}`
-                : (item.categoria?.trim()
-                    ? `${item.hora} • ${item.categoria.trim()}`
-                    : `Hora: ${item.hora}`);
-
-            return (
-              <View style={[styles.card, { backgroundColor: palette.cardBg, shadowColor: palette.text }]}>
-                <View style={[styles.iconBox, { borderColor: palette.cardBorder, backgroundColor: palette.kpiTrack }]}>
-                  <Icon name={icon} size={18} color={palette.accent} />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.nombre, { color: palette.text }]} numberOfLines={1}>
-                    {item.title}
-                  </Text>
-                  <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
-                    {metaRight}
-                  </Text>
-                </View>
-                <Text style={[styles.monto, { color: palette.text }]}>R$ {Number(item.monto || 0).toFixed(2)}</Text>
-              </View>
-            );
-          }}
-          ListEmptyComponent={
-            <View style={{ alignItems: 'center', marginTop: 24 }}>
-              <Text style={{ color: palette.softText }}>{emptyText}</Text>
-            </View>
-          }
+          contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 16 + insets.bottom }}
           // Pull-to-refresh (opcional)
           refreshing={!!onRefresh && loading}
           onRefresh={onRefresh}
+          // Tuning de rendimiento
+          initialNumToRender={16}
+          maxToRenderPerBatch={24}
+          updateCellsBatchingPeriod={50}
+          windowSize={7}
+          removeClippedSubviews
+          // Paginación opcional
+          onEndReached={onEndReached}
+          onEndReachedThreshold={0.6}
         />
       )}
 

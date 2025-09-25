@@ -267,22 +267,70 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
 
       // 3) Ventas (préstamos creados hoy por el admin)
       if (tipo === 'venta') {
-        const qPrest = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin));
-        const snap = await getDocs(qPrest);
+        // ✅ Camino rápido: filtrar por createdDate (YYYY-MM-DD) + creadoPor
+        //    (necesita índice compuesto en collectionGroup 'prestamos')
+        const qPrest = query(
+          collectionGroup(db, 'prestamos'),
+          where('creadoPor', '==', admin),
+          where('createdDate', '==', fecha)
+        );
+        let snap = await getDocs(qPrest);
 
-        const arr: MovimientoItem[] = [];
-        snap.forEach((d) => {
-          const data: any = d.data();
-          const tz = data?.tz || tzFallback;
-          const ymd =
-            ymdFromAny(
+        // 🔁 Fallback: si el índice aún no está o hay docs viejos sin createdDate,
+        //    usa tu lógica previa (consulta amplia + filtro en memoria).
+        if (snap.empty) {
+          const qWide = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin));
+          snap = await getDocs(qWide);
+
+          const filtered = snap.docs.filter(d => {
+            const data: any = d.data();
+            const tz = data?.tz || tzFallback;
+            const ymd = ymdFromAny(
               typeof data?.createdAtMs === 'number'
                 ? data.createdAtMs
                 : (data?.createdAt ?? data?.fechaInicio),
               tz
             );
-          if (ymd !== fecha) return;
+            return ymd === fecha;
+          });
 
+          const arr = filtered.map((d) => {
+            const data: any = d.data();
+            const tz = data?.tz || tzFallback;
+            const ts = tsFromData(data) || Date.now();
+            const hora = new Intl.DateTimeFormat('pt-BR', {
+              hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: tz,
+            }).format(new Date(ts));
+
+            const cliente: string =
+              (data?.clienteNombre ??
+                data?.cliente?.nombre ??
+                data?.clienteName ??
+                '') as string;
+            const concepto: string = (data?.concepto ?? data?.producto ?? '').toString().trim();
+
+            const monto = Number(data?.valorNeto ?? data?.capital ?? 0);
+            return {
+              id: d.id,
+              // ✅ SOLO nombre (sin “Venta — ”). Fallback genérico si no hay nombre.
+              title: cliente?.trim() || 'Préstamo',
+              monto: Number.isFinite(monto) ? monto : 0,
+              hora,
+              nota: concepto || null,
+              raw: data,
+            };
+          });
+
+          arr.sort((a, b) => tsFromData(b.raw) - tsFromData(a.raw));
+          setItems(arr);
+          setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
+          return;
+        }
+
+        // 🚀 Camino rápido (createdDate)
+        const arr: MovimientoItem[] = snap.docs.map((d) => {
+          const data: any = d.data();
+          const tz = data?.tz || tzFallback;
           const ts = tsFromData(data) || Date.now();
           const hora = new Intl.DateTimeFormat('pt-BR', {
             hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: tz,
@@ -296,15 +344,14 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
           const concepto: string = (data?.concepto ?? data?.producto ?? '').toString().trim();
 
           const monto = Number(data?.valorNeto ?? data?.capital ?? 0);
-          arr.push({
+          return {
             id: d.id,
-            // ✅ SOLO nombre (sin “Venta — ”). Fallback genérico si no hay nombre.
-            title: cliente?.trim() || 'Préstamo',
+            title: cliente?.trim() || 'Préstamo', // 👈 sin prefijos, como acordamos
             monto: Number.isFinite(monto) ? monto : 0,
             hora,
             nota: concepto || null,
             raw: data,
-          });
+          };
         });
 
         arr.sort((a, b) => tsFromData(b.raw) - tsFromData(a.raw));
