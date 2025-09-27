@@ -1,5 +1,5 @@
 // screens/NuevoClienteScreen.tsx
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -44,6 +44,16 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
     []
   );
 
+  // Refs para Enter → siguiente
+  const refNombre = useRef<TextInput>(null);
+  const refAlias = useRef<TextInput>(null);
+  const refNit = useRef<TextInput>(null);
+  const refDir1 = useRef<TextInput>(null);
+  const refDir2 = useRef<TextInput>(null);
+  const refBarrio = useRef<TextInput>(null);
+  const refTel1 = useRef<TextInput>(null);
+  const refTel2 = useRef<TextInput>(null);
+
   const handleChange = (key: keyof typeof cliente, value: any) => {
     setCliente((c) => ({ ...c, [key]: value }));
     if ((typeof value === 'string' ? value.trim() !== '' : !!value) && errores[key]) {
@@ -67,6 +77,12 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
     }
     if (Object.keys(nuevos).length) {
       setErrores(nuevos);
+      // Foco en el primer campo con error
+      if (nuevos.nombre) refNombre.current?.focus();
+      else if (nuevos.nit) refNit.current?.focus();
+      else if (nuevos.direccion1) refDir1.current?.focus();
+      else if (nuevos.barrio) refBarrio.current?.focus();
+      else if (nuevos.telefono1) refTel1.current?.focus();
       return;
     }
 
@@ -105,7 +121,7 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
           <ScrollView
             contentContainerStyle={[
               styles.container,
-              { paddingBottom: 92 + insets.bottom }, // más espacio inferior
+              { paddingBottom: 92 + insets.bottom },
             ]}
             keyboardShouldPersistTaps="handled"
           >
@@ -126,6 +142,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                 error={errores.nombre}
                 autoCapitalize="words"
                 palette={palette}
+                inputRef={refNombre}
+                returnKeyType="next"
+                blurOnSubmit={false}
+                onSubmitEditing={() => refAlias.current?.focus()}
               />
 
               <View style={styles.row2}>
@@ -136,6 +156,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                   autoCapitalize="words"
                   palette={palette}
                   compact
+                  inputRef={refAlias}
+                  returnKeyType="next"
+                  blurOnSubmit={false}
+                  onSubmitEditing={() => refNit.current?.focus()}
                 />
                 <Field
                   label="NIT"
@@ -145,6 +169,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                   autoCapitalize="characters"
                   palette={palette}
                   compact
+                  inputRef={refNit}
+                  returnKeyType="next"
+                  blurOnSubmit={false}
+                  onSubmitEditing={() => refDir1.current?.focus()}
                 />
               </View>
 
@@ -155,6 +183,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                 error={errores.direccion1}
                 autoCapitalize="words"
                 palette={palette}
+                inputRef={refDir1}
+                returnKeyType="next"
+                blurOnSubmit={false}
+                onSubmitEditing={() => refDir2.current?.focus()}
               />
 
               <View style={styles.row2}>
@@ -165,6 +197,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                   autoCapitalize="words"
                   palette={palette}
                   compact
+                  inputRef={refDir2}
+                  returnKeyType="next"
+                  blurOnSubmit={false}
+                  onSubmitEditing={() => refBarrio.current?.focus()}
                 />
                 <Field
                   label="Barrio"
@@ -174,6 +210,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                   autoCapitalize="words"
                   palette={palette}
                   compact
+                  inputRef={refBarrio}
+                  returnKeyType="next"
+                  blurOnSubmit={false}
+                  onSubmitEditing={() => refTel1.current?.focus()}
                 />
               </View>
 
@@ -186,6 +226,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                   keyboardType="phone-pad"
                   palette={palette}
                   compact
+                  inputRef={refTel1}
+                  returnKeyType="next"
+                  blurOnSubmit={false}
+                  onSubmitEditing={() => refTel2.current?.focus()}
                 />
                 <Field
                   label="Teléfono 2"
@@ -194,6 +238,10 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
                   keyboardType="phone-pad"
                   palette={palette}
                   compact
+                  inputRef={refTel2}
+                  returnKeyType="done"
+                  blurOnSubmit
+                  onSubmitEditing={continuar}
                 />
               </View>
 
@@ -265,6 +313,10 @@ function Field({
   autoCapitalize = 'none',
   compact = false,
   palette,
+  inputRef,
+  returnKeyType,
+  blurOnSubmit,
+  onSubmitEditing,
 }: {
   label: string;
   value: string;
@@ -274,11 +326,17 @@ function Field({
   autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
   compact?: boolean;
   palette: ReturnType<typeof useAppTheme>['palette'];
+  /** 👇 Acepta refs que pueden ser null */
+  inputRef?: React.RefObject<TextInput | null>;
+  returnKeyType?: 'done' | 'next' | 'go' | 'send' | 'search';
+  blurOnSubmit?: boolean;
+  onSubmitEditing?: () => void;
 }) {
   return (
     <View style={{ marginBottom: compact ? 12 : 16, flex: compact ? 1 : undefined }}>
       <Text style={[styles.label, { color: palette.softText }]}>{label}</Text>
       <TextInput
+        ref={inputRef as any}
         style={[
           styles.input,
           {
@@ -295,6 +353,9 @@ function Field({
         placeholderTextColor={palette.softText}
         keyboardType={keyboardType}
         autoCapitalize={autoCapitalize}
+        returnKeyType={returnKeyType}
+        blurOnSubmit={blurOnSubmit}
+        onSubmitEditing={onSubmitEditing}
       />
       {error ? <Text style={[styles.error, { color: '#d32f2f' }]}>{error}</Text> : null}
     </View>
@@ -310,7 +371,7 @@ const styles = StyleSheet.create({
   headerTitle: { fontSize: 18, fontWeight: '800' },
 
   container: {
-    padding: 16, // más respiro
+    padding: 16,
   },
 
   card: {
@@ -328,12 +389,12 @@ const styles = StyleSheet.create({
 
   row2: {
     flexDirection: 'row',
-    gap: 16, // “doble espacio” entre columnas
+    gap: 16,
   },
 
   label: {
     fontSize: 13,
-    marginBottom: 6, // “doble” vs versión compacta
+    marginBottom: 6,
     fontWeight: '700',
   },
 
@@ -350,12 +411,12 @@ const styles = StyleSheet.create({
 
   genderRow: {
     flexDirection: 'row',
-    gap: 16, // doble
+    gap: 16,
     marginTop: 6,
   },
   genderPill: {
     flex: 1,
-    height: 36, // más alto
+    height: 36,
     borderRadius: 999,
     alignItems: 'center',
     justifyContent: 'center',
@@ -369,7 +430,7 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     borderTopWidth: 1,
-    padding: 12, // más grande
+    padding: 12,
     elevation: 6,
     shadowColor: '#000',
     shadowOpacity: 0.08,

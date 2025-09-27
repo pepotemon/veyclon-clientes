@@ -1,5 +1,5 @@
 // screens/NuevoPrestamoScreen.tsx
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -64,6 +64,10 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
     fechaInicio: '',
     permitirAdelantar: true,
   });
+
+  // 👇 refs para Enter → siguiente
+  const refValorNeto = useRef<TextInput>(null);
+  const refCuotas = useRef<TextInput>(null);
 
   useEffect(() => {
     const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -344,7 +348,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
 
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
         <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-          <ScrollView contentContainerStyle={styles.container}>
+          <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
             {/* Card 1: Parámetros */}
             <View
               style={[
@@ -402,6 +406,10 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
                 onChangeText={(v) => handleChange('valorNeto', v)}
                 keyboardType="numeric"
                 palette={palette}
+                inputRef={refValorNeto}
+                returnKeyType="next"
+                blurOnSubmit={false}
+                onSubmitEditing={() => refCuotas.current?.focus()}
               />
 
               <Field
@@ -417,6 +425,10 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
                 onChangeText={(v) => handleChange('cuotas', v)}
                 keyboardType="numeric"
                 palette={palette}
+                inputRef={refCuotas}
+                returnKeyType="done"
+                blurOnSubmit={true}
+                onSubmitEditing={confirmarGuardado}
               />
 
               <Field
@@ -467,7 +479,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
                   style={({ pressed }) => [
                     styles.optionRow,
                     { borderBottomColor: palette.cardBorder },
-                    pressed && { backgroundColor: palette.kpiTrack },
+                    pressed && { opacity: 0.9 },
                   ]}
                 >
                   <Text style={[styles.optionTxt, { color: palette.text }]}>{modo}</Text>
@@ -501,7 +513,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
                   style={({ pressed }) => [
                     styles.optionRow,
                     { borderBottomColor: palette.cardBorder },
-                    pressed && { backgroundColor: palette.kpiTrack },
+                    pressed && { opacity: 0.9 },
                   ]}
                 >
                   <Text style={[styles.optionTxt, { color: palette.text }]}>{int}%</Text>
@@ -527,6 +539,10 @@ function Field({
   keyboardType = 'default',
   editable = true,
   palette,
+  inputRef,
+  returnKeyType,
+  blurOnSubmit,
+  onSubmitEditing,
 }: {
   label: string;
   value: string;
@@ -534,11 +550,17 @@ function Field({
   keyboardType?: 'default' | 'numeric';
   editable?: boolean;
   palette: ReturnType<typeof useAppTheme>['palette'];
+  /** ✅ acepta refs que pueden ser null */
+  inputRef?: React.RefObject<TextInput | null>;
+  returnKeyType?: 'done' | 'next' | 'go' | 'send' | 'search';
+  blurOnSubmit?: boolean;
+  onSubmitEditing?: () => void;
 }) {
   return (
-    <View style={{ marginBottom: 10 }}>
+    <View style={{ marginBottom: 12 }}>
       <Text style={[styles.label, { color: palette.softText }]}>{label}</Text>
       <TextInput
+        ref={inputRef as any}  // 👈 corrige TS2322
         style={[
           styles.input,
           {
@@ -551,13 +573,15 @@ function Field({
         onChangeText={onChangeText}
         keyboardType={keyboardType}
         editable={editable}
-        // 🔕 sin placeholder para no mostrar texto de ejemplo
+        returnKeyType={returnKeyType}
+        blurOnSubmit={blurOnSubmit}
+        onSubmitEditing={onSubmitEditing}
       />
     </View>
   );
 }
 
-/** ---------- Estilos (compactados) ---------- */
+/** ---------- Estilos (con opciones más grandes) ---------- */
 const styles = StyleSheet.create({
   header: {
     borderBottomWidth: 1,
@@ -583,28 +607,28 @@ const styles = StyleSheet.create({
 
   selector: {
     borderWidth: 1,
-    borderRadius: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    marginBottom: 10,
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    marginBottom: 12,
   },
-  selectorText: { fontSize: 13.5 },
+  selectorText: { fontSize: 15 },
 
   input: {
     borderWidth: 1,
-    borderRadius: 8,
-    paddingVertical: Platform.select({ ios: 7, android: 6 }),
-    paddingHorizontal: 10,
-    fontSize: 14,
+    borderRadius: 10,
+    paddingVertical: Platform.select({ ios: 10, android: 9 }),
+    paddingHorizontal: 12,
+    fontSize: 16,
   },
 
   btn: {
-    paddingVertical: 10,
-    borderRadius: 10,
+    paddingVertical: 12,
+    borderRadius: 12,
     alignItems: 'center',
-    marginTop: 2,
+    marginTop: 4,
   },
-  btnTxt: { color: '#fff', fontWeight: '800', fontSize: 14 },
+  btnTxt: { color: '#fff', fontWeight: '800', fontSize: 15 },
 
   sheetOverlay: {
     flex: 1,
@@ -612,15 +636,15 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   sheet: {
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
     paddingBottom: 8,
     paddingTop: 4,
   },
   optionRow: {
-    paddingVertical: 12,
-    paddingHorizontal: 14,
+    paddingVertical: 18,
+    paddingHorizontal: 18,
     borderBottomWidth: 1,
   },
-  optionTxt: { fontSize: 13.5, fontWeight: '600' },
+  optionTxt: { fontSize: 17, fontWeight: '700' },
 });
