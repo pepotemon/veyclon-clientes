@@ -12,14 +12,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { db } from '../firebase/firebaseConfig';
 import {
   addDoc, serverTimestamp, query, where, collection, onSnapshot, orderBy,
-  getDocs, collectionGroup
+  getDocs, collectionGroup, getDoc, doc, limit
 } from 'firebase/firestore';
 
 import { todayInTZ, pickTZ, normYYYYMMDD } from '../utils/timezone';
 import { logAudit, pick } from '../utils/auditLogs';
 import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';
 
-// 👇 NUEVO: helper de movimientos (tipos/iconos/labels/colores)
 import {
   canonicalTipo,
   iconFor,
@@ -41,10 +40,9 @@ type MovimientoBase = {
   createdAtMs?: number;
 };
 
-// Para la lista compacta mostramos ingreso | retiro | gasto_admin
 type MovimientoCaja = MovimientoBase & {
   tipo: Extract<MovimientoTipo, 'ingreso' | 'retiro' | 'gasto_admin'>;
-  categoria?: string; // solo para gasto_admin
+  categoria?: string;
 };
 
 type Prestamo = {
@@ -59,6 +57,7 @@ type Prestamo = {
   creadoPor?: string;
 };
 
+// MISMA TZ que usamos para definir aperturas
 const tz = 'America/Sao_Paulo';
 
 function formatDateToYMD(date: Date, tzLocal: string) {
@@ -79,9 +78,7 @@ function anyDateToYYYYMMDD(d: any, tzLocal: string): string | null {
     if (typeof d?.seconds === 'number') return formatDateToYMD(new Date(d.seconds * 1000), tzLocal);
     if (d instanceof Date) return formatDateToYMD(d, tzLocal);
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 export default function CajaDiariaScreen({ route, navigation }: Props) {
@@ -94,18 +91,19 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   const [cargando, setCargando] = useState(true);
 
   // KPIs desde cajaDiaria
-  const [apertura, setApertura] = useState(0);
-  const [abonos, setAbonos] = useState(0);     // cobrado (abono/pago)
-  const [ingresos, setIngresos] = useState(0); // manuales (⚠️ ventas NO suman aquí)
-  const [retiros, setRetiros] = useState(0);   // incluye retiros manuales y ventas (retiro por entrega)
-
-  // Movimientos combinados (ingresos + retiros + gastos admin)
+  const [apertura, setApertura] = useState(0);  // SOLO lectura (no seteamos caja inicial desde aquí)
+  const [abonos, setAbonos] = useState(0);
+  const [ingresos, setIngresos] = useState(0);
+  const [retiros, setRetiros] = useState(0);
   const [movsCaja, setMovsCaja] = useState<MovimientoCaja[]>([]);
 
   // Préstamos del día (capital/valorNeto creado hoy)
   const [prestamosDelDia, setPrestamosDelDia] = useState(0);
 
-  // Total de gastos admin (para KPI) a partir de movsCaja
+  // Caja inicial base = CIERRE DE AYER (nunca se pisa desde snapshot)
+  const [cajaInicialBase, setCajaInicialBase] = useState(0);
+
+  // Total de gastos admin
   const totalGastos = useMemo(
     () => movsCaja
       .filter(m => m.tipo === 'gasto_admin')
@@ -113,17 +111,68 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     [movsCaja]
   );
 
-  // Balance operativo del día (incluye préstamos como salida de caja)
-  const balance = useMemo(
-    () => apertura + ingresos + abonos - retiros - totalGastos - prestamosDelDia,
-    [apertura, ingresos, abonos, retiros, totalGastos, prestamosDelDia]
+  // Caja inicial DERIVADA: si hay apertura hoy, esa es la inicial; si no, la base
+  const cajaInicial = useMemo(
+    () => (apertura > 0 ? apertura : cajaInicialBase),
+    [apertura, cajaInicialBase]
   );
 
-  // Snapshot de movimientos del día (cajaDiaria)
+  // Caja final (viva)
+  const cajaFinal = useMemo(
+    () => Math.round((cajaInicial + ingresos + abonos - retiros - totalGastos - prestamosDelDia) * 100) / 100,
+    [cajaInicial, ingresos, abonos, retiros, totalGastos, prestamosDelDia]
+  );
+
+  // --- Cargar CAJA INICIAL BASE = cierre de AYER
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        // AYER a partir de HOY
+        const [Y, M, D] = hoy.split('-').map(n => parseInt(n, 10));
+        const dt = new Date(Date.UTC(Y, M - 1, D));
+        dt.setUTCDate(dt.getUTCDate() - 1);
+        const ayer = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+
+        // 1) cierre idempotente
+        const cierreId = `cierre_${admin}_${ayer}`;
+        const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
+        if (cierreSnap.exists()) {
+          const base = Number(cierreSnap.data()?.balance || 0);
+          if (!cancelled) setCajaInicialBase(Number.isFinite(base) ? base : 0);
+          return;
+        }
+
+        // 2) último cierre no idempotente
+        const qC = query(
+          collection(db, 'cajaDiaria'),
+          where('admin', '==', admin),
+          where('operationalDate', '==', ayer),
+          where('tipo', '==', 'cierre'),
+          orderBy('createdAt', 'desc'),
+          limit(1)
+        );
+        const sC = await getDocs(qC);
+        if (!sC.empty) {
+          const base = Number(sC.docs[0].data()?.balance || 0);
+          if (!cancelled) setCajaInicialBase(Number.isFinite(base) ? base : 0);
+          return;
+        }
+
+        // 3) nada → 0
+        if (!cancelled) setCajaInicialBase(0);
+      } catch (e) {
+        console.warn('[CajaDiaria] cajaInicialBase error:', e);
+        if (!cancelled) setCajaInicialBase(0);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [admin, hoy]);
+
+  // Snapshot de movimientos del día (NO pisa cajaInicialBase; sólo lee apertura y KPIs)
   useEffect(() => {
     setCargando(true);
     try {
-      // admin ==, operationalDate ==, orderBy createdAt asc
       const qDia = query(
         collection(db, 'cajaDiaria'),
         where('admin', '==', admin),
@@ -134,9 +183,8 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
       const unsub = onSnapshot(
         qDia,
         (snap) => {
-          // acumuladores
           let lastAperturaMonto = 0;
-          let lastAperturaTs = -1; // para elegir la última apertura del día
+          let lastAperturaTs = -1;
           let _abonos = 0;
           let _ingresos = 0;
           let _retiros = 0;
@@ -148,10 +196,9 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
             const tip = canonicalTipo(data?.tipo);
             if (!tip) return;
 
-            const m = Number(data?.monto || 0);
+            const m = Number(data?.monto ?? data?.balance ?? 0);
             if (!Number.isFinite(m)) return;
 
-            // timestamp robusto
             const ts =
               (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
               (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
@@ -159,18 +206,13 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
             switch (tip) {
               case 'apertura':
-                if (ts >= lastAperturaTs) {
-                  lastAperturaTs = ts;
-                  lastAperturaMonto = m;
-                }
+                if (ts >= lastAperturaTs) { lastAperturaTs = ts; lastAperturaMonto = m; }
                 break;
 
               case 'abono':
-                _abonos += m;
-                break;
+                _abonos += m; break;
 
               case 'ingreso':
-                // ✅ Ingreso manual únicamente (ventas NO cuentan como ingreso)
                 _ingresos += m;
                 _movsCaja.push({
                   id: d.id, tipo: 'ingreso', monto: m,
@@ -184,7 +226,6 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                 break;
 
               case 'retiro':
-                // ✅ Retiro: incluye retiros manuales y ventas (retiro por entrega de préstamo)
                 _retiros += m;
                 _movsCaja.push({
                   id: d.id, tipo: 'retiro', monto: m,
@@ -199,40 +240,30 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
               case 'gasto_admin':
                 _movsCaja.push({
-                  id: d.id,
-                  tipo: 'gasto_admin',
+                  id: d.id, tipo: 'gasto_admin',
                   categoria: data?.categoria || 'Gasto admin',
-                  monto: m,
-                  nota: data?.nota || '',
+                  monto: m, nota: data?.nota || '',
                   operationalDate: data?.operationalDate,
-                  tz: data?.tz || tz,
-                  admin: data?.admin || admin,
+                  tz: data?.tz || tz, admin: data?.admin || admin,
                   createdAt: data?.createdAt,
                   createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
                 });
                 break;
 
-              case 'gasto_cobrador':
-                // Gasto del cobrador: NO se muestra aquí (caja del admin)
-                break;
-
-              // ⚠️ 'venta' no es un tipo canónico de caja: la venta se registra como 'retiro'
-              // y el KPI de préstamos se calcula leyendo la colección de préstamos del día.
-              case 'cierre':
               default:
-                // no suma a KPIs mostrados
                 break;
             }
           });
 
-          // ordenar la lista combinada por fecha DESC (más reciente primero)
+          // ⛔ NO setear cajaInicialBase aquí (evita pisar con 0 por carreras)
+          setApertura(lastAperturaMonto);
+
           _movsCaja.sort(
             (a, b) =>
               (b.createdAtMs ?? (b as any).createdAt?.seconds ?? 0) -
               (a.createdAtMs ?? (a as any).createdAt?.seconds ?? 0)
           );
 
-          setApertura(lastAperturaMonto);
           setAbonos(_abonos);
           setIngresos(_ingresos);
           setRetiros(_retiros);
@@ -254,9 +285,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     }
   }, [admin, hoy]);
 
-  // Cálculo de PRÉSTAMOS DEL DÍA (KPI préstamos)
-  // ✅ Se suman los préstamos creados hoy por este admin (valorNeto/capital),
-  // y NO se suman como ingreso (la salida de efectivo ya quedó como retiro).
+  // Cálculo de PRÉSTAMOS DEL DÍA
   useEffect(() => {
     let active = true;
     (async () => {
@@ -283,7 +312,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
         if (active) setPrestamosDelDia(total);
       } catch (e) {
-        console.warn('[CajaDiaria] prestamosDelDia error:', e);
+        console.warn('[CajaDiaria] préstamos del día error:', e);
         if (active) setPrestamosDelDia(0);
       }
     })();
@@ -318,7 +347,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     try {
       setGuardandoMov(true);
       const payload = {
-        tipo: modalOpen, // 'ingreso' | 'retiro' (canónico). Las ventas NUNCA van como 'ingreso'.
+        tipo: modalOpen,
         admin,
         monto: Math.round(num * 100) / 100,
         operationalDate: hoy,
@@ -330,7 +359,6 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
       };
       const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
 
-      // Auditoría específica
       await logAudit({
         userId: admin,
         action: modalOpen === 'ingreso' ? 'caja_ingreso' : 'caja_retiro',
@@ -390,10 +418,11 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
         <ActivityIndicator style={{ marginTop: 24 }} />
       ) : (
         <>
+          {/* KPIs */}
           <View style={[styles.kpis, { borderColor: palette.cardBorder }]}>
             <View style={[styles.kpi, { backgroundColor: isDark ? palette.kpiTrack : '#E8F5E9', borderColor: palette.cardBorder }]}>
-              <Text style={[styles.kpiLabel, { color: palette.softText }]}>Apertura</Text>
-              <Text style={[styles.kpiVal, { color: palette.text }]}>R$ {apertura.toFixed(2)}</Text>
+              <Text style={[styles.kpiLabel, { color: palette.softText }]}>Caja inicial</Text>
+              <Text style={[styles.kpiVal, { color: palette.text }]}>R$ {cajaInicial.toFixed(2)}</Text>
             </View>
             <View style={[styles.kpi, { backgroundColor: isDark ? palette.kpiTrack : '#E3F2FD', borderColor: palette.cardBorder }]}>
               <Text style={[styles.kpiLabel, { color: palette.softText }]}>Cobrado</Text>
@@ -420,6 +449,20 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
             </View>
           </View>
 
+          {/* Resultado */}
+          <View style={[styles.kpis, { borderColor: palette.cardBorder, marginTop: 8 }]}>
+            <View style={[styles.kpi, { backgroundColor: isDark ? palette.kpiTrack : '#F3E5F5', borderColor: palette.cardBorder }]}>
+              <Text style={[styles.kpiLabel, { color: palette.softText }]}>Caja final (viva)</Text>
+              <Text style={[styles.kpiVal, { color: palette.text }]}>R$ {cajaFinal.toFixed(2)}</Text>
+            </View>
+            {!!apertura && (
+              <View style={[styles.kpi, { backgroundColor: isDark ? palette.kpiTrack : '#ECEFF1', borderColor: palette.cardBorder }]}>
+                <Text style={[styles.kpiLabel, { color: palette.softText }]}>Apertura (referencia)</Text>
+                <Text style={[styles.kpiVal, { color: palette.text }]}>R$ {apertura.toFixed(2)}</Text>
+              </View>
+            )}
+          </View>
+
           {/* Listado combinado */}
           <Text style={[styles.sectionTitle, { color: palette.text, marginTop: 8 }]}>Movimientos de caja</Text>
           {movsCaja.length === 0 ? (
@@ -439,7 +482,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
         </>
       )}
 
-      {/* Barra de acciones: + Ingreso / – Retiro / + Gasto */}
+      {/* Barra de acciones */}
       <View style={[
         styles.actionsBar,
         {
@@ -558,7 +601,6 @@ const styles = StyleSheet.create({
   btnGhost: { flex: 1, paddingVertical: 10, borderRadius: 10, alignItems: 'center', borderWidth: 1.5, backgroundColor: 'transparent' },
   btnGhostTxt: { fontWeight: '800', fontSize: 14 },
 
-  // Modal
   modalBackdrop: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.25)' },
   modalCard: {
     position: 'absolute', left: 12, right: 12, bottom: 0,

@@ -7,9 +7,12 @@ import {
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
-import { setCajaInicial } from '../utils/cajaManual';
-import { setSaldoActual } from '../utils/cajaEstado';
+
+import { db } from '../firebase/firebaseConfig';
+import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
+
 import { pickTZ, todayInTZ } from '../utils/timezone';
+import { logAudit, pick } from '../utils/auditLogs';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'DefinirCaja'>;
 
@@ -21,7 +24,7 @@ function parseMoney(input: string): number {
   // admitir "3400", "3.400,50", "3400,50", "3400.50"
   const s = input.trim()
     .replace(/\s/g, '')
-    .replace(/\./g, '')        // quita separadores de miles
+    .replace(/\./g, '')        // separador de miles
     .replace(',', '.');        // coma -> punto decimal
   const n = Number(s);
   return Number.isFinite(n) ? n : NaN;
@@ -31,7 +34,7 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
   const { admin } = route.params;
   const { palette } = useAppTheme();
 
-  // Info inicial solo para mostrar en UI; el cálculo real se hace al guardar
+  // Info para UI; el payload toma TZ/fecha en el momento de guardar
   const tzUI = useMemo(() => pickTZ(undefined, 'America/Sao_Paulo'), []);
   const opDateUI = useMemo(() => todayInTZ(tzUI), [tzUI]);
 
@@ -44,7 +47,7 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
   const onApertura = async () => {
     try {
       if (disabled) {
-        Alert.alert('Monto inválido', `Ingresa un valor mayor o igual a R$ ${MIN_APERTURA.toFixed(2)}.`);
+        Alert.alert('Monto inválido', `Ingresa un valor ≥ R$ ${MIN_APERTURA.toFixed(2)}.`);
         return;
       }
 
@@ -55,18 +58,39 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
         return;
       }
 
-      // Recalcular TZ y fecha operativa justo al guardar (evita desfasajes al pasar de día)
-      const tzNow = pickTZ();
+      // Recalcular TZ/fecha con la MISMA TZ que usan las pantallas
+      const tzNow = pickTZ(undefined, 'America/Sao_Paulo');
       const opDateNow = todayInTZ(tzNow);
-      const notaTrim = nota.trim() || undefined;
+      const notaTrim = (nota || '').trim() || null;
 
-      // 1) asiento del día (visibilidad en reportes del día)
-      await setCajaInicial(admin, val, opDateNow, tzNow, notaTrim);
+      // ⚠️ APERTURA canónica en cajaDiaria (esto define la CAJA INICIAL del día)
+      const payload = {
+        tipo: 'apertura' as const,
+        admin,
+        monto: val,
+        operationalDate: opDateNow, // YYYY-MM-DD en tu TZ
+        tz: tzNow,
+        nota: notaTrim,
+        createdAt: serverTimestamp(),
+        createdAtMs: Date.now(),
+        source: 'manual' as const,
+      };
 
-      // 2) saldo persistente (Caja Inicial acumulada que arrastra al siguiente día)
-      await setSaldoActual(admin, val, tzNow);
+      const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
 
-      Alert.alert('Listo', `Caja inicial registrada por ${val.toLocaleString(DISPLAY_LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} y saldo persistente actualizado.`);
+      // Auditoría
+      await logAudit({
+        userId: admin,
+        action: 'caja_apertura_manual', // agrega este literal a AuditAction si hace falta
+        ref,
+        before: null,
+        after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','source']),
+      });
+
+      Alert.alert(
+        'Listo',
+        `Apertura registrada: R$ ${val.toLocaleString(DISPLAY_LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}.\nSerá la caja inicial de hoy.`
+      );
       navigation.goBack();
     } catch (e: any) {
       console.warn('[DefinirCaja] onApertura error:', e?.message || e);
@@ -109,7 +133,7 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
           </View>
 
           <Text style={{ color: palette.softText, marginTop: 10, fontSize: 12 }}>
-            • La apertura fija la caja inicial del día y el saldo persistente de la caja.
+            • La apertura fija la caja inicial de hoy. La caja final (saldo) se actualizará con tus movimientos y cierre.
           </Text>
         </View>
       </KeyboardAvoidingView>

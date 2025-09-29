@@ -9,10 +9,13 @@ import {
   collection,
   collectionGroup,
   doc,
+  getDoc,
   getDocs,
   onSnapshot,
+  orderBy,
   query,
   where,
+  limit,
 } from 'firebase/firestore';
 import { pickTZ, todayInTZ, normYYYYMMDD } from '../utils/timezone';
 import { ensureAperturaDeHoy, closeMissingDays } from '../utils/cajaEstado';
@@ -42,7 +45,7 @@ type Prestamo = {
 const DISPLAY_LOCALE = 'es-AR';
 const TZ_DEFAULT = 'America/Sao_Paulo';
 const money = (n: number) => {
-  const v = Math.abs(n) < 0.005 ? 0 : n; // evita -0.00
+  const v = Math.abs(n) < 0.005 ? 0 : n;
   return `R$ ${Number(v || 0).toLocaleString(DISPLAY_LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
 
@@ -57,8 +60,10 @@ export default function CerrarDiaScreen({ route }: Props) {
   const [prestamos, setPrestamos] = useState<Prestamo[]>([]);
   const [kpiCaja, setKpiCaja] = useState({ cobrado: 0, gastos: 0, ingresos: 0, retiros: 0 });
 
-  // Caja inicial persistente (cajaEstado) + fallback (última apertura del día)
-  const [cajaInicialPersistente, setCajaInicialPersistente] = useState<number | null>(null);
+  // Caja inicial BASE (cierre de ayer). No se actualiza durante el día.
+  const [cajaInicial, setCajaInicial] = useState<number>(0);
+
+  // Solo para trazabilidad visual (no base): apertura del día
   const [aperturaDelDia, setAperturaDelDia] = useState<number>(0);
 
   // ====== HELPERS ======
@@ -82,11 +87,33 @@ export default function CerrarDiaScreen({ route }: Props) {
       return null;
     } catch { return null; }
   }
-  function addDaysYMD(ymd: string, days: number, tzLocal: string) {
-    const [Y, M, D] = ymd.split('-').map(n => parseInt(n, 10));
-    const dt = new Date(Date.UTC(Y, (M - 1), D));
-    dt.setUTCDate(dt.getUTCDate() + days);
-    return formatDateToYMD(dt, tzLocal);
+
+  async function getCajaInicialUI(adminId: string, hoyYmd: string): Promise<number> {
+    // AYER a partir de 'hoy'
+    const [Y, M, D] = hoyYmd.split('-').map((n) => parseInt(n, 10));
+    const dt = new Date(Date.UTC(Y, M - 1, D));
+    dt.setUTCDate(dt.getUTCDate() - 1);
+    const ayer = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+
+    // 1) Preferimos cierre idempotente
+    const cierreId = `cierre_${adminId}_${ayer}`;
+    const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
+    if (cierreSnap.exists()) return Number(cierreSnap.data()?.balance || 0);
+
+    // 2) Último cierre "no idempotente" (compat)
+    const qC = query(
+      collection(db, 'cajaDiaria'),
+      where('admin', '==', adminId),
+      where('operationalDate', '==', ayer),
+      where('tipo', '==', 'cierre'),
+      orderBy('createdAt', 'desc'),
+      limit(1)
+    );
+    const sC = await getDocs(qC);
+    if (!sC.empty) return Number(sC.docs[0].data()?.balance || 0);
+
+    // 3) Si no hay nada: 0 (o podrías usar saldoActual si >0)
+    return 0;
   }
 
   // —— préstamos del cobrador
@@ -186,7 +213,7 @@ export default function CerrarDiaScreen({ route }: Props) {
               case 'gasto_admin':
                 gastosAdmin += monto; break;
               default:
-                break; // cierre y otros no suman en KPIs
+                break;
             }
           });
 
@@ -205,29 +232,20 @@ export default function CerrarDiaScreen({ route }: Props) {
     return () => { try { unsub && unsub(); } catch {} };
   }, [admin, hoy]);
 
-  // —— saldo persistente de la caja (cajaEstado/{admin})
+  // —— Cargar la CAJA INICIAL (cierre de AYER) una vez por día
   useEffect(() => {
-    let unsub: undefined | (() => void);
-    try {
-      const ref = doc(db, 'cajaEstado', admin);
-      unsub = onSnapshot(
-        ref,
-        (snap) => {
-          const data = snap.data() as any;
-          const saldo = Number(data?.saldoActual);
-          setCajaInicialPersistente(Number.isFinite(saldo) ? saldo : null);
-        },
-        (err) => {
-          console.warn('[cajaEstado] snapshot:', err?.code || err?.message || err);
-          setCajaInicialPersistente(null);
-        }
-      );
-    } catch (e) {
-      console.warn('[cajaEstado] suscripción no disponible:', e);
-      setCajaInicialPersistente(null);
-    }
-    return () => { try { unsub && unsub(); } catch {} };
-  }, [admin]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const base = await getCajaInicialUI(admin, hoy);
+        if (!cancelled) setCajaInicial(Number.isFinite(base) ? base : 0);
+      } catch (e) {
+        console.warn('[CerrarDia] getCajaInicialUI error:', e);
+        if (!cancelled) setCajaInicial(0);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [admin, hoy]);
 
   // —— KPIs de clientes
   const totalProgramados = prestamos.length;
@@ -282,13 +300,13 @@ export default function CerrarDiaScreen({ route }: Props) {
 
   const ingresos = kpiCaja.ingresos;
   const retiros = kpiCaja.retiros;
-  const gastos = kpiCaja.gastos; // solo gasto_admin
+  const gastos = kpiCaja.gastos;
 
-  // Caja Inicial mostrada = saldo persistente si existe, si no, última apertura del día
-  const cajaInicial = (cajaInicialPersistente ?? aperturaDelDia) || 0;
+  // —— Caja inicial DERIVADA: apertura si existe, si no el cierre de ayer
+  const baseInicial = aperturaDelDia > 0 ? aperturaDelDia : cajaInicial;
 
-  // —— Caja final del día
-  const cajaFinalRaw = cajaInicial + ingresos + cobrado - retiros - prestamosDelDia - gastos;
+  // —— Caja final del día (viva)
+  const cajaFinalRaw = baseInicial + ingresos + cobrado - retiros - prestamosDelDia - gastos;
   const cajaFinal = useMemo(() => Math.round(cajaFinalRaw * 100) / 100, [cajaFinalRaw]);
 
   // ====== SANEADOR: Cierra días pendientes y luego asegura apertura de HOY ======
@@ -298,10 +316,7 @@ export default function CerrarDiaScreen({ route }: Props) {
     autoCloseGuard.current = true;
 
     (async () => {
-      // 1) Cerrar en cadena días faltantes (si no abriste la app por 1–N días)
-      await closeMissingDays(admin, hoy, tz); // ← calcula KPIs y registra 'cierre' por cada día faltante
-
-      // 2) Ahora sí, asegurar APERTURA de HOY (basada en el CIERRE inmediato anterior)
+      await closeMissingDays(admin, hoy, tz);
       await ensureAperturaDeHoy(admin, hoy, tz);
     })().catch((e) => {
       console.warn('[CerrarDia] auto-saneador error:', e?.message || e);
@@ -327,7 +342,8 @@ export default function CerrarDiaScreen({ route }: Props) {
         <View style={{ flex: 1 }}>
           {/* KPI Grid */}
           <View style={styles.grid}>
-            <KpiCard label="Caja inicial" value={cajaInicial} money palette={palette} />
+            {/* 👇 ahora muestra la caja inicial DERIVADA */}
+            <KpiCard label="Caja inicial" value={baseInicial} money palette={palette} />
             <KpiCard label="Cobrado" value={cobrado} money palette={palette} />
             <KpiCard label="Ingresos" value={ingresos} money palette={palette} />
             <KpiCard label="Retiros" value={retiros} money palette={palette} />
@@ -348,6 +364,9 @@ export default function CerrarDiaScreen({ route }: Props) {
           {/* Resultado */}
           <Card title="Resultado" palette={palette}>
             <Row label="Caja final" value={money(cajaFinal)} palette={palette} />
+            {aperturaDelDia > 0 && (
+              <Row label="(Apertura del día)" value={money(aperturaDelDia)} palette={palette} />
+            )}
           </Card>
         </View>
       )}

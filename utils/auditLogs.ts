@@ -14,6 +14,7 @@ type AuditAction =
   | 'caja_apertura' | 'caja_apertura_auto'
   | 'caja_ingreso'  | 'caja_retiro'
   | 'caja_gasto_admin' | 'caja_gasto'
+  |'caja_apertura_manual'
   | 'caja_cierre_manual' | 'caja_cierre_auto'
   | 'caja_estado_update';
 

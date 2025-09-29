@@ -54,6 +54,18 @@ import DetalleHistorialPrestamoScreen from './screens/DetalleHistorialPrestamoSc
 import NetInfo from '@react-native-community/netinfo';
 import { processOutboxBatch } from './utils/outbox';
 
+// 👉 WATCHER de caja (auto cierre/apertura y live update)
+import { onSnapshot, query, where, collection } from 'firebase/firestore';
+import { db } from './firebase/firebaseConfig';
+import { getSessionUser } from './utils/session';
+import { pickTZ, todayInTZ } from './utils/timezone';
+import {
+  updateCajaEstadoLive,
+  autoCloseDay,
+  ensureAperturaDeHoy,
+  closeMissingDays,
+} from './utils/cajaEstado';
+
 // Tipado de navegación
 export type RootStackParamList = {
   // 🕹️ nueva ruta inicial (señuelo)
@@ -270,6 +282,100 @@ export default function App() {
     return () => {
       unsubNet();
       subAppState.remove();
+    };
+  }, []);
+
+  // 👉 WATCHER automático de CAJA (sin archivos nuevos)
+  useEffect(() => {
+    let unsubDaySnap: (() => void) | null = null;
+    let unsubAppState: (() => void) | null = null;
+    let unsubNet: (() => void) | null = null;
+    let mounted = true;
+
+    const tz = pickTZ(undefined, 'America/Sao_Paulo');
+    let currentYmd: string | null = null;
+    let adminCache: string | null = null;
+
+    async function tick() {
+      if (!mounted || !adminCache) return;
+      const ymdNow = todayInTZ(tz);
+
+      // Cambió el día → cerrar AYER + asegurar apertura HOY y re-suscribir
+      if (currentYmd && ymdNow !== currentYmd) {
+        const ayer = currentYmd;
+        await autoCloseDay(adminCache, ayer, tz);
+        await ensureAperturaDeHoy(adminCache, ymdNow, tz);
+        currentYmd = ymdNow;
+
+        // re-suscripción al nuevo día
+        if (unsubDaySnap) try { unsubDaySnap(); } catch {}
+        const qDia = query(
+          collection(db, 'cajaDiaria'),
+          where('admin', '==', adminCache),
+          where('operationalDate', '==', currentYmd),
+        );
+        unsubDaySnap = onSnapshot(qDia, async () => {
+          try {
+            await updateCajaEstadoLive(adminCache!, currentYmd!, tz);
+          } catch (e) {
+            console.warn('[CajaWatcher] live update error:', e);
+          }
+        });
+      } else {
+        // Mismo día → refresco live por foreground/reconexión
+        await updateCajaEstadoLive(adminCache, ymdNow, tz);
+      }
+
+      // Saneo de días faltantes
+      await closeMissingDays(adminCache, ymdNow, tz, 7);
+    }
+
+    async function mountFor(admin: string) {
+      adminCache = admin;
+      currentYmd = todayInTZ(tz);
+
+      // suscripción en vivo al día actual
+      if (unsubDaySnap) try { unsubDaySnap(); } catch {}
+      const qDia = query(
+        collection(db, 'cajaDiaria'),
+        where('admin', '==', admin),
+        where('operationalDate', '==', currentYmd),
+      );
+      unsubDaySnap = onSnapshot(qDia, async () => {
+        try {
+          await updateCajaEstadoLive(admin, currentYmd!, tz);
+        } catch (e) {
+          console.warn('[CajaWatcher] live update error:', e);
+        }
+      });
+
+      // primer tick (aplica cierre/apertura si toca y sanea)
+      await tick();
+    }
+
+    (async () => {
+      const admin = await getSessionUser();
+      if (!mounted || !admin) return;
+      await mountFor(admin);
+
+      // App al foreground → tick
+      const appStateSub = AppState.addEventListener('change', (s) => {
+        if (s === 'active') void tick();
+      });
+      unsubAppState = () => { try { appStateSub.remove(); } catch {} };
+
+      // Reconexión de red → tick
+      const netUn = NetInfo.addEventListener((state) => {
+        if (state.isConnected) void tick();
+      });
+      unsubNet = () => { try { netUn(); } catch {} };
+    })();
+
+    return () => {
+      mounted = false;
+      if (unsubDaySnap) try { unsubDaySnap(); } catch {}
+      if (unsubAppState) try { unsubAppState(); } catch {}
+      if (unsubNet) try { unsubNet(); } catch {}
     };
   }, []);
 
