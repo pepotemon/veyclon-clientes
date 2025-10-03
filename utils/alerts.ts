@@ -1,3 +1,4 @@
+// utils/alerts.ts
 import { calcularDiasAtraso } from './atrasoHelper';
 import { todayInTZ, pickTZ, normYYYYMMDD } from './timezone';
 
@@ -23,53 +24,7 @@ function baseColors(kind: 'vence' | 'atraso' | 'adelantado' | 'aldia'): BadgeCol
   }
 }
 
-/** ===== Helpers internos ===== */
-function huboAbonoHoy(prestamo: any, hoy: string) {
-  return (
-    Array.isArray(prestamo?.abonos) &&
-    prestamo.abonos.some(
-      (a: any) => (a?.operationalDate ?? normYYYYMMDD(a?.fecha)) === hoy
-    )
-  );
-}
-
-function calcAtraso(prestamo: any, modo: 'porCuota' | 'porPresencia') {
-  const tz = pickTZ(prestamo?.tz);
-  const hoy = todayInTZ(tz);
-
-  const cuotas =
-    Number(prestamo?.cuotas || 0) ||
-    Math.ceil(
-      Number(prestamo?.totalPrestamo ?? prestamo?.montoTotal ?? 0) /
-        (Number(prestamo?.valorCuota || 1))
-    );
-
-  const res = calcularDiasAtraso({
-    fechaInicio: prestamo?.fechaInicio || hoy,
-    hoy,
-    cuotas,
-    valorCuota: Number(prestamo?.valorCuota || 0),
-    abonos: Array.isArray(prestamo?.abonos)
-      ? prestamo.abonos.map((a: any) => ({
-          monto: Number(a.monto) || 0,
-          operationalDate: a.operationalDate,
-          fecha: a.fecha,
-        }))
-      : [],
-    diasHabiles:
-      Array.isArray(prestamo?.diasHabiles) && prestamo.diasHabiles.length
-        ? prestamo.diasHabiles
-        : [1, 2, 3, 4, 5, 6],
-    feriados: Array.isArray(prestamo?.feriados) ? prestamo.feriados : [],
-    pausas: Array.isArray(prestamo?.pausas) ? prestamo.pausas : [],
-    modo,
-    permitirAdelantar: !!prestamo?.permitirAdelantar,
-  });
-
-  return { atraso: res.atraso as number, hoy, pagoHoy: huboAbonoHoy(prestamo, hoy) };
-}
-
-/** ====== Helpers nuevos para ADELANTADO (cuotas) ====== */
+/** ===== Helpers de fecha ===== */
 function toYMDInTZ(d: Date, tz: string) {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: tz,
@@ -102,6 +57,8 @@ function ymdAdd(ymd: string, days: number) {
 function isBetween(ymd: string, desde: string, hasta: string) {
   return ymd >= (desde || '') && ymd <= (hasta || '');
 }
+
+/** ====== Helpers de conteo de días hábiles ====== */
 function countExpectedWorkdays(
   startYmd: string,
   hoyYmd: string,
@@ -130,6 +87,67 @@ function countExpectedWorkdays(
   return count;
 }
 
+/** ===== Helpers internos ===== */
+function huboAbonoHoy(prestamo: any, hoy: string) {
+  // 1) Legacy: arreglo embebido en el documento
+  const viaArray =
+    Array.isArray(prestamo?.abonos) &&
+    prestamo.abonos.some((a: any) => (a?.operationalDate ?? normYYYYMMDD(a?.fecha)) === hoy);
+
+  if (viaArray) return true;
+
+  // 2) Nuevo: marca en el doc (cuando el abono viene por subcolección/outbox)
+  const tz = pickTZ(prestamo?.tz);
+  const last = anyToYMD(prestamo?.lastAbonoAt, tz);
+  return last === hoy;
+}
+
+function calcAtraso(prestamo: any, modo: 'porCuota' | 'porPresencia') {
+  const tz = pickTZ(prestamo?.tz);
+  const hoy = todayInTZ(tz);
+
+  // Pago de hoy (robusto)
+  const pagoHoy = huboAbonoHoy(prestamo, hoy);
+
+  // Si ya traemos el agregado 'diasAtraso' en el doc, úsalo (reconciliado)
+  if (typeof prestamo?.diasAtraso === 'number' && Number.isFinite(prestamo.diasAtraso)) {
+    return { atraso: Number(prestamo.diasAtraso) || 0, hoy, pagoHoy };
+  }
+
+  // Caso contrario, recalculamos (compat con abonos embebidos)
+  const valorCuotaNum = Number(prestamo?.valorCuota || 0);
+  const totalPlan =
+    Number(prestamo?.cuotas || 0) ||
+    (valorCuotaNum > 0
+      ? Math.ceil(Number(prestamo?.totalPrestamo ?? prestamo?.montoTotal ?? 0) / valorCuotaNum)
+      : 0);
+
+  const res = calcularDiasAtraso({
+    fechaInicio: prestamo?.fechaInicio || hoy,
+    hoy,
+    cuotas: totalPlan,
+    valorCuota: valorCuotaNum,
+    abonos: Array.isArray(prestamo?.abonos)
+      ? prestamo.abonos.map((a: any) => ({
+          monto: Number(a.monto) || 0,
+          operationalDate: a.operationalDate,
+          fecha: a.fecha,
+        }))
+      : [],
+    diasHabiles:
+      Array.isArray(prestamo?.diasHabiles) && prestamo.diasHabiles.length
+        ? prestamo.diasHabiles
+        : [1, 2, 3, 4, 5, 6],
+    feriados: Array.isArray(prestamo?.feriados) ? prestamo.feriados : [],
+    pausas: Array.isArray(prestamo?.pausas) ? prestamo.pausas : [],
+    modo,
+    permitirAdelantar: !!prestamo?.permitirAdelantar,
+  });
+
+  return { atraso: Number(res.atraso || 0), hoy, pagoHoy };
+}
+
+/** ====== Progreso de cuotas (adelantadas, vencidas, al día) ====== */
 function computeQuotaProgress(prestamo: any) {
   const tz = pickTZ(prestamo?.tz, 'America/Sao_Paulo');
   const hoy = todayInTZ(tz);
@@ -138,10 +156,11 @@ function computeQuotaProgress(prestamo: any) {
   const totalPlan =
     Number(prestamo?.cuotas || 0) ||
     (valorCuota > 0
-      ? Math.ceil(Number(prestamo?.totalPrestamo || prestamo?.montoTotal || 0) / valorCuota)
+      ? Math.ceil(Number(prestamo?.totalPrestamo ?? prestamo?.montoTotal ?? 0) / valorCuota)
       : 0);
 
-  const start = anyToYMD(prestamo?.fechaInicio ?? prestamo?.creadoEn ?? prestamo?.createdAtMs, tz) || hoy;
+  const start =
+    anyToYMD(prestamo?.fechaInicio ?? prestamo?.creadoEn ?? prestamo?.createdAtMs, tz) || hoy;
 
   const diasHabiles: number[] =
     Array.isArray(prestamo?.diasHabiles) && prestamo.diasHabiles.length
@@ -150,33 +169,51 @@ function computeQuotaProgress(prestamo: any) {
   const feriados: string[] = Array.isArray(prestamo?.feriados)
     ? prestamo.feriados.map((f: any) => normYYYYMMDD(f)).filter(Boolean)
     : [];
-  const pausas: { desde: string; hasta: string }[] = Array.isArray(prestamo?.pausas) ? prestamo.pausas : [];
+  const pausas: { desde: string; hasta: string }[] = Array.isArray(prestamo?.pausas)
+    ? prestamo.pausas
+    : [];
 
   let esperadas = countExpectedWorkdays(start, hoy, diasHabiles, feriados, pausas);
   if (totalPlan > 0) esperadas = Math.min(esperadas, totalPlan);
 
-  // Suma de abonos hasta hoy
-  let pagado = 0;
-  const abonos: any[] = Array.isArray(prestamo?.abonos) ? prestamo.abonos : [];
-  for (const a of abonos) {
-    const dia = a?.operationalDate ?? normYYYYMMDD(a?.fecha);
-    if (dia && dia <= hoy) pagado += Number(a?.monto || 0);
-  }
+  // ---- Cuotas pagadas (robusto a subcolección) ----
   const EPS = 0.009;
-  const cuotasPagadas = valorCuota > 0 ? Math.floor((pagado + EPS) / valorCuota) : 0;
+  let cuotasPagadas = 0;
+
+  // 1) Agregado directo
+  if (Number.isFinite(prestamo?.cuotasPagadas)) {
+    cuotasPagadas = Math.max(0, Math.floor(Number(prestamo.cuotasPagadas)));
+  } else {
+    // 2) Derivar de restante vs total (si ambos están)
+    const total = Number(prestamo?.totalPrestamo ?? prestamo?.montoTotal ?? 0);
+    const rest = Number(prestamo?.restante);
+    if (valorCuota > 0 && Number.isFinite(total) && Number.isFinite(rest) && total >= rest) {
+      const pagado = total - rest;
+      cuotasPagadas = Math.floor((pagado + EPS) / valorCuota);
+    } else {
+      // 3) Fallback: sumar abonos embebidos hasta hoy
+      let pagado = 0;
+      const abonos: any[] = Array.isArray(prestamo?.abonos) ? prestamo.abonos : [];
+      for (const a of abonos) {
+        const dia = a?.operationalDate ?? normYYYYMMDD(a?.fecha);
+        if (dia && dia <= hoy) pagado += Number(a?.monto || 0);
+      }
+      cuotasPagadas = valorCuota > 0 ? Math.floor((pagado + EPS) / valorCuota) : 0;
+    }
+  }
 
   return {
     hoy,
     valorCuota,
     esperadas,
     pagadas: cuotasPagadas,
-    diff: cuotasPagadas - esperadas,   // >0 adelantado, <0 vencidas
+    diff: cuotasPagadas - esperadas, // >0 adelantado, <0 vencidas
     permitirAdelantar: !!prestamo?.permitirAdelantar,
   };
 }
 
 /** =========================================================
- *  NUEVOS HELPERS: badges listos para UI (estilo “largo”)
+ *  BADGES “largos” (Home / detalles)
  *  ========================================================= */
 
 export function computeQuotaBadge(prestamo: any): Badge {
@@ -218,7 +255,7 @@ export function computePresenceBadge(prestamo: any): Badge {
 }
 
 /** =========================================================
- *  COMPAT compacta (PagosDiarios): +N rojo / +N verde / “Vence hoy” / “Al día”
+ *  COMPAT compacta (PagosDiarios): +N rojo / +N verde / “Al día”
  *  ========================================================= */
 
 export function computeAlertTag(prestamo: any): AlertaTag {
@@ -239,7 +276,7 @@ export function computeAlertInfo(prestamo: any) {
   const { atraso } = calcAtraso(prestamo, modo);
   const tag = computeAlertTag(prestamo);
 
-  // 👉 Para “adelantado”, usamos el número de cuotas adelantadas como negativo,
+  // Para “adelantado”, usamos el número de cuotas adelantadas como negativo,
   // así labelFor muestra “+N” y pillColors ya pinta verde.
   let countForLabel = atraso;
   if (tag === 'adelantado') {
@@ -251,10 +288,11 @@ export function computeAlertInfo(prestamo: any) {
   const colors = pillColors(tag, countForLabel);
   return { atraso, tag, label, colors };
 }
+
 export function labelFor(tag: AlertaTag, atrasoReal?: number) {
   switch (tag) {
     case 'vence_hoy':
-      // 👈 antes decía "Vence hoy"
+      // Compacto: tratamos “vence hoy” como “al día”
       return 'Al día';
     case 'atraso_1':
       return '+1';
@@ -274,7 +312,6 @@ export function labelFor(tag: AlertaTag, atrasoReal?: number) {
 export function pillColors(tag: AlertaTag, _atrasoReal?: number) {
   switch (tag) {
     case 'vence_hoy':
-      // 👈 usa la paleta "al día" (azul)
       return { bg: '#E3F2FD', text: '#1565C0', border: '#BBDEFB' };
     case 'atraso_1':
       return { bg: '#FFEBEE', text: '#C62828', border: '#FFCDD2' };

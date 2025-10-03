@@ -1,6 +1,13 @@
+// utils/ruta.ts
 import { db } from '../firebase/firebaseConfig';
 import {
-  collection, getDocs, query, where, writeBatch, doc,
+  collection,
+  collectionGroup,
+  getDocs,
+  query,
+  where,
+  writeBatch,
+  doc,
 } from 'firebase/firestore';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -76,35 +83,72 @@ export function applyRutaOrder<T extends { id: string; nombre?: string }>(
    ============================================================================ */
 
 /**
- * Asegura que todos los clientes del admin tengan routeOrder secuencial.
- * Si ya lo tienen, no cambia nada (solo rellena faltantes al final).
+ * Asegura que los clientes del ADMIN que tienen préstamos ACTIVOS (restante > 0)
+ * tengan un `routeOrder` secuencial.
+ * - No toca clientes sin préstamo activo del admin.
+ * - Respeta `routeOrder` existente y completa sólo los faltantes,
+ *   iniciando desde (max routeOrder existente + 1).
+ * - Ordena faltantes alfabéticamente por nombre para asignarles un orden estable.
  */
 export async function ensureRouteOrder(admin: string) {
-  const ref = collection(db, 'clientes');
-  const qy = query(ref, where('admin', '==', admin));
-  const snap = await getDocs(qy);
+  if (!admin) return;
 
-  const conOrden: { id: string; nombre: string; routeOrder: number }[] = [];
-  const sinOrden: { id: string; nombre: string }[] = [];
+  // 1) IDs de clientes con PRÉSTAMOS ACTIVOS del admin (restante > 0)
+  const qPrest = query(
+    collectionGroup(db, 'prestamos'),
+    where('creadoPor', '==', admin),
+    where('restante', '>', 0)
+  );
+  const sPrest = await getDocs(qPrest);
 
-  snap.forEach(d => {
-    const data = d.data() as any;
-    const nombre = String(data?.nombre || 'Cliente');
-    const ro = Number(data?.routeOrder);
-    if (Number.isFinite(ro)) conOrden.push({ id: d.id, nombre, routeOrder: ro });
-    else sinOrden.push({ id: d.id, nombre });
+  const clienteIdsSet = new Set<string>();
+  sPrest.forEach((d) => {
+    const p: any = d.data();
+    const cid = p?.clienteId;
+    if (cid) clienteIdsSet.add(String(cid));
   });
+
+  const clienteIds = Array.from(clienteIdsSet);
+  if (clienteIds.length === 0) return;
+
+  // 2) Traer esos clientes en lotes (where '__name__' in [...]) → máx 10 por query
+  type ClienteMini = { id: string; nombre: string; routeOrder: number | null };
+  const clientes: ClienteMini[] = [];
+
+  for (let i = 0; i < clienteIds.length; i += 10) {
+    const batchIds = clienteIds.slice(i, i + 10);
+    const qCli = query(
+      collection(db, 'clientes'),
+      where('__name__', 'in', batchIds as any) // Firestore admite hasta 10
+    );
+    const sCli = await getDocs(qCli);
+    sCli.forEach((docSnap) => {
+      const data = docSnap.data() as any;
+      const ro = Number(data?.routeOrder);
+      clientes.push({
+        id: docSnap.id,
+        nombre: String(data?.nombre || 'Cliente'),
+        routeOrder: Number.isFinite(ro) ? ro : null,
+      });
+    });
+  }
+
+  const conOrden = clientes.filter((c) => c.routeOrder !== null) as Array<
+    ClienteMini & { routeOrder: number }
+  >;
+  const sinOrden = clientes.filter((c) => c.routeOrder === null);
 
   if (sinOrden.length === 0) return;
 
-  const start = conOrden.length > 0 ? Math.max(...conOrden.map(x => x.routeOrder)) + 1 : 0;
+  const start = conOrden.length > 0 ? Math.max(...conOrden.map((x) => x.routeOrder)) + 1 : 0;
+
+  // 3) Asignar orden a faltantes por nombre (estable)
+  sinOrden.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
 
   const batch = writeBatch(db);
-  sinOrden
-    .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'))
-    .forEach((c, i) => {
-      batch.update(doc(db, 'clientes', c.id), { routeOrder: start + i });
-    });
+  sinOrden.forEach((c, i) => {
+    batch.update(doc(db, 'clientes', c.id), { routeOrder: start + i });
+  });
 
   await batch.commit();
 }
@@ -114,6 +158,7 @@ export async function ensureRouteOrder(admin: string) {
  * Asigna routeOrder = índice. (Versión Firestore)
  */
 export async function persistRouteOrder(orderedIds: string[]) {
+  if (!orderedIds?.length) return;
   const batch = writeBatch(db);
   orderedIds.forEach((id, idx) => {
     batch.update(doc(db, 'clientes', id), { routeOrder: idx });

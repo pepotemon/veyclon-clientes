@@ -1,4 +1,4 @@
-// screens/CerrarDiaScreen.tsx (versión ajustada)
+// screens/CerrarDiaScreen.tsx
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { SafeAreaView, View, Text, StyleSheet, ActivityIndicator, Alert } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -17,37 +17,22 @@ import {
   where,
   limit,
 } from 'firebase/firestore';
-import { pickTZ, todayInTZ, normYYYYMMDD } from '../utils/timezone';
+import { pickTZ, todayInTZ } from '../utils/timezone';
 import { ensureAperturaDeHoy, closeMissingDays } from '../utils/cajaEstado';
 import { canonicalTipo } from '../utils/movimientoHelper';
 
-type Props = NativeStackScreenProps<RootStackParamList, 'CerrarDia'>;
+// 👇 NUEVO: helpers de fallback (sin índices)
+import { onSnapshotWithFallback, getDocsWithFallback } from '../utils/firestoreFallback';
 
-type Prestamo = {
-  id: string;
-  creadoPor: string;
-  clienteId?: string;
-  concepto?: string;
-  valorCuota?: number;
-  valorNeto?: number; // capital (sin interés)
-  capital?: number;
-  montoTotal?: number; // NO usar para “Préstamos”
-  totalPrestamo?: number; // NO usar para “Préstamos”
-  restante?: number;
-  tz?: string;
-  fechaInicio?: any;
-  createdAt?: any;
-  createdAtMs?: number;
-  estado?: string;
-  abonos?: { monto: number; fecha?: any; operationalDate?: string; tz?: string }[];
-};
+type Props = NativeStackScreenProps<RootStackParamList, 'CerrarDia'>;
 
 const DISPLAY_LOCALE = 'es-AR';
 const TZ_DEFAULT = 'America/Sao_Paulo';
-const money = (n: number) => {
-  const v = Math.abs(n) < 0.005 ? 0 : n;
-  return `R$ ${Number(v || 0).toLocaleString(DISPLAY_LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-};
+const money = (n: number) =>
+  `R$ ${Number(Math.abs(n) < 0.005 ? 0 : n).toLocaleString(DISPLAY_LOCALE, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
 
 export default function CerrarDiaScreen({ route }: Props) {
   const { admin } = route.params;
@@ -56,52 +41,44 @@ export default function CerrarDiaScreen({ route }: Props) {
   const tz = pickTZ(undefined, TZ_DEFAULT);
   const hoy = todayInTZ(tz);
 
-  const [loading, setLoading] = useState(true);
-  const [prestamos, setPrestamos] = useState<Prestamo[]>([]);
-  const [kpiCaja, setKpiCaja] = useState({ cobrado: 0, gastos: 0, ingresos: 0, retiros: 0 });
+  // ===== Estado =====
+  const [loadingCaja, setLoadingCaja] = useState(true);
+  const [loadingProg, setLoadingProg] = useState(true);
+
+  // KPIs 100% desde cajaDiaria
+  const [kpiCaja, setKpiCaja] = useState({
+    apertura: 0,
+    cobrado: 0,
+    ingresos: 0,
+    retiros: 0,
+    gastos: 0,
+    prestamos: 0,
+    abonosCount: 0, // 👈 visitadosHoy = cantidad de abonos del día
+  });
+
+  // Conteo “programados” (listener filtrado, ligero)
+  const [programadosCount, setProgramadosCount] = useState(0);
 
   // Caja inicial BASE (cierre de ayer). No se actualiza durante el día.
   const [cajaInicial, setCajaInicial] = useState<number>(0);
 
-  // Solo para trazabilidad visual (no base): apertura del día
-  const [aperturaDelDia, setAperturaDelDia] = useState<number>(0);
-
-  // ====== HELPERS ======
-  function formatDateToYMD(date: Date, tzLocal: string) {
-    const parts = new Intl.DateTimeFormat('es-ES', {
-      timeZone: tzLocal, year: 'numeric', month: '2-digit', day: '2-digit',
-    }).formatToParts(date);
-    const y = parts.find(p => p.type === 'year')?.value ?? '0000';
-    const m = parts.find(p => p.type === 'month')?.value ?? '01';
-    const d = parts.find(p => p.type === 'day')?.value ?? '01';
-    return `${y}-${m}-${d}`;
-  }
-  function anyDateToYYYYMMDD(d: any, tzLocal: string): string | null {
-    try {
-      if (!d) return null;
-      if (typeof d === 'string') return normYYYYMMDD(d) || null;
-      if (typeof d === 'number') return formatDateToYMD(new Date(d), tzLocal);
-      if (typeof d?.toDate === 'function') return formatDateToYMD(d.toDate(), tzLocal);
-      if (typeof d?.seconds === 'number') return formatDateToYMD(new Date(d.seconds * 1000), tzLocal);
-      if (d instanceof Date) return formatDateToYMD(d, tzLocal);
-      return null;
-    } catch { return null; }
-  }
-
+  // ===== Helpers =====
   async function getCajaInicialUI(adminId: string, hoyYmd: string): Promise<number> {
     // AYER a partir de 'hoy'
     const [Y, M, D] = hoyYmd.split('-').map((n) => parseInt(n, 10));
     const dt = new Date(Date.UTC(Y, M - 1, D));
     dt.setUTCDate(dt.getUTCDate() - 1);
-    const ayer = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+    const ayer = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(
+      dt.getUTCDate(),
+    ).padStart(2, '0')}`;
 
     // 1) Preferimos cierre idempotente
     const cierreId = `cierre_${adminId}_${ayer}`;
     const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
     if (cierreSnap.exists()) return Number(cierreSnap.data()?.balance || 0);
 
-    // 2) Último cierre "no idempotente" (compat)
-    const qC = query(
+    // 2) Último cierre “no idempotente” (compat) — con fallback sin orderBy
+    const qCMain = query(
       collection(db, 'cajaDiaria'),
       where('admin', '==', adminId),
       where('operationalDate', '==', ayer),
@@ -109,85 +86,113 @@ export default function CerrarDiaScreen({ route }: Props) {
       orderBy('createdAt', 'desc'),
       limit(1)
     );
-    const sC = await getDocs(qC);
-    if (!sC.empty) return Number(sC.docs[0].data()?.balance || 0);
 
-    // 3) Si no hay nada: 0 (o podrías usar saldoActual si >0)
+    // Fallback sin orderBy; luego elegimos el más reciente client-side
+    const qCFallback = query(
+      collection(db, 'cajaDiaria'),
+      where('admin', '==', adminId),
+      where('operationalDate', '==', ayer),
+      where('tipo', '==', 'cierre')
+    );
+
+    const sC = await getDocsWithFallback(qCMain, qCFallback);
+    if (!sC.empty) {
+      // Si vino sin orderBy, tomamos el más “reciente” manualmente
+      const best = sC.docs.reduce((acc, d) => {
+        const data: any = d.data();
+        const ms =
+          (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
+          (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
+          0;
+        if (!acc) return { d, ms };
+        return ms > acc.ms ? { d, ms } : acc;
+      }, null as null | { d: typeof sC.docs[number]; ms: number });
+      const base = Number((best?.d?.data() as any)?.balance || 0);
+      return Number.isFinite(base) ? base : 0;
+    }
+
+    // 3) Nada → 0
     return 0;
   }
 
-  // —— préstamos del cobrador
+  // —— Listener LIGERO de “programados” (préstamos activos del admin) con fallback
   useEffect(() => {
-    let unsub: undefined | (() => void);
-    try {
-      const qP = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin));
-      unsub = onSnapshot(
-        qP,
-        (sg) => {
-          const list: Prestamo[] = [];
-          sg.forEach((d) => {
-            const data = d.data() as any;
-            const capital =
-              Number(data?.valorNeto) ||
-              Number(data?.capital) ||
-              Number(data?.monto) ||
-              Number(data?.montoPrestado) ||
-              Number(data?.valorPrestamo) ||
-              Number(data?.montoCapital) ||
-              Number(data?.valorSinInteres) ||
-              0;
+    setLoadingProg(true);
 
-            list.push({
-              id: d.id,
-              creadoPor: data.creadoPor,
-              clienteId: data.clienteId,
-              concepto: data.concepto,
-              valorCuota: Number(data.valorCuota || 0),
-              valorNeto: Number(data?.valorNeto ?? 0),
-              capital: Number.isFinite(capital) ? capital : 0,
-              montoTotal: Number(data?.montoTotal ?? 0),
-              totalPrestamo: Number(data?.totalPrestamo ?? 0),
-              restante: Number(data.restante || 0),
-              tz: typeof data.tz === 'string' ? data.tz : undefined,
-              fechaInicio: data.fechaInicio,
-              createdAt: data.createdAt,
-              createdAtMs: typeof data.createdAtMs === 'number' ? data.createdAtMs : undefined,
-              estado: typeof data.estado === 'string' ? data.estado : 'activo',
-              abonos: Array.isArray(data.abonos) ? data.abonos : [],
-            });
+    try {
+      const qPMain = query(
+        collectionGroup(db, 'prestamos'),
+        where('creadoPor', '==', admin),
+        where('status', '==', 'activo'),
+        where('restante', '>', 0)
+      );
+
+      // Fallback sin inequality/extra filtros (evita índice); filtramos client-side
+      const qPFallback = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin));
+
+      const unsub = onSnapshotWithFallback(
+        qPMain,
+        qPFallback,
+        (sg) => {
+          // Filtrar SIEMPRE client-side para consistencia entre main y fallback
+          let n = 0;
+          sg.forEach((docSnap) => {
+            const data: any = docSnap.data();
+            const st = (data?.status ?? 'activo') as string;
+            if (st !== 'activo') return;
+            if (!(Number(data?.restante) > 0)) return;
+            n++;
           });
-          setPrestamos(list);
-          setLoading(false);
+          setProgramadosCount(n);
+          setLoadingProg(false);
         },
         (err) => {
-          console.warn('[CerrarDia] prestamos snapshot:', err?.code || err?.message || err);
-          Alert.alert('Error', 'No se pudieron leer los préstamos.');
-          setPrestamos([]);
-          setLoading(false);
+          console.warn('[CerrarDia] prestamos (conteo) snapshot:', err?.code || err?.message || err);
+          setProgramadosCount(0);
+          setLoadingProg(false);
         }
       );
+
+      return () => {
+        try { unsub(); } catch {}
+      };
     } catch (e) {
-      console.warn('[CerrarDia] suscripción no disponible:', e);
-      setLoading(false);
+      console.warn('[CerrarDia] suscripción prestamos (conteo) no disponible:', e);
+      setProgramadosCount(0);
+      setLoadingProg(false);
     }
-    return () => { try { unsub && unsub(); } catch {} };
   }, [admin]);
 
-  // —— caja del día (KPI + última apertura del día)
+  // —— caja del día (TODOS los KPIs salen de aquí) con fallback
   useEffect(() => {
-    let unsub: undefined | (() => void);
+    setLoadingCaja(true);
     try {
-      const qCaja = query(
+      const qCajaMain = query(
+        collection(db, 'cajaDiaria'),
+        where('admin', '==', admin),
+        where('operationalDate', '==', hoy),
+        orderBy('createdAt', 'asc')
+      );
+
+      // Fallback sin orderBy (ordenaremos client-side por createdAtMs/createdAt)
+      const qCajaFallback = query(
         collection(db, 'cajaDiaria'),
         where('admin', '==', admin),
         where('operationalDate', '==', hoy)
       );
-      unsub = onSnapshot(
-        qCaja,
+
+      const unsub = onSnapshotWithFallback(
+        qCajaMain,
+        qCajaFallback,
         (snap) => {
-          let lastAperturaMonto = 0;
-          let lastAperturaTs = -1;
-          let cobrado = 0, ingresos = 0, retiros = 0, gastosAdmin = 0;
+          let apertura = 0;
+          let aperturaTs = -1;
+          let cobrado = 0;
+          let ingresos = 0;
+          let retiros = 0;
+          let gastos = 0;
+          let prestamos = 0;
+          let abonosCount = 0;
 
           snap.forEach((d) => {
             const data = d.data() as any;
@@ -202,34 +207,48 @@ export default function CerrarDiaScreen({ route }: Props) {
 
             switch (tip) {
               case 'apertura':
-                if (ts >= lastAperturaTs) { lastAperturaTs = ts; lastAperturaMonto = monto; }
+                if (ts >= aperturaTs) {
+                  aperturaTs = ts;
+                  apertura = monto;
+                }
                 break;
               case 'abono':
-                cobrado += monto; break;
+                cobrado += monto;
+                abonosCount += 1;
+                break;
               case 'ingreso':
-                ingresos += monto; break;
+                ingresos += monto;
+                break;
               case 'retiro':
-                retiros += monto; break;
+                retiros += monto;
+                break;
               case 'gasto_admin':
-                gastosAdmin += monto; break;
+                gastos += monto;
+                break;
+              case 'prestamo':
+                prestamos += monto; // capital entregado hoy
+                break;
               default:
                 break;
             }
           });
 
-          setAperturaDelDia(lastAperturaMonto);
-          setKpiCaja({ cobrado, gastos: gastosAdmin, ingresos, retiros });
+          setKpiCaja({ apertura, cobrado, ingresos, retiros, gastos, prestamos, abonosCount });
+          setLoadingCaja(false);
         },
         (err) => {
           console.warn('[CerrarDia] cajaDiaria snapshot:', err?.code || err?.message || err);
-          setAperturaDelDia(0);
-          setKpiCaja({ cobrado: 0, gastos: 0, ingresos: 0, retiros: 0 });
+          setKpiCaja({ apertura: 0, cobrado: 0, ingresos: 0, retiros: 0, gastos: 0, prestamos: 0, abonosCount: 0 });
+          setLoadingCaja(false);
+          Alert.alert('Atención', 'Si ves un enlace de índice en la consola, créalo para continuar.');
         }
       );
+
+      return () => { try { unsub(); } catch {} };
     } catch (e) {
       console.warn('[CerrarDia] suscripción cajaDiaria no disponible:', e);
+      setLoadingCaja(false);
     }
-    return () => { try { unsub && unsub(); } catch {} };
   }, [admin, hoy]);
 
   // —— Cargar la CAJA INICIAL (cierre de AYER) una vez por día
@@ -244,72 +263,12 @@ export default function CerrarDiaScreen({ route }: Props) {
         if (!cancelled) setCajaInicial(0);
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [admin, hoy]);
 
-  // —— KPIs de clientes
-  const totalProgramados = prestamos.length;
-  const visitadosHoy = useMemo(() => {
-    let count = 0;
-    for (const p of prestamos) {
-      const tzP = pickTZ(p.tz, tz);
-      const hoyP = todayInTZ(tzP);
-      const abonos = Array.isArray(p.abonos) ? p.abonos : [];
-      const pagoHoy = abonos.some((a) => {
-        const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
-        return dia === hoyP;
-      });
-      if (pagoHoy) count++;
-    }
-    return count;
-  }, [prestamos, tz]);
-  const pendientes = Math.max(0, totalProgramados - visitadosHoy);
-
-  // —— Fallback “Cobrado”
-  const cobradoFallback = useMemo(() => {
-    let total = 0;
-    for (const p of prestamos) {
-      const tzP = pickTZ(p.tz, tz);
-      const hoyP = todayInTZ(tzP);
-      for (const a of p.abonos || []) {
-        const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
-        if (dia === hoyP) total += Number(a.monto || 0);
-      }
-    }
-    return total;
-  }, [prestamos, tz]);
-  const cobrado = kpiCaja.cobrado > 0 ? kpiCaja.cobrado : cobradoFallback;
-
-  // —— “Préstamos” del día = suma SOLO de valorNeto/capital creado HOY
-  const prestamosDelDia = useMemo(() => {
-    let total = 0;
-    for (const p of prestamos) {
-      if (p.estado && p.estado !== 'activo') continue;
-      const tzP = pickTZ(p.tz, tz);
-      const startYmd = anyDateToYYYYMMDD(
-        (typeof p.createdAtMs === 'number' ? p.createdAtMs : (p.createdAt ?? p.fechaInicio)),
-        tzP
-      );
-      if (!startYmd) continue;
-      if (startYmd !== todayInTZ(tzP)) continue;
-      const capital = Number(p.valorNeto ?? p.capital ?? 0);
-      if (Number.isFinite(capital) && capital > 0) total += capital;
-    }
-    return total;
-  }, [prestamos, tz]);
-
-  const ingresos = kpiCaja.ingresos;
-  const retiros = kpiCaja.retiros;
-  const gastos = kpiCaja.gastos;
-
-  // —— Caja inicial DERIVADA: apertura si existe, si no el cierre de ayer
-  const baseInicial = aperturaDelDia > 0 ? aperturaDelDia : cajaInicial;
-
-  // —— Caja final del día (viva)
-  const cajaFinalRaw = baseInicial + ingresos + cobrado - retiros - prestamosDelDia - gastos;
-  const cajaFinal = useMemo(() => Math.round(cajaFinalRaw * 100) / 100, [cajaFinalRaw]);
-
-  // ====== SANEADOR: Cierra días pendientes y luego asegura apertura de HOY ======
+  // ====== SANEADOR: Cierra días pendientes y asegura apertura de HOY ======
   const autoCloseGuard = useRef(false);
   useEffect(() => {
     if (autoCloseGuard.current) return;
@@ -322,6 +281,23 @@ export default function CerrarDiaScreen({ route }: Props) {
       console.warn('[CerrarDia] auto-saneador error:', e?.message || e);
     });
   }, [admin, hoy, tz]);
+
+  // ===== KPIs derivados =====
+  const baseInicial = kpiCaja.apertura > 0 ? kpiCaja.apertura : cajaInicial;
+  const cajaFinalRaw =
+    baseInicial +
+    kpiCaja.ingresos +
+    kpiCaja.cobrado -
+    kpiCaja.retiros -
+    kpiCaja.prestamos -
+    kpiCaja.gastos;
+  const cajaFinal = useMemo(() => Math.round(cajaFinalRaw * 100) / 100, [cajaFinalRaw]);
+
+  const programados = programadosCount;
+  const visitadosHoy = kpiCaja.abonosCount; // ✅ ahora sale de cajaDiaria
+  const pendientes = Math.max(0, programados - visitadosHoy);
+
+  const loading = loadingCaja || loadingProg;
 
   // ====== UI ======
   return (
@@ -340,15 +316,14 @@ export default function CerrarDiaScreen({ route }: Props) {
         </View>
       ) : (
         <View style={{ flex: 1 }}>
-          {/* KPI Grid */}
+          {/* KPI Grid (todo desde cajaDiaria + cierre de ayer) */}
           <View style={styles.grid}>
-            {/* 👇 ahora muestra la caja inicial DERIVADA */}
             <KpiCard label="Caja inicial" value={baseInicial} money palette={palette} />
-            <KpiCard label="Cobrado" value={cobrado} money palette={palette} />
-            <KpiCard label="Ingresos" value={ingresos} money palette={palette} />
-            <KpiCard label="Retiros" value={retiros} money palette={palette} />
-            <KpiCard label="Préstamos (día)" value={prestamosDelDia} money palette={palette} />
-            <KpiCard label="Gastos admin" value={gastos} money palette={palette} />
+            <KpiCard label="Cobrado" value={kpiCaja.cobrado} money palette={palette} />
+            <KpiCard label="Ingresos" value={kpiCaja.ingresos} money palette={palette} />
+            <KpiCard label="Retiros" value={kpiCaja.retiros} money palette={palette} />
+            <KpiCard label="Préstamos (día)" value={kpiCaja.prestamos} money palette={palette} />
+            <KpiCard label="Gastos admin" value={kpiCaja.gastos} money palette={palette} />
           </View>
 
           {/* Separador */}
@@ -356,17 +331,15 @@ export default function CerrarDiaScreen({ route }: Props) {
 
           {/* Clientes */}
           <Card title="Clientes" palette={palette}>
-            <Row label="Programados" value={prestamos.length} palette={palette} />
+            <Row label="Programados" value={programados} palette={palette} />
             <Row label="Visitados" value={visitadosHoy} palette={palette} />
-            <Row label="Pendientes" value={Math.max(0, prestamos.length - visitadosHoy)} palette={palette} />
+            <Row label="Pendientes" value={pendientes} palette={palette} />
           </Card>
 
           {/* Resultado */}
           <Card title="Resultado" palette={palette}>
             <Row label="Caja final" value={money(cajaFinal)} palette={palette} />
-            {aperturaDelDia > 0 && (
-              <Row label="(Apertura del día)" value={money(aperturaDelDia)} palette={palette} />
-            )}
+            {kpiCaja.apertura > 0 && <Row label="(Apertura del día)" value={money(kpiCaja.apertura)} palette={palette} />}
           </Card>
         </View>
       )}
@@ -392,7 +365,9 @@ function Row({ label, value, palette }: { label: string; value: number | string;
   );
 }
 function KpiCard({ label, value, money: isMoney, palette }: { label: string; value: number; money?: boolean; palette: any }) {
-  const display = isMoney ? `R$ ${Number(value || 0).toLocaleString(DISPLAY_LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : String(value);
+  const display = isMoney
+    ? `R$ ${Number(value || 0).toLocaleString(DISPLAY_LOCALE, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : String(value);
   return (
     <View style={[styles.kpi, { backgroundColor: palette.cardBg, borderColor: palette.cardBorder }]}>
       <Text style={[styles.kpiLbl, { color: palette.softText }]}>{label}</Text>

@@ -1,4 +1,10 @@
-// utils/outbox.ts
+/* Outbox (refactor P1)
+   - Contador de pendientes 100% **event-driven** (sin polling).
+   - Emisión **acelerada** (throttle 150ms) para evitar cascadas de renders.
+   - Mirror en memoria para lecturas rápidas (sin JSON.stringify ni re-parses).
+   - API compatible: subscribeCount(cb) sigue existiendo y devuelve unsubscribe().
+*/
+
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DeviceEventEmitter } from 'react-native';
 
@@ -11,7 +17,7 @@ import {
   serverTimestamp,
   getDoc,
   getDocs,
-  arrayUnion,               // 👈 espejo en array "abonos"
+  arrayUnion, // (legacy) empuja al array "abonos" — se quitará en el paso 4
 } from 'firebase/firestore';
 import { logAudit, pick } from './auditLogs';
 import { pickTZ, todayInTZ } from './timezone';
@@ -56,8 +62,8 @@ export type VentaPayload = {
   valorCuota: number;
   cuotas: number;
   totalPrestamo?: number; // alias opcional
-  montoTotal?: number;   // alias opcional
-  fechaInicio: string;   // YYYY-MM-DD
+  montoTotal?: number; // alias opcional
+  fechaInicio: string; // YYYY-MM-DD
   tz: string;
   operationalDate: string;
 
@@ -79,7 +85,7 @@ export type NoPagoPayload = {
   createdAtMs?: number; // opcional, por compat
 };
 
-/** ✅ NUEVO: Movimiento genérico offline (no asociado a un préstamo específico) */
+/** ✅ Movimiento genérico offline (no asociado a un préstamo específico) */
 export type MovSubkind = 'ingreso' | 'retiro' | 'gasto_admin' | 'gasto_cobrador';
 export type MovPayload = {
   admin: string;
@@ -112,7 +118,7 @@ type OutboxBase = {
 export type OutboxAbono = OutboxBase & { kind: 'abono'; payload: AbonoPayload };
 export type OutboxVenta = OutboxBase & { kind: 'venta'; payload: VentaPayload };
 export type OutboxNoPago = OutboxBase & { kind: 'no_pago'; payload: NoPagoPayload };
-/** ✅ NUEVO: item “mov” */
+/** ✅ item “mov” */
 export type OutboxMov = OutboxBase & { kind: 'mov'; payload: MovPayload };
 // Por si quieres poner otras cosas (logs, etc.)
 export type OutboxOtro = OutboxBase & { kind: 'otro'; payload: any };
@@ -130,43 +136,66 @@ export type OutboxStatusCounts = {
 type Listener = () => void;
 const listeners = new Set<Listener>();
 
+// 🔄 Mirror en memoria (evita JSON.parse repetidos)
+let memoryOutbox: OutboxItem[] | null = null;
+
+// ⏱️ Emisión acelerada para evitar cascadas de renders
+const NOTIFY_THROTTLE_MS = 150;
+let notifyTimer: any = null;
+function notifyOutboxChangedThrottled() {
+  if (notifyTimer) return;
+  notifyTimer = setTimeout(() => {
+    notifyTimer = null;
+    for (const l of listeners) {
+      try {
+        l();
+      } catch {}
+    }
+  }, NOTIFY_THROTTLE_MS);
+}
+
 export function subscribeOutbox(fn: Listener): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);
 }
 
 export function emitOutboxChanged() {
-  for (const l of listeners) {
-    try {
-      l();
-    } catch {}
-  }
+  notifyOutboxChangedThrottled();
 }
 
 /* 🔔 Evento global para que Home/Pagos recarguen al terminar un envío */
 export const OUTBOX_FLUSHED = 'outbox:flushed';
 export function emitOutboxFlushed() {
-  try { DeviceEventEmitter.emit(OUTBOX_FLUSHED); } catch {}
+  try {
+    DeviceEventEmitter.emit(OUTBOX_FLUSHED);
+  } catch {}
 }
 
 /* ============ Storage helpers ============ */
 export async function loadOutbox(): Promise<OutboxItem[]> {
+  if (memoryOutbox) return memoryOutbox;
   try {
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
     const parsed: any[] = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? (parsed as OutboxItem[]) : [];
+    memoryOutbox = Array.isArray(parsed) ? (parsed as OutboxItem[]) : [];
+    return memoryOutbox;
   } catch {
-    return [];
+    memoryOutbox = [];
+    return memoryOutbox;
   }
 }
 
 export async function saveOutbox(list: OutboxItem[]): Promise<void> {
-  await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-  // 🔔 Notifica a la UI (badge/pendientes) en cada cambio
-  emitOutboxChanged();
+  memoryOutbox = list; // 👈 actualiza el mirror
+  try {
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+  } finally {
+    // 🔔 Notifica a la UI (badge/pendientes) en cada cambio (throttled)
+    emitOutboxChanged();
+  }
 }
 
-// (alias opcional) lectura directa
+// (alias) lectura directa (usa mirror si ya está cargado)
 export async function listOutbox(): Promise<OutboxItem[]> {
   return loadOutbox();
 }
@@ -175,7 +204,13 @@ export async function listOutbox(): Promise<OutboxItem[]> {
 export async function getOutboxCounts(): Promise<OutboxStatusCounts> {
   const list = await loadOutbox();
   const pending = list.filter((x) => (x.status ?? 'pending') !== 'done');
-  const byKind: Record<OutboxKind, number> = { abono: 0, venta: 0, no_pago: 0, mov: 0, otro: 0 };
+  const byKind: Record<OutboxKind, number> = {
+    abono: 0,
+    venta: 0,
+    no_pago: 0,
+    mov: 0,
+    otro: 0,
+  };
   for (const it of pending) {
     const k = it.kind as OutboxKind;
     if (byKind[k] != null) byKind[k] += 1;
@@ -284,7 +319,7 @@ export async function addToOutbox(
     await saveOutbox(list);
   }
 
-  // (Opcional) auditar encolado
+  // (Opcional) auditar encolado — no bloqueante
   try {
     await logAudit({
       userId: (full as any)?.payload?.admin ?? 'unknown',
@@ -304,23 +339,32 @@ export function genLocalId(): string {
   return 'loc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-// Sencillo “contador en vivo” por polling (cada 1.5s). Mantén por compat.
-// Devuelve una función para desuscribirte.
+/**
+ * ➡️ NUEVO: Suscripción **event-driven** al conteo de items (sin polling).
+ * Llama inmediatamente al callback con el conteo actual y luego en cada cambio
+ * (con emisión acelerada para evitar cascadas).
+ */
 export function subscribeCount(cb: (n: number) => void): () => void {
   let alive = true;
-  const interval = setInterval(async () => {
+
+  // callback que calcula el conteo desde el mirror en memoria
+  const fire = async () => {
     if (!alive) return;
-    try {
-      const list = await loadOutbox();
-      cb(list.length);
-    } catch {
-      // ignore
-    }
-  }, 1500);
+    const list = await listOutbox(); // usa mirror si ya cargó
+    cb(list.length); // mantenemos semántica original: total en outbox (pendientes+errores+processing)
+  };
+
+  // suscribimos al emisor interno
+  const unsubscribe = subscribeOutbox(() => {
+    fire().catch(() => {});
+  });
+
+  // primer disparo inmediato
+  fire().catch(() => {});
 
   return () => {
     alive = false;
-    clearInterval(interval);
+    unsubscribe();
   };
 }
 
@@ -361,7 +405,6 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
     createdAtMs: Date.now(),
     source: 'outbox',
     fromOutboxId: item.id, // trazabilidad
-    // (si quieres homogeneidad con “online”) createdAtIso: new Date().toISOString(),
   };
 
   // 1) Transacción idempotente
@@ -395,11 +438,11 @@ async function reenviarAbono(item: OutboxAbono): Promise<void> {
     // 2) Crea el subdocumento del abono (idempotente)
     tx.set(abonoDocRef, abonoDoc);
 
-    // 3) 🔁 ESPEJO LEGACY: empuja también al array "abonos" del doc
+    // 3) 🔁 LEGACY: empuja también al array "abonos" del doc (se retirará en Paso 4)
     tx.update(prestamoRef, {
       abonos: arrayUnion({
         monto: Number(monto),
-        operationalDate,         // YYYY-MM-DD
+        operationalDate, // YYYY-MM-DD
         tz,
         registradoPor: admin,
         createdAtMs: Date.now(),
@@ -692,15 +735,39 @@ async function reenviarNoPago(item: OutboxNoPago): Promise<void> {
     docPath: noPagoRef.path,
     after: pick(
       base,
-      ['tipo', 'reason', 'fechaOperacion', 'clienteId', 'prestamoId', 'valorCuota', 'saldo', 'promesaFecha', 'promesaMonto', 'nota', 'fromOutboxId']
+      [
+        'tipo',
+        'reason',
+        'fechaOperacion',
+        'clienteId',
+        'prestamoId',
+        'valorCuota',
+        'saldo',
+        'promesaFecha',
+        'promesaMonto',
+        'nota',
+        'fromOutboxId',
+      ]
     ),
   });
 }
 
-/** ✅ NUEVO: Mov genérico → usar addMovimientoIdempotente con id 'oxmov_<subkind>_<outboxId>' */
+/** ✅ Mov genérico → usar addMovimientoIdempotente con id 'oxmov_<subkind>_<outboxId>' */
 async function reenviarMov(item: OutboxMov): Promise<void> {
   const p = item.payload;
-  const { admin, subkind, monto, operationalDate, tz, nota, categoria, clienteId, prestamoId, clienteNombre, meta } = p;
+  const {
+    admin,
+    subkind,
+    monto,
+    operationalDate,
+    tz,
+    nota,
+    categoria,
+    clienteId,
+    prestamoId,
+    clienteNombre,
+    meta,
+  } = p;
 
   if (!admin || !subkind || !Number.isFinite(monto) || !operationalDate || !tz) {
     throw new Error('Payload de movimiento incompleto');
@@ -755,12 +822,24 @@ async function reenviarMov(item: OutboxMov): Promise<void> {
         clienteNombre,
         fromOutboxId: item.id,
       },
-      ['tipo','admin','monto','operationalDate','tz','nota','categoria','clienteId','prestamoId','clienteNombre','fromOutboxId']
+      [
+        'tipo',
+        'admin',
+        'monto',
+        'operationalDate',
+        'tz',
+        'nota',
+        'categoria',
+        'clienteId',
+        'prestamoId',
+        'clienteNombre',
+        'fromOutboxId',
+      ]
     ),
   });
 }
 
-/* ============ (Opcional) procesamiento (expuesto) ============ */
+/* ============ (expuesto) ============ */
 // Debe lanzar error si falla; true si ok.
 export async function processOutboxItem(item: OutboxItem): Promise<boolean> {
   if (item.kind === 'abono') {
@@ -783,7 +862,7 @@ export async function processOutboxItem(item: OutboxItem): Promise<boolean> {
   return true;
 }
 
-/* ============ NUEVO: Motor de procesamiento con backoff + límites ============ */
+/* ============ Motor de procesamiento con backoff + límites ============ */
 
 // Backoff exponencial: 1s → 2s → 4s → 8s → 16s → 32s → 60s (tope)
 const BACKOFF_BASE_MS = 1_000;

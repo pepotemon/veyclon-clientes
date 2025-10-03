@@ -1,3 +1,4 @@
+// screens/PendientesScreen.tsx
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   SafeAreaView,
@@ -22,47 +23,40 @@ import {
   subscribeCount, // fallback si no hay emitter
 } from '../utils/outbox';
 
-type OutboxStatus = 'pending' | 'processing' | 'done' | 'error';
+// =========================
+// TIPOS **LOCALES** (renombrados a UIOutbox*) para evitar choque con utils/outbox
+// =========================
+type UIOutboxStatus = 'pending' | 'processing' | 'done' | 'error';
 
-/** ==== TIPOS: aceptar legacy y normalizar ==== */
-type KindEs = 'abono' | 'venta' | 'no_pago' | 'otro';
-type KindLegacy = 'payment' | 'other';
-type OutboxKind = KindEs | KindLegacy;
+// admite español + legacy + 'mov' (del motor nuevo)
+type UIKindEs = 'abono' | 'venta' | 'no_pago' | 'otro' | 'mov';
+type UILegacy = 'payment' | 'other';
+type UIOutboxKind = UIKindEs | UILegacy;
 
-type OutboxItem = {
+type UIOutboxItem = {
   id: string;
-  kind: OutboxKind;       // <- acepta ambos
+  kind: UIOutboxKind;     // ahora acepta "mov"
   createdAtMs: number;
   payload: any;
 
-  // Campos reales del motor con backoff
   attempts?: number;
-  status?: OutboxStatus;
+  status?: UIOutboxStatus;
   nextRetryAt?: number;
   lastError?: string;
 
-  // Compat con versión previa del screen
+  // compat versiones previas
   error?: string;
 };
 
 const STORAGE_KEY = 'outbox:pending';
 
-/** Normaliza cualquier kind legacy al canónico en español */
-function normalizeKind(kind: OutboxKind): KindEs {
+/** Normaliza cualquier kind legacy al canónico en español (y preserva 'mov') */
+function normalizeKind(kind: UIOutboxKind): UIKindEs {
   if (kind === 'payment') return 'abono';
   if (kind === 'other') return 'otro';
-  // si el motor nuevo encoló 'venta', respétalo
-  if (kind === 'venta') return 'venta';
-  return kind as KindEs; // ya es 'abono' | 'no_pago' | 'otro'
-}
-
-/** Etiqueta base (fallback) */
-function kindLabel(kind: OutboxKind): 'Abono' | 'Venta' | 'No pago' | 'Otro' {
-  const k = normalizeKind(kind);
-  if (k === 'abono') return 'Abono';
-  if (k === 'venta') return 'Venta';
-  if (k === 'no_pago') return 'No pago';
-  return 'Otro';
+  if (kind === 'mov') return 'mov';
+  if (kind === 'venta' || kind === 'abono' || kind === 'no_pago' || kind === 'otro') return kind;
+  return 'otro';
 }
 
 /** Píldora de estado */
@@ -70,7 +64,7 @@ function StatusPill({
   status,
   colorSet,
 }: {
-  status?: OutboxStatus;
+  status?: UIOutboxStatus;
   colorSet: { text: string; border: string; bg: string };
 }) {
   const label =
@@ -106,7 +100,7 @@ function StatusPill({
 type FilterKey = 'todos' | 'abono' | 'no_pago' | 'otro';
 
 /** Título “inteligente” con nombre del cliente si existe */
-function getDisplayTexts(item: OutboxItem): { title: string; subtitle?: string } {
+function getDisplayTexts(item: UIOutboxItem): { title: string; subtitle?: string } {
   const k = normalizeKind(item.kind);
   const p = item.payload || {};
 
@@ -125,7 +119,7 @@ function getDisplayTexts(item: OutboxItem): { title: string; subtitle?: string }
 
   const who = nombre || fallbackId;
 
-  // subkind para movimientos genéricos (ingreso/retiro/gasto_admin/gasto_cobrador/apertura/cierre)
+  // subkind para movimientos genéricos
   const sub: string | undefined = p.subkind;
   const subLabelMap: Record<string, string> = {
     ingreso: 'Ingreso',
@@ -136,30 +130,29 @@ function getDisplayTexts(item: OutboxItem): { title: string; subtitle?: string }
     cierre: 'Cierre',
   };
 
+  if (k === 'mov' && sub && subLabelMap[sub]) {
+    return { title: `${subLabelMap[sub]} — ${who}` };
+  }
   if (k === 'abono') return { title: `Pago — ${who}` };
   if (k === 'venta') return { title: `Venta — ${who}` };
   if (k === 'no_pago') return { title: `No pago — ${who}` };
 
-  if (sub && subLabelMap[sub]) {
-    return { title: `${subLabelMap[sub]} — ${who}` };
-  }
-
   // fallback genérico
-  return { title: `${kindLabel(item.kind)}${nombre ? ` — ${who}` : ''}` };
+  return { title: `${k === 'otro' ? 'Otro' : k} ${nombre ? `— ${who}` : ''}` };
 }
 
 export default function PendientesScreen() {
   const { palette } = useAppTheme();
 
   // estados
-  const [items, setItems] = useState<OutboxItem[]>([]);
+  const [items, setItems] = useState<UIOutboxItem[]>([]);
   const [loadingInitial, setLoadingInitial] = useState(true); // 👈 carga inicial
   const [refreshing, setRefreshing] = useState(false);        // 👈 solo pull-to-refresh
   const [processing, setProcessing] = useState(false);
   const [filter, setFilter] = useState<FilterKey>('todos');
 
-  // Carga lista desde AsyncStorage (con migración de kind)
-  const readFromStorage = useCallback(async (): Promise<OutboxItem[]> => {
+  // Carga lista desde AsyncStorage (compat) y migra kinds legacy
+  const readFromStorage = useCallback(async (): Promise<UIOutboxItem[]> => {
     try {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
       if (!raw) return [];
@@ -171,7 +164,7 @@ export default function PendientesScreen() {
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify([]));
         return [];
       }
-      const list: OutboxItem[] = Array.isArray(parsed) ? parsed : [];
+      const list: UIOutboxItem[] = Array.isArray(parsed) ? parsed : [];
       const migrated = list.map((it) => ({ ...it, kind: normalizeKind(it.kind) }));
       // si hubo cambios, persistimos
       if (JSON.stringify(list) !== JSON.stringify(migrated)) {
@@ -220,12 +213,11 @@ export default function PendientesScreen() {
       unsubEvt = null;
     }
 
-    // 2) Fallback: polling liviano (cada 1.5s) si no hay emitter
+    // 2) Fallback: contador (si no hay emitter)
     let unsubPoll: (() => void) | null = null;
     if (!unsubEvt) {
       try {
         unsubPoll = subscribeCount(() => {
-          // No confiamos en el número aquí, solo disparamos una recarga silenciosa
           load('silent');
         });
       } catch {
@@ -239,12 +231,12 @@ export default function PendientesScreen() {
     };
   }, [load]);
 
-  const saveList = async (list: OutboxItem[]) => {
+  const saveList = async (list: UIOutboxItem[]) => {
     setItems(list);
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
   };
 
-  // Reintentar uno (preferir motor nuevo; si falla, quitar ítem o marcar error local)
+  // Reintentar uno
   const retryOne = async (id: string) => {
     setProcessing(true);
     try {
@@ -254,8 +246,7 @@ export default function PendientesScreen() {
         await processOutboxBatch(1);
       }
       await load('silent');
-    } catch (e: any) {
-      // Si el motor lanzó, no tocamos la lista; el motor ya dejó lastError/backoff
+    } catch {
       Alert.alert('Reintento', 'No se pudo reenviar este elemento.');
     } finally {
       setProcessing(false);
@@ -323,8 +314,8 @@ export default function PendientesScreen() {
     [palette]
   );
 
-  const renderItem = ({ item }: { item: OutboxItem }) => {
-    const statusKey: OutboxStatus =
+  const renderItem = ({ item }: { item: UIOutboxItem }) => {
+    const statusKey: UIOutboxStatus =
       item.status === 'processing'
         ? 'processing'
         : item.status === 'error'
@@ -398,7 +389,7 @@ export default function PendientesScreen() {
     );
   };
 
-  // Barra de filtros (chips) — sin cambios
+  // Barra de filtros (chips)
   const FilterChip = ({ value, label, icon }: { value: FilterKey; label: string; icon: string }) => {
     const active = filter === value;
     return (
@@ -432,7 +423,7 @@ export default function PendientesScreen() {
       <View
         style={[
           styles.header,
-        { borderBottomColor: palette.topBorder, backgroundColor: palette.topBg },
+          { borderBottomColor: palette.topBorder, backgroundColor: palette.topBg },
         ]}
       >
         <TouchableOpacity
@@ -470,6 +461,7 @@ export default function PendientesScreen() {
           <ActivityIndicator size="large" />
         </View>
       ) : (
+        // ⛔️ OJO: NO usamos <FlatList<...>> para evitar TS2558
         <FlatList
           data={filtered}
           keyExtractor={(it) => it.id}

@@ -22,7 +22,12 @@ import NetInfo from '@react-native-community/netinfo';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { db } from '../firebase/firebaseConfig';
-import { addDoc, collection, doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  serverTimestamp,
+  writeBatch,
+} from 'firebase/firestore';
 import { todayInTZ, pickTZ } from '../utils/timezone';
 import { useAppTheme } from '../theme/ThemeProvider';
 import { logAudit, pick } from '../utils/auditLogs';
@@ -31,7 +36,7 @@ import { addToOutbox } from '../utils/outbox';
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoPrestamo'>;
 
 // 👉 util: dado un YYYY-MM-DD, devuelve el siguiente día operativo (Lun–Sáb por defecto)
-function nextOperativeDayStr(startIso: string, diasHabiles: number[] = [1,2,3,4,5,6]) {
+function nextOperativeDayStr(startIso: string, diasHabiles: number[] = [1, 2, 3, 4, 5, 6]) {
   const [y, m, d] = startIso.split('-').map(Number);
   let cur = new Date(y, (m || 1) - 1, d || 1);
   cur.setDate(cur.getDate() + 1);
@@ -71,8 +76,14 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
 
   useEffect(() => {
     const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (modalidadVisible) { setModalidadVisible(false); return true; }
-      if (interesVisible) { setInteresVisible(false); return true; }
+      if (modalidadVisible) {
+        setModalidadVisible(false);
+        return true;
+      }
+      if (interesVisible) {
+        setInteresVisible(false);
+        return true;
+      }
       return false;
     });
     return () => backHandler.remove();
@@ -135,7 +146,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       [
         { text: 'Cancelar', style: 'cancel' },
         { text: 'Guardar', onPress: guardarTodo },
-      ]
+      ],
     );
   };
 
@@ -148,9 +159,9 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       let isOnline = true;
       try {
         const state = await NetInfo.fetch();
-        isOnline = !!state.isConnected;
+        isOnline = !!(state?.isInternetReachable ?? state?.isConnected);
       } catch {
-        isOnline = true; // si falla NetInfo, intentamos online
+        isOnline = true; // si NetInfo falla, intentamos online
       }
 
       // --------- Datos comunes ----------
@@ -167,7 +178,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         if (!existingClienteId) {
           Alert.alert(
             'Sin conexión',
-            'Para crear un cliente nuevo necesitas internet. Si ya existe el cliente, selecciónalo e intenta de nuevo.'
+            'Para crear un cliente nuevo necesitas internet. Si ya existe el cliente, selecciónalo e intenta de nuevo.',
           );
           return;
         }
@@ -197,7 +208,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
 
           Alert.alert(
             'Sin conexión',
-            'El nuevo préstamo se guardó en "Pendientes" y se enviará cuando vuelvas a tener internet.'
+            'El nuevo préstamo se guardó en "Pendientes" y se enviará cuando vuelvas a tener internet.',
           );
           navigation.popToTop();
           return;
@@ -210,7 +221,9 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         }
       }
 
-      // ========== ONLINE: flujo actual ==========
+      // ========== ONLINE: batch (2–4 writes efectivos) ==========
+      const batch = writeBatch(db);
+
       // 1) Crear/actualizar cliente en /clientes
       let clienteRef;
       if (existingClienteId) {
@@ -222,14 +235,14 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
           ...(cliente?.telefono1 ? { telefono1: cliente.telefono1 } : {}),
           actualizadoEn: serverTimestamp(),
         };
-        await setDoc(clienteRef, updatePayload, { merge: true });
+        batch.set(clienteRef, updatePayload, { merge: true });
 
-        // 🔍 AUDIT: update cliente (best-effort, solo after)
-        await logAudit({
+        // 🔍 AUDIT (best-effort)
+        void logAudit({
           userId: admin,
           action: 'update',
           ref: clienteRef,
-          after: pick(updatePayload, ['nombre','alias','direccion1','telefono1']),
+          after: pick(updatePayload, ['nombre', 'alias', 'direccion1', 'telefono1']),
         });
       } else {
         clienteRef = doc(collection(db, 'clientes'));
@@ -240,69 +253,80 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
           creadoEn: serverTimestamp(),
           id: clienteId,
         };
-        await setDoc(clienteRef, createPayload);
+        batch.set(clienteRef, createPayload);
 
-        // 🔍 AUDIT: create cliente
-        await logAudit({
+        // 🔍 AUDIT
+        void logAudit({
           userId: admin,
           action: 'create',
           ref: clienteRef,
-          after: pick(createPayload, ['nombre','alias','direccion1','telefono1','creadoPor','id']),
+          after: pick(createPayload, ['nombre', 'alias', 'direccion1', 'telefono1', 'creadoPor', 'id']),
         });
       }
 
-      // 3) Crear /clientes/{id}/prestamos
+      // 2) Crear préstamo con campos **denormalizados** y **agregados** iniciales
+      const prestamoRef = doc(collection(clienteRef, 'prestamos')); // ID anticipado (para caja)
       const prestamoPayload = {
-        concepto,
-        cobradorId: admin,
-        montoTotal: total,
-        restante: total,
+        // Identidad / tracking
         creadoPor: admin,
         creadoEn: serverTimestamp(),
         createdAtMs: Date.now(),
         createdDate: hoyIso, // ✅ YYYY-MM-DD en TZ del préstamo
+        clienteId: existingClienteId ?? clienteRef.id,
 
-        // denormalizados
+        // Denormalizados del cliente (para evitar joins)
         clienteNombre: concepto,
         clienteAlias: cliente?.alias ?? '',
         clienteDireccion1: cliente?.direccion1 ?? '',
         clienteTelefono1: cliente?.telefono1 ?? '',
 
+        // Esquema de negocio
+        concepto, // visible en UI
         modalidad: prestamo.modalidad,
         interes: interesPct,
         valorNeto: valor,
-        totalPrestamo: total,
-        cuotas: cuotasNum,
+        totalPrestamo: total, // alias
+        montoTotal: total, // compat
         valorCuota: vCuota,
+        cuotas: cuotasNum, // compat
+        cuotasTotales: cuotasNum, // ✅ agregado explícito
+        cuotasPagadas: 0, // ✅ agregado
+        restante: total, // ✅ agregado
+        diasAtraso: 0, // ✅ agregado
+        status: 'activo' as const, // ✅ filtro principal
+        permitirAdelantar: true,
 
-        // calendario
+        // Calendario / control
         fechaInicio: fechaInicioOperativa,
-        clienteId: existingClienteId ?? clienteRef.id,
         tz,
         diasHabiles,
         feriados: [],
         pausas: [],
-
-        // atraso y adelanto
-        modoAtraso: 'porPresencia',
-        permitirAdelantar: true,
+        proximoVencimiento: fechaInicioOperativa, // ✅ agregado
+        dueToday: false, // ✅ agregado
       };
+      batch.set(prestamoRef, prestamoPayload);
 
-      const prestamoRef = await addDoc(collection(clienteRef, 'prestamos'), prestamoPayload);
+      // 3) CajaDiaria: asiento del **capital entregado** (tipo 'prestamo')
+      //    ID determinístico para evitar duplicados si el usuario toca dos veces
+      const cajaDocId = `loan_${prestamoRef.id}`;
+      const cajaRef = doc(collection(db, 'cajaDiaria'), cajaDocId);
+      const cajaPayload = {
+        tipo: 'prestamo' as const,
+        admin,
+        monto: Number(valor),
+        operationalDate: hoyIso,
+        tz,
+        clienteId: existingClienteId ?? clienteRef.id,
+        prestamoId: prestamoRef.id,
+        clienteNombre: concepto,
+        createdAt: serverTimestamp(),
+        createdAtMs: Date.now(),
+        meta: { modalidad: prestamo.modalidad, interesPct },
+      };
+      batch.set(cajaRef, cajaPayload);
 
-      // 🔍 AUDIT: create préstamo (incluye createdDate)
-      await logAudit({
-        userId: admin,
-        action: 'create',
-        ref: prestamoRef,
-        after: pick(prestamoPayload, [
-          'concepto','cobradorId','montoTotal','restante','valorCuota','cuotas',
-          'clienteId','modalidad','interes','valorNeto','fechaInicio','tz','permitirAdelantar',
-          'createdDate'
-        ]),
-      });
-
-      // 4) Índice /clientesDisponibles (opcional)
+      // 4) (Opcional pero recomendado) Índice clientesDisponibles
       const idxRef = doc(db, 'clientesDisponibles', existingClienteId ?? clienteRef.id);
       const idxPayload = {
         id: existingClienteId ?? clienteRef.id,
@@ -314,14 +338,33 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         barrio: cliente?.barrio ?? '',
         telefono1: cliente?.telefono1 ?? '',
       };
-      await setDoc(idxRef, idxPayload, { merge: true });
+      batch.set(idxRef, idxPayload, { merge: true });
 
-      // 🔍 AUDIT: upsert índice
-      await logAudit({
+      // Commit único
+      await batch.commit();
+
+      // 🔍 AUDIT: préstamo creado (best-effort)
+      void logAudit({
         userId: admin,
-        action: 'update',
-        ref: idxRef,
-        after: pick(idxPayload, ['id','disponible','alias','nombre','barrio','telefono1']),
+        action: 'create',
+        ref: prestamoRef,
+        after: pick(prestamoPayload, [
+          'concepto',
+          'montoTotal',
+          'restante',
+          'valorCuota',
+          'cuotasTotales',
+          'cuotasPagadas',
+          'status',
+          'clienteId',
+          'modalidad',
+          'interes',
+          'valorNeto',
+          'fechaInicio',
+          'tz',
+          'permitirAdelantar',
+          'createdDate',
+        ]),
       });
 
       Alert.alert('Guardado', 'Préstamo registrado correctamente.');
@@ -346,7 +389,10 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         <Text style={[styles.headerTitle, { color: palette.text }]}>Nuevo préstamo</Text>
       </View>
 
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={{ flex: 1 }}
+      >
         <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
           <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
             {/* Card 1: Parámetros */}
@@ -367,7 +413,12 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
                 onPress={() => setModalidadVisible(true)}
                 activeOpacity={0.85}
               >
-                <Text style={[styles.selectorText, { color: prestamo.modalidad ? palette.text : palette.softText }]}>
+                <Text
+                  style={[
+                    styles.selectorText,
+                    { color: prestamo.modalidad ? palette.text : palette.softText },
+                  ]}
+                >
                   {prestamo.modalidad || 'Seleccionar'}
                 </Text>
               </TouchableOpacity>
@@ -381,7 +432,12 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
                 onPress={() => setInteresVisible(true)}
                 activeOpacity={0.85}
               >
-                <Text style={[styles.selectorText, { color: (toNum(prestamo.interes) > 0) ? palette.text : palette.softText }]}>
+                <Text
+                  style={[
+                    styles.selectorText,
+                    { color: toNum(prestamo.interes) > 0 ? palette.text : palette.softText },
+                  ]}
+                >
                   {toNum(prestamo.interes) > 0 ? `${prestamo.interes}%` : 'Seleccionar'}
                 </Text>
               </TouchableOpacity>
@@ -446,11 +502,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
               disabled={guardando}
               activeOpacity={0.9}
             >
-              {guardando ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={styles.btnTxt}>Guardar</Text>
-              )}
+              {guardando ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnTxt}>Guardar</Text>}
             </TouchableOpacity>
           </ScrollView>
         </TouchableWithoutFeedback>
@@ -528,7 +580,13 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
 }
 
 /** ---------- Componentes pequeños ---------- */
-function Label({ children, palette }: { children: React.ReactNode; palette: ReturnType<typeof useAppTheme>['palette'] }) {
+function Label({
+  children,
+  palette,
+}: {
+  children: React.ReactNode;
+  palette: ReturnType<typeof useAppTheme>['palette'];
+}) {
   return <Text style={[styles.label, { color: palette.softText }]}>{children}</Text>;
 }
 
@@ -550,7 +608,6 @@ function Field({
   keyboardType?: 'default' | 'numeric';
   editable?: boolean;
   palette: ReturnType<typeof useAppTheme>['palette'];
-  /** ✅ acepta refs que pueden ser null */
   inputRef?: React.RefObject<TextInput | null>;
   returnKeyType?: 'done' | 'next' | 'go' | 'send' | 'search';
   blurOnSubmit?: boolean;
@@ -560,7 +617,7 @@ function Field({
     <View style={{ marginBottom: 12 }}>
       <Text style={[styles.label, { color: palette.softText }]}>{label}</Text>
       <TextInput
-        ref={inputRef as any}  // 👈 corrige TS2322
+        ref={inputRef as any}
         style={[
           styles.input,
           {

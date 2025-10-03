@@ -1,4 +1,3 @@
-// screens/HomeScreen.tsx
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
   View,
@@ -45,32 +44,17 @@ import { computeQuotaBadge, computePresenceBadge } from '../utils/alerts';
 // 👇 NUEVO: Modal de WhatsApp
 import WhatsModal from '../components/WhatsModal';
 
-// 👇 NUEVO: Cache de catálogos
-import {
-  saveCatalogSnapshot,
-  loadCatalogSnapshot,
-} from '../utils/catalogCache';
+// 👇 NUEVO: Cache de catálogos (lo mantenemos best-effort)
+import { saveCatalogSnapshot, loadCatalogSnapshot } from '../utils/catalogCache';
 
 // 🆕 Ruta (asegurar/usar orden)
-import { ensureRouteOrder, loadRutaOrder } from '../utils/ruta'; // ⬅️ añadido loadRutaOrder
-import { useFocusEffect } from '@react-navigation/native'; // ⬅️ añadido useFocusEffect
+import { ensureRouteOrder, loadRutaOrder } from '../utils/ruta';
+import { useFocusEffect } from '@react-navigation/native';
 
 // ✅ NUEVO: saneador de caja (cierra días faltantes y asegura apertura de hoy)
 import { closeMissingDays, ensureAperturaDeHoy } from '../utils/cajaEstado';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
-
-type Cliente = {
-  id: string;
-  nombre?: string;
-  alias?: string;
-  direccion1?: string;
-  direccion2?: string;
-  telefono1?: string;
-  telefono2?: string;
-  // 🆕 orden de ruta
-  routeOrder?: number;
-};
 
 type Abono = {
   monto: number;
@@ -87,13 +71,13 @@ type Prestamo = {
   cobradorId: string;
   montoTotal: number;
   restante: number;
-  abonos: Abono[];
+  abonos: Abono[]; // legado (solo para fallback/UX)
   totalPrestamo: number;
   creadoPor: string;
   valorCuota: number;
   modalidad?: string;
 
-  // denormalizados (opcionalmente presentes)
+  // denormalizados (del propio préstamo)
   clienteAlias?: string;
   clienteDireccion1?: string;
   clienteDireccion2?: string;
@@ -111,6 +95,7 @@ type Prestamo = {
   cuotas?: number;
   diasAtraso?: number;
   faltas?: string[];
+  status?: 'activo' | 'cerrado' | 'pausado';
 };
 
 export default function HomeScreen({ route, navigation }: Props) {
@@ -122,12 +107,10 @@ export default function HomeScreen({ route, navigation }: Props) {
 
   // ======== Estado ========
   const [prestamosRaw, setPrestamosRaw] = useState<Prestamo[]>([]);
-  const [clientesMap, setClientesMap] = useState<Record<string, Cliente>>({});
   const [cargando, setCargando] = useState(true);
   const [cargaPrestamosOk, setCargaPrestamosOk] = useState<boolean | null>(null);
 
   // 👇 NUEVO: flags de carga para snapshot + cache
-  const [clientesLoaded, setClientesLoaded] = useState(false);
   const [prestamosLoaded, setPrestamosLoaded] = useState(false);
   const [ultimaActualizacion, setUltimaActualizacion] = useState<number | null>(null);
 
@@ -151,7 +134,8 @@ export default function HomeScreen({ route, navigation }: Props) {
   // 💰 Caja diaria KPI
   const [cobradoHoy, setCobradoHoy] = useState(0);
   const [tieneCajaSnapshot, setTieneCajaSnapshot] = useState(false);
-const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
+  const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
+
   // 🔄 Refresh manual: fuerza re-suscripción de snapshots
   const [refreshKey, setRefreshKey] = useState(0);
   const handleManualRefresh = () => {
@@ -161,7 +145,8 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
 
   // ⬇️ NUEVO: ids de clientes ordenados guardados por EnrutarClientes
   const [routeOrderIds, setRouteOrderIds] = useState<string[]>([]);
-  // ⬇️ Asegura sesión y administra admin desde params si falta
+
+  // Asegura sesión/admin si no vino por params
   useFocusEffect(
     useCallback(() => {
       let alive = true;
@@ -171,17 +156,14 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
           if (!alive) return;
 
           if (!u) {
-            // 🔄 si no hay sesión, vuelve al señuelo retro
             navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
             return;
           }
 
-          // Si hay sesión pero Home no recibió admin por params, lo inyectamos
           if (!route.params?.admin) {
             navigation.setParams({ admin: u } as any);
           }
         } catch {
-          // Si hay error leyendo sesión, volvemos al señuelo por seguridad
           navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
         }
       })();
@@ -192,23 +174,21 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
 
   // 🔔 Refresco ligero cuando cambie la cola (pendientes procesados/añadidos)
   useEffect(() => {
-    // 1) Emitter "en vivo": cuando el outbox cambie, refrescamos silenciosamente
     let unsubEvt: (() => void) | null = null;
     try {
       unsubEvt = subscribeOutbox(() => {
-        setRefreshKey((k) => k + 1); // fuerza re-suscripción (prestamos/caja)
+        setRefreshKey((k) => k + 1);
       });
     } catch {
       unsubEvt = null;
     }
 
-    // 2) Contador + fallback: mantiene el badge y también refresca si hay cambio real
     const unsubCount = subscribeCount((n) => {
       const prev = prevOutboxCountRef.current;
       setOutboxCount(n);
       if (n !== prev) {
         prevOutboxCountRef.current = n;
-        setRefreshKey((k) => k + 1); // refresco solo cuando cambia el tamaño
+        setRefreshKey((k) => k + 1);
      }
     });
 
@@ -217,6 +197,7 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
       unsubCount && unsubCount();
     };
   }, []);
+
   const { storageKeyV, storageKeyO } = useMemo(() => {
     const d = hoyApp;
     return {
@@ -226,7 +207,6 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
   }, [admin, hoyApp]);
 
   useEffect(() => {
-    // ⛑️ Evita tocar almacenamiento si aún no tenemos admin
     if (!admin) return;
 
     const loadLists = async () => {
@@ -258,12 +238,11 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
     const token = route.params?.refreshToken;
     if (token) {
       handleManualRefresh();
-      // limpiar param para no re-disparar
       navigation.setParams({ refreshToken: undefined } as any);
     }
   }, [route.params?.refreshToken]);
 
-  // 🆕 asegurar que todos los clientes tengan routeOrder (best-effort)
+  // 🆕 asegurar que exista routeOrder persistido (best-effort)
   useEffect(() => {
     if (!admin) return;
     (async () => {
@@ -276,7 +255,7 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
     React.useCallback(() => {
       let alive = true;
       (async () => {
-        if (!admin) return; // 👈 evita leer sin admin
+        if (!admin) return;
         try {
           const ids = await loadRutaOrder(admin);
           if (alive) setRouteOrderIds(ids);
@@ -288,7 +267,7 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
     }, [admin])
   );
 
-  // 👇 NUEVO: Hidratar desde cache al iniciar
+  // 👇 NUEVO: Hidratar desde cache al iniciar (prestamos solamente)
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -296,16 +275,7 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
         if (!admin) return;
         const snap = await loadCatalogSnapshot(admin);
         if (alive && snap) {
-          // prestamos: directo
           setPrestamosRaw(Array.isArray(snap.prestamos) ? (snap.prestamos as any) : []);
-          // clientes: convertir a mapa
-          if (Array.isArray(snap.clientes)) {
-            const map: Record<string, Cliente> = {};
-            for (const c of snap.clientes as any[]) {
-              if (c?.id) map[c.id] = c as Cliente;
-            }
-            setClientesMap(map);
-          }
           setUltimaActualizacion(snap.ts || Date.now());
         }
       } catch {
@@ -315,121 +285,69 @@ const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
     return () => { alive = false; };
   }, [admin]);
 
- // 🧾 Suscripción a cajaDiaria para KPI “cobrado hoy” + marcar visitados por prestamoId
-useEffect(() => {
-  if (!admin) return; // evita query sin admin
-
-  setTieneCajaSnapshot(false);
-  setCobradoHoy(0);
-  setCajaVisitados(new Set()); // ✅ reset al cambiar de día/admin
-
-  try {
-    const qCaja = query(
-      collection(db, 'cajaDiaria'),
-      where('admin', '==', admin),
-      where('operationalDate', '==', hoyApp)
-    );
-    const unsub = onSnapshot(
-      qCaja,
-      (snap) => {
-        let total = 0;
-        const ids = new Set<string>();
-
-        snap.forEach((d) => {
-          const data = d.data() as any;
-          const m = Number(data?.monto || 0);
-          const tipo = String(data?.tipo || '');
-          // Solo los 'abono' cuentan y marcan visitado
-          if (tipo === 'abono' && Number.isFinite(m)) {
-            total += m;
-
-            // 👉 recordAbonoFromOutbox y pagos online deben guardar prestamoId top-level
-            const pid = typeof data?.prestamoId === 'string' ? data.prestamoId : undefined;
-            if (pid) ids.add(pid);
-          }
-        });
-
-        setCobradoHoy(total);
-        setCajaVisitados(ids);
-        setTieneCajaSnapshot(true);
-      },
-      (err) => {
-        console.warn('[cajaDiaria] snapshot error:', err?.code || err?.message || err);
-        // Fallback: deja tieneCajaSnapshot=false y usaremos el legacy
-      }
-    );
-    return () => unsub();
-  } catch (e) {
-    console.warn('[cajaDiaria] suscripción no disponible:', e);
-    return () => {};
-  }
-}, [admin, hoyApp, refreshKey]);
-
-
-  // 👤 Suscripción en tiempo real a /clientes → mapa por id
+  // 🧾 Suscripción a cajaDiaria para KPI “cobrado hoy” + marcar visitados por prestamoId
   useEffect(() => {
-    let unsub: undefined | (() => void);
-    let alive = true;
+    if (!admin) return;
 
-    setClientesLoaded(false);
+    setTieneCajaSnapshot(false);
+    setCobradoHoy(0);
+    setCajaVisitados(new Set());
 
     try {
-      unsub = onSnapshot(
-        collection(db, 'clientes'),
+      const qCaja = query(
+        collection(db, 'cajaDiaria'),
+        where('admin', '==', admin),
+        where('operationalDate', '==', hoyApp)
+      );
+      const unsub = onSnapshot(
+        qCaja,
         (snap) => {
-          if (!alive) return;
-          const map: Record<string, Cliente> = {};
+          let total = 0;
+          const ids = new Set<string>();
+
           snap.forEach((d) => {
             const data = d.data() as any;
-            map[d.id] = {
-              id: d.id,
-              nombre: data?.nombre,
-              alias: data?.alias,
-              direccion1: data?.direccion1,
-              direccion2: data?.direccion2,
-              telefono1: data?.telefono1,
-              telefono2: data?.telefono2,
-              // 🆕 tomar routeOrder si existe
-              routeOrder: typeof data?.routeOrder === 'number' ? data.routeOrder : undefined,
-            };
+            const m = Number(data?.monto || 0);
+            const tipo = String(data?.tipo || '');
+            if (tipo === 'abono' && Number.isFinite(m)) {
+              total += m;
+              const pid = typeof data?.prestamoId === 'string' ? data.prestamoId : undefined;
+              if (pid) ids.add(pid);
+            }
           });
-          setClientesMap(map);
-          setClientesLoaded(true);
+
+          setCobradoHoy(total);
+          setCajaVisitados(ids);
+          setTieneCajaSnapshot(true);
         },
         (err) => {
-          console.warn('[clientes] snapshot error:', err?.code || err?.message || err);
-          if (!alive) return;
-          setClientesMap({});
-          setClientesLoaded(false);
+          console.warn('[cajaDiaria] snapshot error:', err?.code || err?.message || err);
         }
       );
+      return () => unsub();
     } catch (e) {
-      console.warn('[clientes] suscripción no disponible:', e);
-      setClientesMap({});
-      setClientesLoaded(false);
+      console.warn('[cajaDiaria] suscripción no disponible:', e);
+      return () => {};
     }
+  }, [admin, hoyApp, refreshKey]);
 
-    return () => {
-      alive = false;
-      try { unsub && unsub(); } catch {}
-    };
-  }, [refreshKey]);
-
-  // 🔐 Suscripción a préstamos del admin
+  // 🔐 Suscripción a préstamos del admin — **filtrado mínimo** (sin orderBy para evitar índices)
   useEffect(() => {
-    if (!admin) return; // 👈 evita query sin admin
+    if (!admin) return;
 
     let unsub: (() => void) | undefined;
 
     const suscribir = () => {
       setCargando(true);
       setCargaPrestamosOk(null);
-      setPrestamosLoaded(false); // ✅ NUEVO
+      setPrestamosLoaded(false);
 
       try {
+        // ⚡ Query mínima: por creador + con saldo (>0). Ordenamos del lado del cliente.
         const qPrestamos = query(
           collectionGroup(db, 'prestamos'),
-          where('creadoPor', '==', admin)
+          where('creadoPor', '==', admin),
+          where('restante', '>', 0)
         );
 
         unsub = onSnapshot(
@@ -438,6 +356,10 @@ useEffect(() => {
             const lista: Prestamo[] = [];
             sg.forEach((docSnap) => {
               const data = docSnap.data() as any;
+              // Filtrado client-side de status: considera activos los que no tienen status (legacy)
+              const st: any = data?.status;
+              if (st && st !== 'activo') return;
+
               lista.push({
                 id: docSnap.id,
                 concepto: (data.concepto ?? '').trim() || 'Sin nombre',
@@ -451,7 +373,7 @@ useEffect(() => {
                 modalidad: data.modalidad ?? 'Diaria',
                 clienteId: data.clienteId,
 
-                // denormalizados tal como vengan (completaremos con clientesMap más abajo)
+                // denormalizados (NO mergeamos con /clientes)
                 clienteAlias: data.clienteAlias ?? data.clienteNombre ?? '',
                 clienteDireccion1: data.clienteDireccion1 ?? '',
                 clienteDireccion2: data.clienteDireccion2 ?? '',
@@ -469,68 +391,65 @@ useEffect(() => {
                 cuotas: data.cuotas,
                 diasAtraso: data.diasAtraso,
                 faltas: data.faltas,
+                status: data.status,
               });
             });
 
             setPrestamosRaw(lista);
-            setPrestamosLoaded(true); // ✅ NUEVO
+            setPrestamosLoaded(true);
             setCargando(false);
             setCargaPrestamosOk(true);
 
-            // Reconciliar atraso en lote pequeño
+            // Reconciliación limitada (máx 10 docs) — prioriza mayor restante (sin índices)
             (async () => {
-              const candidatos = lista.filter((p) => Number(p.restante || 0) > 0);
-              const MAX_UPDATES = 10;
-              let count = 0;
+              const candidatos = [...lista]
+                .sort((a, b) => Number(b.restante || 0) - Number(a.restante || 0))
+                .slice(0, 10);
 
               for (const p of candidatos) {
-                if (count >= MAX_UPDATES) break;
+                try {
+                  const hoyLocal = todayInTZ(pickTZ(p?.tz, tzSession));
+                  const diasHabiles =
+                    Array.isArray(p?.diasHabiles) && p.diasHabiles.length
+                      ? p.diasHabiles
+                      : [1, 2, 3, 4, 5, 6];
+                  const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
+                  const pausas = Array.isArray(p?.pausas) ? p?.pausas : [];
+                  const modo = (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
+                  const permitirAdelantar = !!p?.permitirAdelantar;
+                  const cuotas =
+                    Number(p?.cuotas || 0) ||
+                    Math.ceil(
+                      Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
+                    );
 
-                const hoyLocal = todayInTZ(pickTZ(p?.tz, tzSession));
-                const diasHabiles =
-                  Array.isArray(p?.diasHabiles) && p.diasHabiles.length
-                    ? p.diasHabiles
-                    : [1, 2, 3, 4, 5, 6];
-                const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
-                const pausas = Array.isArray(p?.pausas) ? p?.pausas : [];
-                const modo =
-                  (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
-                const permitirAdelantar = !!p?.permitirAdelantar;
-                const cuotas =
-                  Number(p?.cuotas || 0) ||
-                  Math.ceil(
-                    Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
-                  );
+                  const calc = calcularDiasAtraso({
+                    fechaInicio: p?.fechaInicio || hoyLocal,
+                    hoy: hoyLocal,
+                    cuotas,
+                    valorCuota: Number(p?.valorCuota || 0),
+                    abonos: (p?.abonos || []).map((a: any) => ({
+                      monto: Number(a.monto) || 0,
+                      operationalDate: a.operationalDate,
+                      fecha: a.fecha,
+                    })),
+                    diasHabiles,
+                    feriados,
+                    pausas,
+                    modo,
+                    permitirAdelantar,
+                  });
 
-                const calc = calcularDiasAtraso({
-                  fechaInicio: p?.fechaInicio || hoyLocal,
-                  hoy: hoyLocal,
-                  cuotas,
-                  valorCuota: Number(p?.valorCuota || 0),
-                  abonos: (p?.abonos || []).map((a: any) => ({
-                    monto: Number(a.monto) || 0,
-                    operationalDate: a.operationalDate,
-                    fecha: a.fecha,
-                  })),
-                  diasHabiles,
-                  feriados,
-                  pausas,
-                  modo,
-                  permitirAdelantar,
-                });
-
-                if (calc.atraso !== Number(p.diasAtraso ?? -1)) {
-                  try {
+                  if (calc.atraso !== Number(p.diasAtraso ?? -1)) {
                     const ref = doc(db, 'clientes', p.clienteId!, 'prestamos', p.id);
                     await updateDoc(ref, {
                       diasAtraso: calc.atraso,
                       faltas: calc.faltas || [],
                       ultimaReconciliacion: serverTimestamp(),
                     });
-                    count++;
-                  } catch (e) {
-                    console.warn('Reconciliación omitida para préstamo', p?.id, e);
                   }
+                } catch (e) {
+                  // best-effort
                 }
               }
             })();
@@ -540,10 +459,10 @@ useEffect(() => {
             setCargando(false);
             setCargaPrestamosOk(false);
             setPrestamosRaw([]);
-            setPrestamosLoaded(false); // ✅ NUEVO
+            setPrestamosLoaded(false);
             Alert.alert(
-              'Permisos insuficientes',
-              'No tienes permisos para leer los préstamos. Revisa tus reglas de Firestore.'
+              'Lectura de préstamos',
+              'No se pudieron cargar los préstamos (revisa reglas o índices de Firestore).'
             );
           }
         );
@@ -551,7 +470,7 @@ useEffect(() => {
         console.warn('[prestamos] suscripción no disponible:', e);
         setCargando(false);
         setCargaPrestamosOk(false);
-        setPrestamosLoaded(false); // ✅ NUEVO
+        setPrestamosLoaded(false);
       }
     };
 
@@ -561,21 +480,19 @@ useEffect(() => {
     };
   }, [admin, tzSession]);
 
-  // 👇 NUEVO: Guardar snapshot en cache cuando AMBAS fuentes estén listas
+  // ✅ Guardar snapshot en cache cuando prestamos estén listos
   useEffect(() => {
     if (!admin) return;
-    if (!clientesLoaded || !prestamosLoaded) return;
-    const clientesArr = Object.values(clientesMap);
-    // Guardamos snapshot best-effort (no bloquea la UI)
+    if (!prestamosLoaded) return;
     void (async () => {
       try {
-        await saveCatalogSnapshot(admin, { clientes: clientesArr as any, prestamos: prestamosRaw as any });
+        await saveCatalogSnapshot(admin, { clientes: [], prestamos: prestamosRaw as any });
         setUltimaActualizacion(Date.now());
       } catch {
         // ignore
       }
     })();
-  }, [admin, clientesLoaded, prestamosLoaded, clientesMap, prestamosRaw]);
+  }, [admin, prestamosLoaded, prestamosRaw]);
 
   // ✅ NUEVO: saneador de caja al abrir Home (una sola vez cuando hay admin)
   const saneadorOnce = useRef(false);
@@ -595,27 +512,13 @@ useEffect(() => {
     })();
   }, [admin, tzSession]);
 
-  // 🔄 Merge en vivo: prestamosRaw + clientesMap
-  const prestamos: Prestamo[] = useMemo(() => {
-    if (!prestamosRaw.length) return [];
-    return prestamosRaw.map((p) => {
-      const c = p.clienteId ? clientesMap[p.clienteId] : undefined;
-      return {
-        ...p,
-        clienteAlias: p.clienteAlias || c?.alias || c?.nombre || '',
-        clienteDireccion1: p.clienteDireccion1 || c?.direccion1 || '',
-        clienteDireccion2: p.clienteDireccion2 || c?.direccion2 || '',
-        clienteTelefono1: p.clienteTelefono1 || c?.telefono1 || '',
-      };
-    });
-  }, [prestamosRaw, clientesMap]);
+  // 🔄 No mergeamos con /clientes — usamos los campos denormalizados del propio préstamo
+  const prestamos = useMemo(() => prestamosRaw, [prestamosRaw]);
 
-  const prestamosAdmin = useMemo(
-    () => prestamos.filter((p) => p.creadoPor === admin),
-    [prestamos, admin]
-  );
+  // (La query ya trae solo del admin y con saldo)
+  const prestamosAdmin = useMemo(() => prestamos, [prestamos]);
 
-  // 🆕 Ordenar por orden guardado (AsyncStorage) y fallback a routeOrder / nombre
+  // 🆕 Ordenar por orden guardado (AsyncStorage) y fallback a nombre
   const orderedPrestamosAdmin = useMemo(() => {
     const BIG = 1e9;
     const pos = new Map<string, number>(routeOrderIds.map((id, i) => [id, i]));
@@ -624,36 +527,22 @@ useEffect(() => {
       const pb = b.clienteId ? (pos.has(b.clienteId) ? (pos.get(b.clienteId) as number) : BIG) : BIG;
       if (pa !== pb) return pa - pb;
 
-      const ra =
-        typeof clientesMap[a.clienteId || '']?.routeOrder === 'number'
-          ? (clientesMap[a.clienteId!].routeOrder as number)
-          : BIG;
-      const rb =
-        typeof clientesMap[b.clienteId || '']?.routeOrder === 'number'
-          ? (clientesMap[b.clienteId!].routeOrder as number)
-          : BIG;
-      if (ra !== rb) return ra - rb;
-
       return (a.concepto || '').localeCompare(b.concepto || '');
     });
-  }, [prestamosAdmin, clientesMap, routeOrderIds]);
+  }, [prestamosAdmin, routeOrderIds]);
 
- function esVisitadoHoy(p: Prestamo, tzFallback = tzSession, hoyStr?: string) {
-  // ✅ Si caja de hoy tiene un abono para este préstamo, ya está visitado
-  if (cajaVisitados.has(p.id)) return true;
-
-  // ↘️ Respaldo por array denormalizado ‘abonos’
-  const tzPrestamo = pickTZ(p.tz, tzFallback);
-  const hoyPrestamo = hoyStr ?? todayInTZ(tzPrestamo);
-  return (
-    Array.isArray(p.abonos) &&
-    p.abonos.some((a) => {
-      const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
-      return dia === hoyPrestamo;
-    })
-  );
-}
-
+  function esVisitadoHoy(p: Prestamo, tzFallback = tzSession, hoyStr?: string) {
+    if (cajaVisitados.has(p.id)) return true;
+    const tzPrestamo = pickTZ(p.tz, tzFallback);
+    const hoyPrestamo = hoyStr ?? todayInTZ(tzPrestamo);
+    return (
+      Array.isArray(p.abonos) &&
+      p.abonos.some((a) => {
+        const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
+        return dia === hoyPrestamo;
+      })
+    );
+  }
 
   function getHoyTZ(p: Prestamo) {
     const tzPrestamo = pickTZ(p.tz, tzSession);
@@ -663,18 +552,14 @@ useEffect(() => {
   function diasAtrasoRobusto(p: Prestamo) {
     const hoy = getHoyTZ(p);
     const diasHabiles =
-      Array.isArray(p?.diasHabiles) && p.diasHabiles.length
-        ? p.diasHabiles
-        : [1, 2, 3, 4, 5, 6];
+      Array.isArray(p?.diasHabiles) && p.diasHabiles.length ? p.diasHabiles : [1, 2, 3, 4, 5, 6];
     const feriados = Array.isArray(p?.feriados) ? p?.feriados : [];
     const pausas = Array.isArray(p?.pausas) ? p?.pausas : [];
     const modo = (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
     const permitirAdelantar = !!p?.permitirAdelantar;
     const cuotas =
       Number(p?.cuotas || 0) ||
-      Math.ceil(
-        Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
-      );
+      Math.ceil(Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1));
 
     const res = calcularDiasAtraso({
       fechaInicio: p.fechaInicio || hoy,
@@ -736,7 +621,6 @@ useEffect(() => {
     if (payload.promesaFecha && payload.promesaFecha.trim()) base.promesaFecha = payload.promesaFecha.trim();
     if (typeof payload.promesaMonto === 'number' && isFinite(payload.promesaMonto)) base.promesaMonto = payload.promesaMonto;
 
-    // 👇 guarda y audita
     const docRef = await addDoc(
       collection(db, 'clientes', p.clienteId, 'prestamos', p.id, 'reportesNoPago'),
       base
@@ -746,9 +630,8 @@ useEffect(() => {
       userId: admin,
       action: 'no_pago',
       docPath: `clientes/${p.clienteId}/prestamos/${p.id}/reportesNoPago/${docRef.id}`,
-      // opcional: incluye un pequeño "after" con datos no sensibles
       after: pick(
-        { ...base, createdAt: undefined }, // evita el timestamp server-side gigante
+        { ...base, createdAt: undefined },
         ['tipo','reason','fechaOperacion','clienteId','prestamoId','valorCuota','saldo','promesaFecha','promesaMonto','nota']
       ),
     });
@@ -761,15 +644,11 @@ useEffect(() => {
     let curr = new Date(Date.UTC(y, m - 1, d));
 
     const diasHabiles =
-      Array.isArray(p?.diasHabiles) && p.diasHabiles.length
-        ? p.diasHabiles
-        : [1, 2, 3, 4, 5, 6];
+      Array.isArray(p?.diasHabiles) && p.diasHabiles.length ? p.diasHabiles : [1, 2, 3, 4, 5, 6];
 
     const cuotas =
       Number(p?.cuotas || 0) ||
-      Math.ceil(
-        Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
-      );
+      Math.ceil(Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1));
 
     let restantes = Math.max(1, cuotas);
     while (restantes > 0) {
@@ -792,16 +671,15 @@ useEffect(() => {
   }
 
   // ===== KPIs =====
-  const totalClientes = orderedPrestamosAdmin.length; // 🆕
+  const totalClientes = orderedPrestamosAdmin.length;
   const visitados = useMemo(
-    () => orderedPrestamosAdmin.filter((p) => esVisitadoHoy(p)).length, // 🆕
+    () => orderedPrestamosAdmin.filter((p) => esVisitadoHoy(p)).length,
     [orderedPrestamosAdmin]
   );
 
-  // Legacy por abonos array (respaldo si no hay cajaDiaria por permisos)
   const cobradoLegacy = useMemo(() => {
     let total = 0;
-    for (const p of orderedPrestamosAdmin) { // 🆕
+    for (const p of orderedPrestamosAdmin) {
       const tzPrestamo = pickTZ(p.tz, tzSession);
       const hoyPrestamo = todayInTZ(tzPrestamo);
       for (const a of p.abonos || []) {
@@ -812,16 +690,14 @@ useEffect(() => {
     return total;
   }, [orderedPrestamosAdmin]);
 
-  // 💡 KPI usa cajaDiaria si hay snapshot; si no, fallback
   const cobrado = tieneCajaSnapshot ? cobradoHoy : cobradoLegacy;
 
   // Meta = suma de valorCuota de todos los préstamos del admin (diaria)
   const meta = useMemo(
-    () => orderedPrestamosAdmin.reduce((acc, p) => acc + (Number(p.valorCuota) || 0), 0), // 🆕
+    () => orderedPrestamosAdmin.reduce((acc, p) => acc + (Number(p.valorCuota) || 0), 0),
     [orderedPrestamosAdmin]
   );
 
-  // ✅ Progreso por RECAUDO (no por visitas)
   const porcentajeCobro = meta > 0 ? (cobrado / meta) * 100 : 0;
   const progresoCobro = Math.min(100, Math.max(0, Math.round(porcentajeCobro)));
 
@@ -832,7 +708,7 @@ useEffect(() => {
   );
 
   const prestamosVisibles = useMemo(
-    () => orderedPrestamosAdmin.filter((p) => !hiddenIds.has(p.id) && !esVisitadoHoy(p)), // 🆕
+    () => orderedPrestamosAdmin.filter((p) => !hiddenIds.has(p.id) && !esVisitadoHoy(p)),
     [orderedPrestamosAdmin, hiddenIds]
   );
 
@@ -959,17 +835,14 @@ useEffect(() => {
     const restante = Number(current.restante || 0);
 
     const abonosSuma = (current.abonos || []).reduce((s, a) => s + (Number(a.monto || 0)), 0);
-    // total planeado de cuotas
     const parcelasTotais =
       current.cuotas && current.cuotas > 0
         ? current.cuotas
         : (valorCuota > 0 ? Math.ceil((restante + abonosSuma) / valorCuota) : 0);
 
-    // cuota actual (1-based)
     const parcelaAtual =
       valorCuota > 0 ? Math.min(parcelasTotais || 0, Math.floor((abonosSuma + 1e-9) / valorCuota) + 1) : 0;
 
-    // si hay parcial en la última cuota pagada, cuánto falta
     let faltam: number | undefined = undefined;
     if (valorCuota > 0) {
       const restoUltima = abonosSuma % valorCuota;
@@ -986,7 +859,6 @@ useEffect(() => {
       parcelaAtual: parcelasTotais ? parcelaAtual : undefined,
       parcelasTotais: parcelasTotais || undefined,
       faltam,
-      // defaultText: '...si quisieras forzar un texto ya armado'
     });
     setWhatsVisible(true);
   };
@@ -1036,13 +908,11 @@ useEffect(() => {
           accent={palette.accent}
           onPress={() => navigation.navigate('Acciones', { admin })}
         />
-
       </View>
 
       {/* Encabezado: fecha */}
       <View style={styles.headerDate}>
         <Text style={[styles.headerDateTxt, { color: palette.text }]}>{fechaHeader}</Text>
-        {/* 👇 NUEVO: “Últ. act.” (si existe cache o último guardado) */}
         {ultimaActualizacion ? (
           <Text style={{ marginTop: 2, fontSize: 11, color: palette.softText }}>
             Últ. act.: {new Date(ultimaActualizacion).toLocaleString()}
@@ -1068,17 +938,12 @@ useEffect(() => {
             />
           </View>
           <View style={styles.progressRow}>
-            {/* Visitas (informativo) */}
             <Text style={[styles.progressText, { color: palette.text }]}>
               {visitados}/{totalClientes}
             </Text>
-
-            {/* Porcentaje por cobro */}
             <Text style={[styles.progressText, { color: palette.text }]}>
               {porcentajeCobro.toFixed(1)}%
             </Text>
-
-            {/* Dinero cobrado vs meta */}
             <Text style={[styles.progressText, { color: palette.text }]}>
               R$ {cobrado.toFixed(2)}/{meta.toFixed(2)}
             </Text>
@@ -1098,8 +963,8 @@ useEffect(() => {
             <View style={styles.cardContent}>
               <Text style={{ textAlign: 'center', color: palette.softText }}>
                 {cargaPrestamosOk === false
-                  ? 'Sin permisos para leer préstamos.'
-                  : 'No tienes préstamos pendientes que mostrar por hoy.'}
+                  ? 'No se pudieron leer los préstamos.'
+                  : 'No tienes préstamos pendientes por hoy.'}
               </Text>
             </View>
             <View style={[styles.cardFooter, { borderTopColor: palette.divider }]}>
@@ -1314,7 +1179,7 @@ useEffect(() => {
               { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
             ]}
             activeOpacity={0.9}
-            onPress={openWhatsForCurrent} // 👈 ahora abre el modal
+            onPress={openWhatsForCurrent}
           >
             <MIcon name="whatsapp" size={22} color={palette.text} />
           </TouchableOpacity>
@@ -1426,6 +1291,7 @@ useEffect(() => {
           </View>
         </View>
       </Modal>
+
       {/* Modal No-Pago */}
       {current && (
         <ModalNoPago
@@ -1436,13 +1302,11 @@ useEffect(() => {
             if (!current) return;
             try {
               setNoPagoSaving(true);
-              // Intento online
               await guardarReporteNoPago(current, form);
               await marcarComoOmitido(current.id);
               setNoPagoOpen(false);
             } catch (e) {
               console.warn('Sin conexión / error guardando no-pago, encolando:', e);
-              // ⬇️ Offline: encolar para reenviar
               try {
                 await addToOutbox({
                   kind: 'no_pago',
@@ -1450,7 +1314,7 @@ useEffect(() => {
                     admin,
                     clienteId: current.clienteId!,
                     prestamoId: current.id!,
-                    ...form, // { reason, nota?, promesaFecha?, promesaMonto? }
+                    ...form,
                   },
                 });
                 Alert.alert('Pendientes', 'Guardado en "Pendientes" para reenviar cuando tengas internet.');
@@ -1480,16 +1344,14 @@ useEffect(() => {
         />
       )}
 
-      {/* 👇 NUEVO: WhatsModal montado al final */}
+      {/* WhatsModal */}
       {current && (
         <WhatsModal
           visible={whatsVisible}
           onClose={() => setWhatsVisible(false)}
           phone={whatsPayload.phone}
           nombre={whatsPayload.nombre}
-          onSent={() => {
-            // opcional: tracking / toast
-          }}
+          onSent={() => {}}
         />
       )}
     </SafeAreaView>

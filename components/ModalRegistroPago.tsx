@@ -1,4 +1,3 @@
-// components/ModalRegistroPago.tsx
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, Keyboard,
@@ -6,7 +5,7 @@ import {
 } from 'react-native';
 import {
   doc, collection, addDoc, deleteDoc, runTransaction, serverTimestamp,
-  updateDoc, getDoc, DocumentReference,
+  updateDoc, getDoc, DocumentReference, getDocs, writeBatch,
 } from 'firebase/firestore';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { db } from '../firebase/firebaseConfig';
@@ -30,24 +29,14 @@ type Props = {
 const quotaCache: Record<string, { cuota: number; saldo: number }> = {};
 const KEY_SEND_RECEIPT_CONFIRM = 'prefs:sendReceiptConfirm';
 
-/** ✅ Abrir WhatsApp sin número: deep-link → fallback web.
- *  Evitamos canOpenURL por restricciones de Android 11+ (package visibility). */
+/** ✅ Abrir WhatsApp sin número: deep-link → fallback web. */
 async function openWhats(text: string) {
   const encoded = encodeURIComponent(text || '');
   const deep = `whatsapp://send?text=${encoded}`;
   const web  = `https://wa.me/?text=${encoded}`;
 
-  // 1) Intento directo a la app
-  try {
-    await Linking.openURL(deep);
-    return;
-  } catch {}
-
-  // 2) Fallback web (navegador → WhatsApp / Play Store)
-  try {
-    await Linking.openURL(web);
-    return;
-  } catch {}
+  try { await Linking.openURL(deep); return; } catch {}
+  try { await Linking.openURL(web);  return; } catch {}
 
   Alert.alert(
     'WhatsApp',
@@ -55,49 +44,6 @@ async function openWhats(text: string) {
       ? 'No se pudo abrir WhatsApp. Verifica que esté instalado.'
       : 'No se pudo abrir WhatsApp en este dispositivo.'
   );
-}
-
-async function logToCajaDiaria(params: {
-  admin: string;
-  clienteId: string;
-  prestamoId: string;
-  clienteNombre: string;
-  monto: number;
-  tz: string;
-  operationalDate: string;
-}) {
-  const { admin, clienteId, prestamoId, clienteNombre, monto, tz, operationalDate } = params;
-  const now = Date.now();
-  try {
-    const ref = await addDoc(collection(db, 'cajaDiaria'), {
-      tipo: 'abono',
-      admin,
-      clienteId,
-      prestamoId,
-      clienteNombre,
-      monto: Number(monto.toFixed(2)),
-      tz,
-      operationalDate,
-      createdAtMs: now,
-      createdAt: serverTimestamp(),
-      source: 'app',
-    });
-    await logAudit({
-      userId: admin,
-      action: 'create',
-      ref,
-      after: {
-        admin,
-        clienteId,
-        prestamoId,
-        monto: Number(monto.toFixed(2)),
-        operationalDate,
-        tipo: 'abono',
-      },
-    });
-  } catch (e) {
-    console.warn('[cajaDiaria] no se pudo registrar:', e);
-  }
 }
 
 function buildReceiptPT(opts: {
@@ -226,6 +172,7 @@ export default function ModalRegistroPago({
     const abonoRef: DocumentReference = doc(collection(prestamoRef, 'abonos'));
 
     try {
+      // ====================== TRANSACCIÓN ======================
       const txResult = await runTransaction(db, async (tx) => {
         const snap = await tx.get(prestamoRef);
         if (!snap.exists()) throw new Error('El préstamo no existe.');
@@ -234,8 +181,23 @@ export default function ModalRegistroPago({
         const tz = pickTZ(data?.tz);
         const operativoHoy = todayInTZ(tz);
 
-        const abonosPrevios: any[] = Array.isArray(data.abonos) ? data.abonos : [];
-        const restanteActual = typeof data.restante === 'number' ? data.restante : data.montoTotal || 0;
+        const restanteActual =
+          typeof data.restante === 'number'
+            ? Number(data.restante)
+            : Number(data.montoTotal || data.totalPrestamo || 0);
+
+        const valorCuotaTx = Number(data?.valorCuota || 0);
+        const cuotasTotalesTx =
+          Number(data?.cuotasTotales || data?.cuotas || 0) ||
+          Math.ceil(Number(data.totalPrestamo || data.montoTotal || 0) / (valorCuotaTx || 1)) ||
+          0;
+
+        const prevCuotasPagadas =
+          typeof data?.cuotasPagadas === 'number'
+            ? Number(data.cuotasPagadas)
+            : valorCuotaTx > 0
+              ? Math.floor((Number(data.totalPrestamo || data.montoTotal || 0) - restanteActual) / valorCuotaTx)
+              : 0;
 
         const nowMs = Date.now();
         const nuevoAbono = {
@@ -244,174 +206,213 @@ export default function ModalRegistroPago({
           tz,
           operationalDate: operativoHoy,
           createdAtMs: nowMs,
-          createdAtIso: new Date(nowMs).toISOString(),
+          createdAt: serverTimestamp(),
+          source: 'app',
         };
 
         // 1) Guardar el abono en SUBCOLECCIÓN
         tx.set(abonoRef, nuevoAbono);
 
-        // 2) Actualizar agregados y ARRAY abonos en el préstamo (SIN serverTimestamp en el array)
+        // 2) Actualizar **solo agregados** del préstamo (🚫 sin array abonos)
         const nuevoRestante = Math.max(restanteActual - montoNum, 0);
-        const nuevosAbonos = [...abonosPrevios, nuevoAbono];
-        tx.update(prestamoRef, { abonos: nuevosAbonos, restante: nuevoRestante });
+        const deltaCuotas = valorCuotaTx > 0 ? Math.floor(montoNum / valorCuotaTx) : 0;
+        const nuevasCuotasPagadas = Math.min(
+          cuotasTotalesTx || (prevCuotasPagadas + deltaCuotas),
+          (cuotasTotalesTx || 0)
+        ) || (prevCuotasPagadas + deltaCuotas);
 
-        // 3) Cálculos para recibo/UX
-        const valorCuotaTx = Number(data?.valorCuota || 0);
-        const totalCuotasTx =
-          Number(data?.cuotas || 0) ||
-          Math.ceil(Number(data.totalPrestamo || data.montoTotal || 0) / (valorCuotaTx || 1)) || 0;
-
-        const totalAbonadoAcum = nuevosAbonos.reduce(
-          (acc, a) => acc + (Number(a?.monto) || 0),
-          0
-        );
-
-        const round2 = (n: number) => Math.round(n * 100) / 100;
-        const cuota = round2(valorCuotaTx);
-        const totalAbonado = round2(totalAbonadoAcum);
-        const pagoActual = round2(montoNum);
-
-        let linhaParcela = '';
-        if (cuota > 0 && totalCuotasTx > 0) {
-          const cuotaCents = Math.max(1, Math.round(cuota * 100));
-          const totalCents = Math.max(0, Math.round(totalAbonado * 100));
-          const pagoCents  = Math.max(0, Math.round(pagoActual * 100));
-
-          const pagosCompletos = Math.floor(totalCents / cuotaCents);
-          const restoCents = totalCents % cuotaCents;
-
-          const parcelaIndex = Math.min(
-            restoCents > 0 ? pagosCompletos + 1 : pagosCompletos,
-            totalCuotasTx
-          );
-
-          const multiploPago = Math.floor(pagoCents / cuotaCents);
-
-          if (restoCents > 0) {
-            const faltanCents = cuotaCents - restoCents;
-            const faltan = (faltanCents / 100).toFixed(2);
-            linhaParcela = `Faltam R$ ${faltan} para completar a parcela #${parcelaIndex}/${totalCuotasTx}.`;
-          } else if (multiploPago > 1) {
-            linhaParcela = `Parcela: R$ ${cuota.toFixed(2)} (#${parcelaIndex}/${totalCuotasTx}) (x${multiploPago} parcelas)`;
-          } else if (multiploPago === 1) {
-            linhaParcela = `Parcela: R$ ${cuota.toFixed(2)} (#${parcelaIndex}/${totalCuotasTx})`;
-          }
-        }
+        tx.update(prestamoRef, {
+          restante: nuevoRestante,
+          cuotasPagadas: nuevasCuotasPagadas,
+          lastAbonoAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
 
         return {
+          prestamoBefore: pick(data, ['restante','valorCuota','totalPrestamo','clienteId','concepto','cuotasPagadas','cuotas','cuotasTotales']),
           nuevoRestante,
           valorCuotaTx,
-          totalCuotasTx,
-          linhaParcela,
-          prestamoBefore: pick(data, ['restante','valorCuota','totalPrestamo','clienteId','concepto']),
+          cuotasTotalesTx,
+          nuevasCuotasPagadas,
           abonoNuevo: nuevoAbono,
           tz,
           operativoHoy,
-          prestamoData: { ...data, abonos: nuevosAbonos, restante: nuevoRestante, tz, operationalDate: operativoHoy },
         };
       });
 
-      // Recibo por WhatsApp (opcional)
+      // ====================== POST-TX: RECIBO (NO BLOQUEA) ======================
       if (prefConfirmReceipt && !hasOpenedWhatsRef.current) {
+        // Línea de "parcela" amistosa (estimada)
+        let linhaParcela: string | undefined;
+        if (txResult.valorCuotaTx > 0 && txResult.cuotasTotalesTx > 0) {
+          const pagosCompletos = txResult.nuevasCuotasPagadas;
+          if (pagosCompletos > 0) {
+            linhaParcela = `Parcela: R$ ${txResult.valorCuotaTx.toFixed(2)} (#${Math.min(pagosCompletos, txResult.cuotasTotalesTx)}/${txResult.cuotasTotalesTx})`;
+          }
+        }
+
         const texto = buildReceiptPT({
           nombre: clienteNombre || 'Cliente',
           montoPagado: montoNum,
           fecha: txResult.operativoHoy,
           saldoRestante: txResult.nuevoRestante || 0,
-          linhaParcela: txResult.linhaParcela,
+          linhaParcela,
         });
         hasOpenedWhatsRef.current = true;
         setLoading(false);
-        // 👉 abre WhatsApp SIN número, con el mensaje prellenado
         void openWhats(texto);
       }
 
-      // Marca de tiempo del último abono
-      await updateDoc(doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!), { lastAbonoAt: serverTimestamp() });
+      // ====================== POST-TX: CAJA (writeBatch idempotente) ======================
+      try {
+        const batch = writeBatch(db);
+        const cajaId = `pay_${abonoRef.id}`;
+        const cajaRef = doc(collection(db, 'cajaDiaria'), cajaId);
+        batch.set(cajaRef, {
+          tipo: 'abono' as const,
+          admin,
+          clienteId: clienteId!,
+          prestamoId: prestamoId!,
+          clienteNombre: clienteNombre || 'Cliente',
+          monto: Number(montoNum.toFixed(2)),
+          tz: txResult.tz,
+          operationalDate: txResult.operativoHoy,
+          createdAtMs: Date.now(),
+          createdAt: serverTimestamp(),
+          source: 'app',
+          meta: { abonoRefId: abonoRef.id },
+        });
+        await batch.commit();
 
-      // AUDIT
-      await logAudit({
+        // Audit (fire-and-forget, no bloquea)
+        void logAudit({
+          userId: admin,
+          action: 'create',
+          docPath: cajaRef.path,
+          after: {
+            tipo: 'abono',
+            admin,
+            clienteId,
+            prestamoId,
+            monto: Number(montoNum.toFixed(2)),
+            operationalDate: txResult.operativoHoy,
+          },
+        });
+      } catch (e) {
+        // best-effort, no rompe la UX
+        console.warn('[cajaDiaria] no se pudo registrar en batch:', e);
+      }
+
+      // ====================== AUDIT ABONO (no bloquea) ======================
+      void logAudit({
         userId: admin,
         action: 'create',
-        ref: doc(collection(doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!), 'abonos'), abonoRef.id),
+        docPath: abonoRef.path,
         after: pick(txResult.abonoNuevo, ['monto','operationalDate','tz']),
       });
 
-      // Caja diaria
-      await logToCajaDiaria({
-        admin, clienteId: clienteId!, prestamoId: prestamoId!,
-        clienteNombre: clienteNombre || txResult.prestamoData?.concepto || 'Cliente',
-        monto: montoNum, tz: txResult.tz, operationalDate: txResult.operativoHoy,
-      });
+      // ====================== RECALC ATRASO (subcolección, local a este préstamo) ======================
+      try {
+        const pSnap = await getDoc(prestamoRef);
+        if (pSnap.exists()) {
+          const p = pSnap.data() as any;
 
-      // Recalcular atraso (con el array abonos actualizado)
-      const p = txResult.prestamoData;
-      const tzDoc = pickTZ(p?.tz);
-      const hoy = p.operationalDate || todayInTZ(tzDoc);
+          // Leer subcolección de abonos SOLAMENTE de este préstamo
+          const abonosSnap = await getDocs(collection(prestamoRef, 'abonos'));
+          const abonos = abonosSnap.docs.map((d) => {
+            const a = d.data() as any;
+            return {
+              monto: Number(a?.monto) || 0,
+              operationalDate: a?.operationalDate,
+              fecha: a?.fecha, // compat
+            };
+          });
 
-      const diasHabiles = Array.isArray(p?.diasHabiles) && p.diasHabiles.length ? p.diasHabiles : [1,2,3,4,5,6];
-      const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
-      const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
-      const modo = (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
-      const permitirAdelantar = !!p?.permitirAdelantar;
-      const cuotas = Number(p?.cuotas || 0) ||
-        Math.ceil(Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1));
+          const tzDoc = pickTZ(p?.tz);
+          const hoy = p?.operationalDate || todayInTZ(tzDoc);
+          const diasHabiles = Array.isArray(p?.diasHabiles) && p.diasHabiles.length ? p.diasHabiles : [1, 2, 3, 4, 5, 6];
+          const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
+          const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
+          const modo = (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
+          const permitirAdelantar = !!p?.permitirAdelantar;
+          const cuotas =
+            Number(p?.cuotasTotales || p?.cuotas || 0) ||
+            Math.ceil(Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1));
 
-      const res = calcularDiasAtraso({
-        fechaInicio: p?.fechaInicio || hoy,
-        hoy,
-        cuotas,
-        valorCuota: Number(p?.valorCuota || 0),
-        abonos: (p?.abonos || []).map((a: any) => ({
-          monto: Number(a.monto) || 0,
-          operationalDate: a.operationalDate,
-          fecha: a.fecha,
-        })),
-        diasHabiles, feriados, pausas, modo, permitirAdelantar,
-      });
+          const res = calcularDiasAtraso({
+            fechaInicio: p?.fechaInicio || hoy,
+            hoy,
+            cuotas,
+            valorCuota: Number(p?.valorCuota || 0),
+            abonos,
+            diasHabiles,
+            feriados,
+            pausas,
+            modo,
+            permitirAdelantar,
+          });
 
-      if (txResult.nuevoRestante > 0) {
-        await updateDoc(doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!), {
-          diasAtraso: res.atraso, faltas: res.faltas || [], ultimaReconciliacion: serverTimestamp(),
-        });
-        await logAudit({
-          userId: admin, action: 'update', ref: doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!),
-          before: txResult.prestamoBefore, after: { restante: txResult.nuevoRestante },
-        });
+          await updateDoc(prestamoRef, {
+            diasAtraso: res.atraso,
+            faltas: res.faltas || [],
+            ultimaReconciliacion: serverTimestamp(),
+          });
+
+          // Audit (no bloquea)
+          void logAudit({
+            userId: admin,
+            action: 'update',
+            ref: prestamoRef,
+            before: txResult.prestamoBefore,
+            after: { restante: txResult.nuevoRestante, cuotasPagadas: txResult.nuevasCuotasPagadas, diasAtraso: res.atraso },
+          });
+        }
+      } catch (e) {
+        // tolerante a fallos
       }
 
-      // Mover a historial si terminó
+      // ====================== CIERRE: mover a historial si terminó ======================
       if (txResult.nuevoRestante === 0) {
-        const historialRef = collection(db, 'clientes', clienteId!, 'historialPrestamos');
-        const histRef = await addDoc(historialRef, {
-          ...p,
-          restante: 0, diasAtraso: 0, faltas: [],
-          finalizadoEn: serverTimestamp(), finalizadoPor: admin,
-        });
+        try {
+          const snap = await getDoc(prestamoRef);
+          const p = snap.exists() ? (snap.data() as any) : {};
 
-        await logAudit({
-          userId: admin, action: 'create', ref: histRef,
-          after: { clienteId, prestamoId, restante: 0, finalizadoPor: admin },
-        });
+          const historialRef = collection(db, 'clientes', clienteId!, 'historialPrestamos');
+          const histRef = await addDoc(historialRef, {
+            ...p,
+            restante: 0,
+            diasAtraso: 0,
+            faltas: [],
+            finalizadoEn: serverTimestamp(),
+            finalizadoPor: admin,
+          });
 
-        await deleteDoc(doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!));
+          void logAudit({
+            userId: admin, action: 'create', ref: histRef,
+            after: { clienteId, prestamoId, restante: 0, finalizadoPor: admin },
+          });
 
-        await logAudit({
-          userId: admin, action: 'delete', ref: doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!),
-          before: txResult.prestamoBefore, after: null,
-        });
+          await deleteDoc(prestamoRef);
+
+          void logAudit({
+            userId: admin, action: 'delete', ref: prestamoRef,
+            before: txResult.prestamoBefore, after: null,
+          });
+        } catch (e) {
+          // si falla, se queda activo; se puede reintentar luego
+        }
       }
 
-      // Cache local
+      // ====================== Cache local + callback ======================
       if (prestamoId) {
         quotaCache[prestamoId] = {
-          cuota: Number(p?.valorCuota ?? 0) || 0,
+          cuota: Number(valorCuota ?? txResult.valorCuotaTx ?? 0) || 0,
           saldo: txResult.nuevoRestante || 0,
         };
       }
 
       setMonto('');
-      onSuccess?.(); // 👉 refresca PagosDelDia y quita del Home el cliente que ya pagó
+      onSuccess?.(); // refresca PagosDelDia y Home
     } catch (error: any) {
       // 🔌 Offline o fallo en la escritura remota → encolar en OUTBOX
       try {
@@ -427,7 +428,6 @@ export default function ModalRegistroPago({
             monto: parseFloat(montoNum.toFixed(2)),
             tz,
             operationalDate,
-            // ✅ clienteNombre top-level (además del que va en cajaPayload)
             clienteNombre: clienteNombre || 'Cliente',
             alsoCajaDiaria: true,
             cajaPayload: { tipo: 'abono' as const, clienteNombre },
@@ -438,7 +438,6 @@ export default function ModalRegistroPago({
       } catch (enqueueErr: any) {
         const msg = (enqueueErr?.message || '').toString();
         if (msg.includes('ya tiene un pago pendiente')) {
-          // ✅ Mensaje amigable cuando la validación del outbox bloquea el 2º abono
           Alert.alert('Pago ya pendiente', 'Este cliente ya tiene un pago pendiente sin enviar.');
         } else {
           Alert.alert('Error', 'No se pudo registrar el pago ni guardarlo en pendientes. Inténtalo nuevamente.');

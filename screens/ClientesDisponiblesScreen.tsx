@@ -43,6 +43,9 @@ export default function ClientesDisponiblesScreen({ route, navigation }: Props) 
   const [activosSet, setActivosSet] = useState<Set<string>>(new Set());
   const [cargando, setCargando] = useState(true);
 
+  // Collator para orden estable por nombre (acentos/ñ)
+  const coll = useMemo(() => new Intl.Collator('es', { sensitivity: 'base' }), []);
+
   // 1) Suscripción a CLIENTES del admin (en vivo) — filtrado en servidor
   useEffect(() => {
     setCargando(true);
@@ -76,7 +79,12 @@ export default function ClientesDisponiblesScreen({ route, navigation }: Props) 
 
   // 2) Suscripción a PRÉSTAMOS ACTIVOS del admin (en vivo) — filtrado en servidor
   useEffect(() => {
-    const qPrestamos = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', String(admin)));
+    // activos por saldo pendiente
+    const qPrestamos = query(
+      collectionGroup(db, 'prestamos'),
+      where('creadoPor', '==', String(admin)),
+      where('restante', '>', 0)
+    );
     const unsub = onSnapshot(
       qPrestamos,
       (snap) => {
@@ -99,9 +107,9 @@ export default function ClientesDisponiblesScreen({ route, navigation }: Props) 
   const clientesDisponibles = useMemo(() => {
     if (!clientesBase.length) return [];
     const out = clientesBase.filter((c) => !activosSet.has(c.id));
-    out.sort((a, b) => a.nombre.localeCompare(b.nombre));
+    out.sort((a, b) => coll.compare(a.nombre, b.nombre));
     return out;
-  }, [clientesBase, activosSet]);
+  }, [clientesBase, activosSet, coll]);
 
   // ─────────────────────────────────────────────────────────────
   // Lista (perf)

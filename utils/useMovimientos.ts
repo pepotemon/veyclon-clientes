@@ -1,11 +1,9 @@
-// hooks/useMovimientos.ts
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   collection,
-  collectionGroup,
+  getDocs,
   query,
   where,
-  getDocs,
 } from 'firebase/firestore';
 import { db } from '../firebase/firebaseConfig';
 import { pickTZ } from '../utils/timezone';
@@ -42,34 +40,23 @@ type Result = {
   reload: () => Promise<void>;
 };
 
+// ===== Helpers =====
 function tsFromData(d: any): number {
   if (typeof d?.createdAtMs === 'number') return d.createdAtMs;
   if (typeof d?.createdAt?.seconds === 'number') return d.createdAt.seconds * 1000;
-  if (typeof d?.fechaInicio?.seconds === 'number') return d.fechaInicio.seconds * 1000; // prestamos
   return 0;
 }
 
-function ymdFromAny(dateLike: any, tz: string): string | null {
-  try {
-    const dt = (() => {
-      if (!dateLike) return null;
-      if (typeof dateLike === 'number') return new Date(dateLike);
-      if (typeof dateLike?.seconds === 'number') return new Date(dateLike.seconds * 1000);
-      if (typeof dateLike?.toDate === 'function') return dateLike.toDate();
-      if (dateLike instanceof Date) return dateLike;
-      return null;
-    })();
-    if (!dt) return null;
-    // formatear en TZ -> YYYY-MM-DD
-    const parts = new Intl.DateTimeFormat('es-ES', {
-      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-    }).formatToParts(dt);
-    const y = parts.find(p => p.type === 'year')?.value ?? '0000';
-    const m = parts.find(p => p.type === 'month')?.value ?? '01';
-    const d = parts.find(p => p.type === 'day')?.value ?? '01';
-    return `${y}-${m}-${d}`;
-  } catch {
-    return null;
+function buildTiposFiltro(tipo: TipoMovimiento): string[] {
+  // 🔁 Acepta variantes legacy + canónicas
+  switch (tipo) {
+    case 'ingreso': return ['ingreso'];
+    case 'retiro': return ['retiro'];
+    case 'gastoAdmin': return ['gastoAdmin', 'gasto_admin'];
+    case 'gastoCobrador': return ['gastoCobrador', 'gasto', 'gasto_cobrador'];
+    case 'pago': return ['abono', 'pago'];
+    case 'venta': return ['prestamo', 'venta']; // “ventas” registradas en caja
+    default: return [];
   }
 }
 
@@ -79,7 +66,7 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
   const [loading, setLoading] = useState(false);
 
   const tzFallback = useMemo(() => pickTZ('America/Sao_Paulo'), []);
-  const fmtHoraFallback = useMemo(
+  const fmtHora = useMemo(
     () =>
       new Intl.DateTimeFormat('pt-BR', {
         hour: '2-digit',
@@ -103,21 +90,16 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         timeZone: tz,
       }).format(new Date(ts));
 
-      // nombre de cliente (con varios fallbacks)
+      const tCanon = canonicalTipo(data?.tipo);
       const cliente: string =
         (data?.clienteNombre ??
           data?.cliente?.nombre ??
           data?.clienteName ??
           '') as string;
 
-      // Nota/concepto auxiliares
+      let title = 'Movimiento';
       let nota: string | null = (data?.nota ?? '').toString().trim() || null;
       const concepto: string = (data?.concepto ?? '').toString().trim();
-
-      // 👇 Tipo canónico SIEMPRE
-      const tCanon = canonicalTipo(data?.tipo);
-
-      let title = 'Movimiento';
 
       if (tCanon === 'ingreso') {
         title = cliente?.trim() || 'Ingreso';
@@ -126,7 +108,6 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         title = cliente?.trim() || 'Retiro';
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'gasto_admin') {
-        // Gastos suelen NO tener cliente => mantenemos categoría o fallback
         title = cliente?.trim() || (data?.categoria ?? '').toString().trim() || 'Gasto admin';
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
@@ -135,8 +116,10 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'abono') {
-        // ✅ SOLO nombre (sin “Pago — ”)
-        title = cliente?.trim() || 'Cliente';
+        title = cliente?.trim() || 'Cliente'; // ✅ sin prefijos
+        if (!nota && concepto) nota = concepto;
+      } else if (tCanon === 'prestamo') {
+        title = cliente?.trim() || 'Préstamo'; // ✅ ventas desde caja
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'apertura') {
         title = 'Apertura';
@@ -160,205 +143,41 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      // 1) Tipos que salen de cajaDiaria (simple)
-      if (tipo === 'ingreso' || tipo === 'retiro') {
-        const qy = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', tipo)
-        );
-        const snap = await getDocs(qy);
-        const arr = snap.docs.map(d => mapDocToItem(d.id, d.data()));
-        arr.sort(
-          (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
-        );
-        setItems(arr);
-        setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
-        return;
-      }
+      // ✅ Exclusivo de cajaDiaria + filtros baratos
+      const tipos = buildTiposFiltro(tipo);
+      // Si ‘tipo’ mapea a varios, haremos varias queries pequeñas y uniremos
+      const queries = tipos.length <= 1
+        ? [
+            query(
+              collection(db, 'cajaDiaria'),
+              where('admin', '==', admin),
+              where('operationalDate', '==', fecha),
+              where('tipo', '==', tipos[0] ?? tipo) // por si faltara mapeo
+            ),
+          ]
+        : tipos.map((t) =>
+            query(
+              collection(db, 'cajaDiaria'),
+              where('admin', '==', admin),
+              where('operationalDate', '==', fecha),
+              where('tipo', '==', t)
+            )
+          );
 
-      // 1.b) Gasto Admin: soporta 'gastoAdmin' (actual) y 'gasto_admin' (legacy)
-      if (tipo === 'gastoAdmin') {
-        const qNew = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', 'gastoAdmin')
-        );
-        const qLegacy = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', 'gasto_admin')
-        );
-        const [s1, s2] = await Promise.all([getDocs(qNew), getDocs(qLegacy)]);
-        const arr = [...s1.docs, ...s2.docs].map(d => mapDocToItem(d.id, d.data()));
-        arr.sort(
-          (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
-        );
-        setItems(arr);
-        setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
-        return;
-      }
+      const snaps = await Promise.all(queries.map((q) => getDocs(q)));
+      const arr = snaps
+        .flatMap((s) => s.docs)
+        .map((d) => mapDocToItem(d.id, d.data()));
 
-      // 1.c) Gasto Cobrador: soporta 'gastoCobrador' (actual) y 'gasto'/'gasto_cobrador' (legacy)
-      if (tipo === 'gastoCobrador') {
-        const qNew = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', 'gastoCobrador')
-        );
-        const qLegacy1 = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', 'gasto')
-        );
-        const qLegacy2 = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', 'gasto_cobrador')
-        );
+      // Orden local por createdAtMs/createdAt (desc)
+      arr.sort(
+        (a, b) =>
+          (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
+          (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
+      );
 
-        const [s1, s2, s3] = await Promise.all([getDocs(qNew), getDocs(qLegacy1), getDocs(qLegacy2)]);
-        const arr = [...s1.docs, ...s2.docs, ...s3.docs].map(d => mapDocToItem(d.id, d.data()));
-        arr.sort(
-          (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
-        );
-        setItems(arr);
-        setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
-        return;
-      }
-
-      // 2) Pagos: incluir 'abono' + 'pago'
-      if (tipo === 'pago') {
-        const qAbono = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', 'abono')
-        );
-        const qPago = query(
-          collection(db, 'cajaDiaria'),
-          where('admin', '==', admin),
-          where('operationalDate', '==', fecha),
-          where('tipo', '==', 'pago')
-        );
-        const [s1, s2] = await Promise.all([getDocs(qAbono), getDocs(qPago)]);
-        const arr = [...s1.docs, ...s2.docs].map(d => mapDocToItem(d.id, d.data()));
-        arr.sort(
-          (a, b) =>
-            (b.raw?.createdAtMs ?? b.raw?.createdAt?.seconds ?? 0) -
-            (a.raw?.createdAtMs ?? a.raw?.createdAt?.seconds ?? 0)
-        );
-        setItems(arr);
-        setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
-        return;
-      }
-
-      // 3) Ventas (préstamos creados hoy por el admin)
-      if (tipo === 'venta') {
-        // ✅ Camino rápido: filtrar por createdDate (YYYY-MM-DD) + creadoPor
-        //    (necesita índice compuesto en collectionGroup 'prestamos')
-        const qPrest = query(
-          collectionGroup(db, 'prestamos'),
-          where('creadoPor', '==', admin),
-          where('createdDate', '==', fecha)
-        );
-        let snap = await getDocs(qPrest);
-
-        // 🔁 Fallback: si el índice aún no está o hay docs viejos sin createdDate,
-        //    usa tu lógica previa (consulta amplia + filtro en memoria).
-        if (snap.empty) {
-          const qWide = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin));
-          snap = await getDocs(qWide);
-
-          const filtered = snap.docs.filter(d => {
-            const data: any = d.data();
-            const tz = data?.tz || tzFallback;
-            const ymd = ymdFromAny(
-              typeof data?.createdAtMs === 'number'
-                ? data.createdAtMs
-                : (data?.createdAt ?? data?.fechaInicio),
-              tz
-            );
-            return ymd === fecha;
-          });
-
-          const arr = filtered.map((d) => {
-            const data: any = d.data();
-            const tz = data?.tz || tzFallback;
-            const ts = tsFromData(data) || Date.now();
-            const hora = new Intl.DateTimeFormat('pt-BR', {
-              hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: tz,
-            }).format(new Date(ts));
-
-            const cliente: string =
-              (data?.clienteNombre ??
-                data?.cliente?.nombre ??
-                data?.clienteName ??
-                '') as string;
-            const concepto: string = (data?.concepto ?? data?.producto ?? '').toString().trim();
-
-            const monto = Number(data?.valorNeto ?? data?.capital ?? 0);
-            return {
-              id: d.id,
-              // ✅ SOLO nombre (sin “Venta — ”). Fallback genérico si no hay nombre.
-              title: cliente?.trim() || 'Préstamo',
-              monto: Number.isFinite(monto) ? monto : 0,
-              hora,
-              nota: concepto || null,
-              raw: data,
-            };
-          });
-
-          arr.sort((a, b) => tsFromData(b.raw) - tsFromData(a.raw));
-          setItems(arr);
-          setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
-          return;
-        }
-
-        // 🚀 Camino rápido (createdDate)
-        const arr: MovimientoItem[] = snap.docs.map((d) => {
-          const data: any = d.data();
-          const tz = data?.tz || tzFallback;
-          const ts = tsFromData(data) || Date.now();
-          const hora = new Intl.DateTimeFormat('pt-BR', {
-            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: tz,
-          }).format(new Date(ts));
-
-          const cliente: string =
-            (data?.clienteNombre ??
-              data?.cliente?.nombre ??
-              data?.clienteName ??
-              '') as string;
-          const concepto: string = (data?.concepto ?? data?.producto ?? '').toString().trim();
-
-          const monto = Number(data?.valorNeto ?? data?.capital ?? 0);
-          return {
-            id: d.id,
-            title: cliente?.trim() || 'Préstamo', // 👈 sin prefijos, como acordamos
-            monto: Number.isFinite(monto) ? monto : 0,
-            hora,
-            nota: concepto || null,
-            raw: data,
-          };
-        });
-
-        arr.sort((a, b) => tsFromData(b.raw) - tsFromData(a.raw));
-        setItems(arr);
-        setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
-        return;
-      }
+      setItems(arr);
+      setTotal(arr.reduce((acc, it) => acc + (Number(it.monto) || 0), 0));
     } catch (e) {
       console.warn('[useMovimientos] error:', e);
       setItems([]);
@@ -366,7 +185,7 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
     } finally {
       setLoading(false);
     }
-  }, [admin, fecha, tipo, mapDocToItem, tzFallback]);
+  }, [admin, fecha, tipo, mapDocToItem]);
 
   useEffect(() => {
     void reload();
@@ -375,5 +194,4 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
   return { items, total, loading, reload };
 }
 
-// ✅ Export nombrado y default
 export default useMovimientos;

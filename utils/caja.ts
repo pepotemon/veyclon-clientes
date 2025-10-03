@@ -13,7 +13,7 @@ import {
 import { db } from '../firebase/firebaseConfig';
 import { logAudit, pick } from './auditLogs';
 
-// 👇 Fase 2: tipos e intérprete canónico
+// 👇 Intérprete canónico (mapea: pago->abono, venta->retiro, gasto/gastoAdmin->gasto_* ...)
 import {
   canonicalTipo,
   type MovimientoTipo,
@@ -23,7 +23,13 @@ import {
 import { pickTZ, normYYYYMMDD } from './timezone';
 
 // ===== Tipos =====
-type LegacyMovimientoTipo = 'gasto' | 'gastoAdmin' | 'pago' | 'aperturaAuto';
+type LegacyMovimientoTipo =
+  | 'gasto'
+  | 'gastoAdmin'
+  | 'pago'
+  | 'aperturaAuto'
+  | 'venta'; // <- alias legacy para "retiro"
+
 type AnyMovimientoTipo = MovimientoTipo | LegacyMovimientoTipo;
 
 export type MovimientoCaja = {
@@ -60,18 +66,21 @@ function stripUndefined<T extends Record<string, any>>(obj: T): T {
   return out;
 }
 
-function sanitizeInput(_admin: string, data: {
-  tipo: AnyMovimientoTipo;
-  admin?: string;
-  monto: any;
-  operationalDate: any;
-  tz?: string | null;
-  nota?: string | null;
-  categoria?: string;
-  meta?: Record<string, any>;
-  source?: MovimientoCaja['source'];
-}) {
-  // canonicalTipo DEBE mapear: pago->abono, venta->retiro, gasto_*->gasto(_admin/_cobrador).
+function sanitizeInput(
+  _admin: string,
+  data: {
+    tipo: AnyMovimientoTipo;
+    admin?: string;
+    monto: any;
+    operationalDate: any;
+    tz?: string | null;
+    nota?: string | null;
+    categoria?: string;
+    meta?: Record<string, any>;
+    source?: MovimientoCaja['source'];
+  }
+) {
+  // canonicalTipo DEBE mapear: pago->abono, venta->retiro, gasto/gastoAdmin->gasto_*.
   const tip = canonicalTipo(String(data.tipo));
   if (!tip) throw new Error(`Tipo de movimiento inválido: ${String(data.tipo)}`);
 
@@ -87,7 +96,7 @@ function sanitizeInput(_admin: string, data: {
   const admin = (data.admin || _admin || '').trim();
   if (!admin) throw new Error('admin requerido');
 
-  const nota = (data.nota ?? '').toString().trim() || null;               // null OK en Firestore
+  const nota = (data.nota ?? '').toString().trim() || null;                // null OK en Firestore
   const categoria = (data.categoria ?? '').toString().trim() || undefined; // undefined será removido
   const meta = data.meta && typeof data.meta === 'object' ? data.meta : undefined;
   const source: MovimientoCaja['source'] = data.source || 'manual';
@@ -99,22 +108,21 @@ function sanitizeInput(_admin: string, data: {
 /** Escribe un movimiento en 'cajaDiaria'. Acepta tipos legacy y los mapea a canónicos. */
 export async function addMovimiento(
   _admin: string,
-  data: Omit<MovimientoCaja, 'tipo' | 'admin' | 'createdAt' | 'createdAtMs' | 'source'> &
-        {
-          tipo: AnyMovimientoTipo;
-          admin?: string;
-          source?: MovimientoCaja['source'];
-          // top-level opcionales:
-          clienteNombre?: string;
-          clienteId?: string;
-          prestamoId?: string;
-        }
+  data: Omit<MovimientoCaja, 'tipo' | 'admin' | 'createdAt' | 'createdAtMs' | 'source'> & {
+    tipo: AnyMovimientoTipo;
+    admin?: string;
+    source?: MovimientoCaja['source'];
+    // top-level opcionales:
+    clienteNombre?: string;
+    clienteId?: string;
+    prestamoId?: string;
+  }
 ) {
   const refCol = collection(db, 'cajaDiaria');
   const s = sanitizeInput(_admin, data);
 
   const payload = {
-    tipo: s.tip,                 // 👈 siempre canónico
+    tipo: s.tip, // 👈 siempre canónico
     admin: s.admin,
     monto: s.monto,
     operationalDate: s.operationalDate,
@@ -140,8 +148,18 @@ export async function addMovimiento(
     ref: doc(db, 'cajaDiaria', docRef.id),
     before: null,
     after: pick(payload, [
-      'tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source',
-      'clienteNombre','clienteId','prestamoId'
+      'tipo',
+      'admin',
+      'monto',
+      'operationalDate',
+      'tz',
+      'nota',
+      'categoria',
+      'meta',
+      'source',
+      'clienteNombre',
+      'clienteId',
+      'prestamoId',
     ]),
   });
 
@@ -157,16 +175,15 @@ export async function addMovimiento(
  */
 export async function addMovimientoIdempotente(
   _admin: string,
-  data: Omit<MovimientoCaja, 'tipo' | 'admin' | 'createdAt' | 'createdAtMs' | 'source'> &
-        {
-          tipo: AnyMovimientoTipo;
-          admin?: string;
-          source?: MovimientoCaja['source'];
-          // top-level opcionales:
-          clienteNombre?: string;
-          clienteId?: string;
-          prestamoId?: string;
-        },
+  data: Omit<MovimientoCaja, 'tipo' | 'admin' | 'createdAt' | 'createdAtMs' | 'source'> & {
+    tipo: AnyMovimientoTipo;
+    admin?: string;
+    source?: MovimientoCaja['source'];
+    // top-level opcionales:
+    clienteNombre?: string;
+    clienteId?: string;
+    prestamoId?: string;
+  },
   docId: string
 ): Promise<{ created: boolean; id: string }> {
   const ref = doc(db, 'cajaDiaria', docId);
@@ -178,7 +195,7 @@ export async function addMovimientoIdempotente(
   const s = sanitizeInput(_admin, data);
 
   const payload = {
-    tipo: s.tip,                 // 👈 canónico
+    tipo: s.tip, // 👈 canónico
     admin: s.admin,
     monto: s.monto,
     operationalDate: s.operationalDate,
@@ -204,8 +221,18 @@ export async function addMovimientoIdempotente(
     ref,
     before: null,
     after: pick(payload, [
-      'tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source',
-      'clienteNombre','clienteId','prestamoId'
+      'tipo',
+      'admin',
+      'monto',
+      'operationalDate',
+      'tz',
+      'nota',
+      'categoria',
+      'meta',
+      'source',
+      'clienteNombre',
+      'clienteId',
+      'prestamoId',
     ]),
   });
 
@@ -233,9 +260,16 @@ export async function recordAbonoFromOutbox(params: {
   tipo?: 'pago' | 'abono';
 }): Promise<{ created: boolean; id: string }> {
   const {
-    admin, outboxId, monto, operationalDate, tz,
-    clienteNombre, clienteId, prestamoId,
-    meta, tipo = 'abono'
+    admin,
+    outboxId,
+    monto,
+    operationalDate,
+    tz,
+    clienteNombre,
+    clienteId,
+    prestamoId,
+    meta,
+    tipo = 'abono',
   } = params;
 
   // Mapear a canónico + reutilizar saneo
@@ -252,7 +286,7 @@ export async function recordAbonoFromOutbox(params: {
   return addMovimientoIdempotente(
     adm,
     {
-      tipo: tip,        // 'abono' canónico
+      tipo: tip, // 'abono' canónico
       monto: m,
       operationalDate: od,
       tz: tzOk,
@@ -280,10 +314,10 @@ export async function fetchGastosAdminDelDia(admin: string, hoy: string) {
   );
   const snap = await getDocs(qy);
 
-  const rows = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) })) as MovimientoCaja[];
+  const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as MovimientoCaja[];
   return rows
-    .map(r => ({ ...r, tipo: (canonicalTipo((r as any).tipo) || (r as any).tipo) as MovimientoTipo }))
-    .filter(r => canonicalTipo((r as any).tipo) === 'gasto_admin');
+    .map((r) => ({ ...r, tipo: (canonicalTipo((r as any).tipo) || (r as any).tipo) as MovimientoTipo }))
+    .filter((r) => canonicalTipo((r as any).tipo) === 'gasto_admin');
 }
 
 /** Gastos (del cobrador) del día desde 'cajaDiaria' para un admin */
@@ -295,8 +329,8 @@ export async function fetchGastosDelCobradorDelDia(admin: string, hoy: string) {
   );
   const snap = await getDocs(qy);
 
-  const rows = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) })) as MovimientoCaja[];
+  const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as MovimientoCaja[];
   return rows
-    .map(r => ({ ...r, tipo: (canonicalTipo((r as any).tipo) || (r as any).tipo) as MovimientoTipo }))
-    .filter(r => canonicalTipo((r as any).tipo) === 'gasto_cobrador');
+    .map((r) => ({ ...r, tipo: (canonicalTipo((r as any).tipo) || (r as any).tipo) as MovimientoTipo }))
+    .filter((r) => canonicalTipo((r as any).tipo) === 'gasto_cobrador');
 }

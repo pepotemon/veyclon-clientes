@@ -21,7 +21,15 @@ import {
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { db } from '../firebase/firebaseConfig';
-import { getDocs, collection, collectionGroup, onSnapshot, doc } from 'firebase/firestore';
+import {
+  getDocs,
+  collection,
+  collectionGroup,
+  onSnapshot,
+  doc,
+  query,
+  where,
+} from 'firebase/firestore';
 import ModalRegistroPago from '../components/ModalRegistroPago';
 import InstantOpcionesCliente from '../components/InstantOpcionesCliente';
 import { RootStackParamList } from '../App';
@@ -31,25 +39,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '../theme/ThemeProvider';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// ✅ Solo cuotas vencidas
+// ✅ Solo cuotas vencidas / adelantadas / al día
 import { computeQuotaBadge } from '../utils/alerts';
-
-// 👇 orden de ruta
-import { ensureRouteOrder, loadRutaOrder } from '../utils/ruta';
 
 // 👇 evento de outbox para refrescar UI tras flush
 import { OUTBOX_FLUSHED } from '../utils/outbox';
-
-type Cliente = {
-  id: string;
-  alias?: string;
-  direccion1?: string;
-  direccion2?: string;
-  telefono1?: string;
-  telefono2?: string;
-  genero?: 'M' | 'F' | 'O';
-  routeOrder?: number;
-};
 
 type Abono = {
   monto: number;
@@ -66,14 +60,18 @@ type Prestamo = {
   cobradorId: string;
   montoTotal: number;
   restante: number;
-  abonos: Abono[];
+  abonos: Abono[]; // legado (fallback UX)
   totalPrestamo: number;
   creadoPor: string;
   valorCuota: number;
   modalidad?: string;
+
+  // denormalizados del préstamo (NO join con /clientes)
   clienteAlias?: string;
   clienteDireccion1?: string;
   clienteDireccion2?: string;
+  clienteTelefono1?: string;
+
   tz?: string;
 
   // (opcionales para "Nuevo")
@@ -89,12 +87,16 @@ type Prestamo = {
   pausas?: { desde: string; hasta: string; motivo?: string }[];
   modoAtraso?: 'porPresencia' | 'porCuota';
 
-  // 👇 añadido: para detectar visita de hoy cuando el abono viene de subcolección (outbox)
+  // para detectar visita de hoy cuando el abono viene de subcolección (outbox)
   lastAbonoAt?: any;
+
+  // ordenamiento barato persistido en doc
+  routeOrder?: number;
+  proximoVencimiento?: string; // 'YYYY-MM-DD' si existe
+  status?: 'activo' | 'cerrado' | 'pausado';
 };
 
 type Filtro = 'todos' | 'pendientes' | 'visitados';
-type ItemRow = Prestamo & { cliente?: Cliente };
 
 export default function PagosDiariosScreen({ route }: any) {
   const admin = route?.params?.admin ?? 'AdminDemo';
@@ -102,21 +104,16 @@ export default function PagosDiariosScreen({ route }: any) {
   const insets = useSafeAreaInsets();
   const { palette, isDark } = useAppTheme();
 
-  const [clientes, setClientes] = useState<Cliente[]>([]);
   const [prestamos, setPrestamos] = useState<Prestamo[]>([]);
   const [cargando, setCargando] = useState(true);
 
   const [busqueda, setBusqueda] = useState('');
-  const [prestamoSeleccionado, setPrestamoSeleccionado] = useState<Prestamo | null>(null);
   const [opcionesVisible, setOpcionesVisible] = useState(false);
   const [modalPagoVisible, setModalPagoVisible] = useState(false);
 
   const [filtro, setFiltro] = useState<Filtro>('todos');
   const [dayTick, setDayTick] = useState(0);
   const [mensajeExito, setMensajeExito] = useState('');
-
-  // 👇 orden guardado en AsyncStorage por admin
-  const [routeOrderIds, setRouteOrderIds] = useState<string[]>([]);
 
   // 👇 pulso para forzar re-render al flush del outbox (snapshot igual traerá cambios)
   const [outboxPulse, setOutboxPulse] = useState(0);
@@ -176,7 +173,7 @@ export default function PagosDiariosScreen({ route }: any) {
   // ====================
 
   // ====== Inercia: capturar tap y abrir pago directo ======
-  const flatRef = useRef<FlatList<ItemRow>>(null);
+  const flatRef = useRef<FlatList<Prestamo>>(null);
   const lastOffsetRef = useRef(0);
   const momentumRef = useRef(false);
   const justHandledCaptureRef = useRef(false);
@@ -185,16 +182,19 @@ export default function PagosDiariosScreen({ route }: any) {
   const SEP_HEIGHT = 8;
   const ROW_STRIDE = ROW_HEIGHT + SEP_HEIGHT;
 
-  const filasFiltradasRef = useRef<ItemRow[]>([]);
+  const filasFiltradasRef = useRef<Prestamo[]>([]);
+
+  // ✅ Selección con ref (no re-renderiza toda la lista)
+  const selectedRef = useRef<Prestamo | null>(null);
 
   const openPagoDirecto = useCallback((item: Prestamo) => {
-    setPrestamoSeleccionado(item);
+    selectedRef.current = item;
     setOpcionesVisible(false);
     setModalPagoVisible(true);
   }, []);
 
   const openOpciones = useCallback((item: Prestamo) => {
-    setPrestamoSeleccionado(item);
+    selectedRef.current = item;
     setOpcionesVisible(true);
   }, []);
 
@@ -268,24 +268,10 @@ export default function PagosDiariosScreen({ route }: any) {
   // 👉 escuchar flush del outbox (cuando un abono/no_pago/venta/mov se sube)
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener(OUTBOX_FLUSHED, () => {
-      // no necesitamos refetchear manual: el onSnapshot disparará
-      // forzamos un rerender suave para que la UI responda instantáneamente
       setOutboxPulse((n) => n + 1);
     });
     return () => sub.remove();
   }, []);
-
-  // recargar orden cuando gana foco
-  useFocusEffect(
-    useCallback(() => {
-      let alive = true;
-      (async () => {
-        const ids = await loadRutaOrder(admin);
-        if (alive) setRouteOrderIds(ids);
-      })();
-      return () => { alive = false; };
-    }, [admin])
-  );
 
   const hoySession = useMemo(() => todayInTZ(tzSession), [tzSession, dayTick, outboxPulse]);
 
@@ -312,115 +298,120 @@ export default function PagosDiariosScreen({ route }: any) {
     [tzSession]
   );
 
-  // Carga de clientes + stream de préstamos
+  // ======== Stream de préstamos (SIN índices compuestos) — filtrado en cliente ========
   useEffect(() => {
-    let unsub: any;
-    const cargar = async () => {
+    let unsub: undefined | (() => void);
+
+    const suscribir = async () => {
       try {
         setCargando(true);
 
-        // Asegura routeOrder
-        try {
-          await ensureRouteOrder(admin);
-        } catch (e) {
-          console.warn('[ensureRouteOrder]', e);
-        }
+        // 🔸 Solo filtramos por admin en servidor; el resto en cliente
+        const qPrestamos = query(
+          collectionGroup(db, 'prestamos'),
+          where('creadoPor', '==', admin)
+        );
 
-        const snapC = await getDocs(collection(db, 'clientes'));
-        const listaC = snapC.docs.map((d) => {
-          const data = d.data() as any;
-          return {
-            id: d.id,
-            alias: data?.alias,
-            direccion1: data?.direccion1,
-            direccion2: data?.direccion2,
-            telefono1: data?.telefono1,
-            telefono2: data?.telefono2,
-            genero: data?.genero,
-            routeOrder: typeof data?.routeOrder === 'number' ? data.routeOrder : undefined,
-          } as Cliente;
-        });
-        setClientes(listaC);
+        unsub = onSnapshot(
+          qPrestamos,
+          (sg) => {
+            const lista: Prestamo[] = [];
+            sg.forEach((docSnap) => {
+              const data = docSnap.data() as any;
 
-        unsub = onSnapshot(collectionGroup(db, 'prestamos'), (sg) => {
-          const lista: Prestamo[] = [];
-          sg.forEach((docSnap) => {
-            const data = docSnap.data() as any;
-            const cliente = listaC.find((c) => c.id === data.clienteId);
-            lista.push({
-              id: docSnap.id,
-              concepto: (data.concepto ?? '').trim() || 'Sin concepto',
-              cobradorId: data.cobradorId ?? '',
-              montoTotal: data.montoTotal ?? data.totalPrestamo ?? 0,
-              totalPrestamo: data.totalPrestamo ?? data.montoTotal ?? 0,
-              restante: data.restante ?? 0,
-              abonos: Array.isArray(data.abonos) ? data.abonos : [],
-              creadoPor: data.creadoPor ?? '',
-              valorCuota: data.valorCuota ?? 0,
-              modalidad: data.modalidad ?? 'Diaria',
-              clienteId: data.clienteId,
-              clienteAlias: cliente?.alias ?? '',
-              clienteDireccion1: cliente?.direccion1 ?? '',
-              clienteDireccion2: cliente?.direccion2 ?? '',
-              tz: data.tz || 'America/Sao_Paulo',
+              lista.push({
+                id: docSnap.id,
+                concepto: (data.concepto ?? '').trim() || 'Sin concepto',
+                cobradorId: data.cobradorId ?? '',
+                montoTotal: data.montoTotal ?? data.totalPrestamo ?? 0,
+                totalPrestamo: data.totalPrestamo ?? data.montoTotal ?? 0,
+                restante: data.restante ?? 0,
+                abonos: Array.isArray(data.abonos) ? data.abonos : [],
+                creadoPor: data.creadoPor ?? '',
+                valorCuota: data.valorCuota ?? 0,
+                modalidad: data.modalidad ?? 'Diaria',
+                clienteId: data.clienteId,
 
-              // opcionales para "nuevo"
-              creadoEn: (data as any)?.creadoEn,
-              createdAtMs: (data as any)?.createdAtMs,
-              fechaInicio: (data as any)?.fechaInicio,
+                // denormalizados (NO join)
+                clienteAlias: data.clienteAlias ?? data.clienteNombre ?? '',
+                clienteDireccion1: data.clienteDireccion1 ?? '',
+                clienteDireccion2: data.clienteDireccion2 ?? '',
+                clienteTelefono1: data.clienteTelefono1 ?? '',
 
-              // cálculo robusto
-              permitirAdelantar: data.permitirAdelantar,
-              cuotas: data.cuotas,
-              diasHabiles: data.diasHabiles,
-              feriados: data.feriados,
-              pausas: data.pausas,
-              modoAtraso: data.modoAtraso,
+                tz: data.tz || 'America/Sao_Paulo',
 
-              // 👇 NUEVO: viene del reenviador de outbox
-              lastAbonoAt: (data as any)?.lastAbonoAt,
+                // opcionales
+                creadoEn: data.creadoEn,
+                createdAtMs: data.createdAtMs,
+                fechaInicio: data.fechaInicio,
+
+                permitirAdelantar: data.permitirAdelantar,
+                cuotas: data.cuotas,
+                diasHabiles: data.diasHabiles,
+                feriados: data.feriados,
+                pausas: data.pausas,
+                modoAtraso: data.modoAtraso,
+
+                lastAbonoAt: data.lastAbonoAt,
+
+                // claves de orden baratas en el doc
+                routeOrder: typeof data.routeOrder === 'number' ? data.routeOrder : undefined,
+                proximoVencimiento: typeof data.proximoVencimiento === 'string' ? data.proximoVencimiento : undefined,
+                status: data.status,
+              });
             });
-          });
-          setPrestamos(lista);
-          setCargando(false);
-        });
+
+            setPrestamos(lista);
+            setCargando(false);
+          },
+          (err) => {
+            console.warn('[pagosDiarios] snapshot error:', err?.code || err?.message || err);
+            setPrestamos([]);
+            setCargando(false);
+          }
+        );
       } catch (e) {
-        console.error('❌ Error al cargar PagosDiarios:', e);
+        console.warn('[pagosDiarios] suscripción no disponible:', e);
         setCargando(false);
       }
     };
-    cargar();
-    return () => unsub && unsub();
+
+    suscribir();
+    return () => {
+      try { unsub && unsub(); } catch {}
+    };
   }, [admin]);
 
-  const filas: ItemRow[] = useMemo(() => {
-    const idx: Record<string, Cliente> = {};
-    for (const c of clientes) idx[c.id] = c;
-
+  // ====== Orden barato por UNA sola clave: routeOrder o proximoVencimiento; fallback: concepto ======
+  const filas: Prestamo[] = useMemo(() => {
     const BIG = 1e9;
-    const pos = new Map<string, number>(routeOrderIds.map((id, i) => [id, i]));
+    const normDate = (s?: string) => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : '9999-12-31');
 
-    return prestamos
-      .filter((p) => p.creadoPor === admin)
-      .map((p) => ({ ...p, cliente: idx[p.clienteId || ''] }))
+    return [...prestamos]
+      // 🔸 Filtrado en cliente para evitar índice compuesto:
+      //   - del admin
+      //   - status 'activo' (legacy: si no hay status, lo consideramos activo)
+      //   - restante > 0
+      .filter((p) => p.creadoPor === admin && (p.status ? p.status === 'activo' : true) && Number(p.restante) > 0)
       .sort((a, b) => {
-        const pa = a.clienteId ? (pos.has(a.clienteId) ? (pos.get(a.clienteId) as number) : BIG) : BIG;
-        const pb = b.clienteId ? (pos.has(b.clienteId) ? (pos.get(b.clienteId) as number) : BIG) : BIG;
-        if (pa !== pb) return pa - pb;
-
-        const ra = typeof a.cliente?.routeOrder === 'number' ? a.cliente!.routeOrder! : BIG;
-        const rb = typeof b.cliente?.routeOrder === 'number' ? b.cliente!.routeOrder! : BIG;
+        const ra = typeof a.routeOrder === 'number' ? a.routeOrder : BIG;
+        const rb = typeof b.routeOrder === 'number' ? b.routeOrder : BIG;
         if (ra !== rb) return ra - rb;
+
+        const da = normDate(a.proximoVencimiento);
+        const db = normDate(b.proximoVencimiento);
+        if (da !== db) return da < db ? -1 : 1;
+
         return (a.concepto || '').localeCompare(b.concepto || '');
       });
-  }, [clientes, prestamos, admin, routeOrderIds, outboxPulse]);
+  }, [prestamos, admin, outboxPulse]);
 
+  // ====== Búsqueda ligera sobre campos denormalizados ======
   const filasBuscadas = useMemo(() => {
     const q = busqueda.trim().toLowerCase();
     if (!q) return filas;
     return filas.filter((x) => {
-      const c = x.cliente;
-      const hay = [x.concepto, c?.alias, c?.direccion1, c?.direccion2, x.clienteId]
+      const hay = [x.concepto, x.clienteAlias, x.clienteDireccion1, x.clienteDireccion2, x.clienteTelefono1, x.clienteId]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
@@ -439,30 +430,23 @@ export default function PagosDiariosScreen({ route }: any) {
   }, [filasFiltradas]);
 
   const abrirModalPago = useCallback(() => {
-    if (!prestamoSeleccionado?.clienteId) {
+    const sel = selectedRef.current;
+    if (!sel?.clienteId) {
       Alert.alert('Error', 'Este préstamo no tiene cliente asignado');
       return;
     }
     setOpcionesVisible(false);
     setModalPagoVisible(true);
-  }, [prestamoSeleccionado]);
+  }, []);
 
   const mostrarMensajeExito = (mensaje: string) => {
     setMensajeExito(mensaje);
     setTimeout(() => setMensajeExito(''), 2500);
   };
 
-  const avatarFor = (c?: Cliente) => {
-    const color = palette.softText;
-    const g = ((c?.genero ?? '') + '').trim().toLowerCase();
-    if (g.startsWith('f')) return <Ionicons name="woman" size={28} color={color} />;
-    if (g.startsWith('m')) return <Ionicons name="man" size={28} color={color} />;
-    return <Ionicons name="person" size={28} color={color} />;
-  };
-
-  const keyExtractor = useCallback((it: ItemRow) => it.id, []);
+  const keyExtractor = useCallback((it: Prestamo) => it.id, []);
   const getItemLayout = useCallback(
-    (_data: ArrayLike<ItemRow> | null | undefined, index: number) => ({
+    (_data: ArrayLike<Prestamo> | null | undefined, index: number) => ({
       length: ROW_HEIGHT,
       offset: index * (ROW_HEIGHT + SEP_HEIGHT),
       index,
@@ -470,146 +454,160 @@ export default function PagosDiariosScreen({ route }: any) {
     []
   );
 
-  const renderItem: ListRenderItem<ItemRow> = useCallback(
-    ({ item }) => {
-      const c = item.cliente;
-      const visitado = esVisitadoHoy(item);
-      const esNuevo = !visitado && esNuevoHoyOPas48h(item);
+  // ===== Fila memoizada =====
+  const RowItem = React.memo(function RowItem({
+    item,
+  }: {
+    item: Prestamo;
+  }) {
+    const visitado = esVisitadoHoy(item);
+    const esNuevo = !visitado && esNuevoHoyOPas48h(item);
 
-      const qbRaw = computeQuotaBadge(item);
-      let quotaLabel = qbRaw.label;
+    // ✅ memo del badge para no recalcular en renders globales
+    const qbRaw = useMemo(
+      () => computeQuotaBadge(item),
+      [item.id, item.valorCuota, item.restante, item.lastAbonoAt, (item.abonos || []).length]
+    );
 
-      // compactar a +N
-      const mV = qbRaw.label.match(/^Cuota(?:s)?\s+vencida(?:s)?:\s*(\d+)/i);
-      const mA = qbRaw.label.match(/^Cuota(?:s)?\s+adelantada(?:s)?:\s*(\d+)/i);
-      if (mV) quotaLabel = `+${mV[1]}`;
-      else if (mA) quotaLabel = `+${mA[1]}`;
-      else if (/^Cuotas al día$/i.test(qbRaw.label)) quotaLabel = 'Al día';
+    let quotaLabel = qbRaw.label;
+    const mV = qbRaw.label.match(/^Cuota(?:s)?\s+vencida(?:s)?:\s*(\d+)/i);
+    const mA = qbRaw.label.match(/^Cuota(?:s)?\s+adelantada(?:s)?:\s*(\d+)/i);
+    if (mV) quotaLabel = `+${mV[1]}`;
+    else if (mA) quotaLabel = `+${mA[1]}`;
+    else if (/^Cuotas al día$/i.test(qbRaw.label)) quotaLabel = 'Al día';
 
-      return (
-        <TouchableOpacity
-          activeOpacity={0.85}
-          onPressIn={() => Keyboard.dismiss()}
-          onPress={() => {
-            if (justHandledCaptureRef.current) return;
-            openPagoDirecto(item);
-          }}
-          onLongPress={() => openOpciones(item)}
-          delayLongPress={220}
+    return (
+      <TouchableOpacity
+        activeOpacity={0.85}
+        onPressIn={() => Keyboard.dismiss()}
+        onPress={() => {
+          if (justHandledCaptureRef.current) return;
+          openPagoDirecto(item);
+        }}
+        onLongPress={() => openOpciones(item)}
+        delayLongPress={220}
+      >
+        <View
+          style={[
+            styles.card,
+            {
+              backgroundColor: palette.cardBg,
+              shadowColor: palette.text,
+              borderColor: palette.cardBorder,
+            },
+            visitado && {
+              borderLeftWidth: 4,
+              borderLeftColor: palette.accent,
+              backgroundColor: isDark ? palette.kpiTrack : '#F1FAF2',
+            },
+            !visitado && esNuevo && {
+              borderLeftWidth: 4,
+              borderLeftColor: '#1E88E5',
+              backgroundColor: isDark ? '#0E2436' : '#E3F2FD',
+            },
+          ]}
         >
-          <View
-            style={[
-              styles.card,
-              {
-                backgroundColor: palette.cardBg,
-                shadowColor: palette.text,
-                borderColor: palette.cardBorder,
-              },
-              visitado && {
-                borderLeftWidth: 4,
-                borderLeftColor: palette.accent,
-                backgroundColor: isDark ? palette.kpiTrack : '#F1FAF2',
-              },
-              !visitado && esNuevo && {
-                borderLeftWidth: 4,
-                borderLeftColor: '#1E88E5',
-                backgroundColor: isDark ? '#0E2436' : '#E3F2FD',
-              },
-            ]}
-          >
-            <View style={styles.left}>{avatarFor(c)}</View>
-            <View style={styles.mid}>
+          <View style={styles.left}>
+            <Ionicons name="person" size={28} color={palette.softText} />
+          </View>
+
+          <View style={styles.mid}>
+            <Text
+              style={[
+                styles.name,
+                { color: palette.text },
+                visitado && { color: palette.accent },
+              ]}
+              numberOfLines={1}
+            >
+              {item.concepto}
+              {item.clienteAlias ? (
+                <Text style={[styles.alias, { color: palette.softText }]}> ({item.clienteAlias})</Text>
+              ) : null}
+            </Text>
+
+            {!!item.clienteTelefono1 && (
+              <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+                Teléfono: {item.clienteTelefono1}
+              </Text>
+            )}
+            {!!item.clienteDireccion1 && (
+              <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+                Dirección: {item.clienteDireccion1}
+              </Text>
+            )}
+            {!!item.clienteDireccion2 && (
+              <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
+                Dirección 2: {item.clienteDireccion2}
+              </Text>
+            )}
+
+            <View style={styles.badgesRow}>
               <Text
                 style={[
-                  styles.name,
-                  { color: palette.text },
-                  visitado && { color: palette.accent },
+                  styles.badge,
+                  {
+                    backgroundColor: qbRaw.bg,
+                    color: qbRaw.text,
+                    borderWidth: StyleSheet.hairlineWidth,
+                    borderColor: qbRaw.border,
+                  },
                 ]}
-                numberOfLines={1}
               >
-                {item.concepto}
-                {c?.alias ? (
-                  <Text style={[styles.alias, { color: palette.softText }]}> ({c.alias})</Text>
-                ) : null}
+                {quotaLabel}
               </Text>
-              {c?.telefono1 ? (
-                <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
-                  Teléfono: {c.telefono1}
-                </Text>
-              ) : null}
-              {c?.direccion1 ? (
-                <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
-                  Dirección: {c.direccion1}
-                </Text>
-              ) : null}
-              {c?.direccion2 ? (
-                <Text style={[styles.meta, { color: palette.softText }]} numberOfLines={1}>
-                  Dirección 2: {c.direccion2}
-                </Text>
-              ) : null}
 
-              <View style={styles.badgesRow}>
+              {visitado ? (
                 <Text
                   style={[
                     styles.badge,
-                    {
-                      backgroundColor: qbRaw.bg,
-                      color: qbRaw.text,
-                      borderWidth: StyleSheet.hairlineWidth,
-                      borderColor: qbRaw.border,
-                    },
+                    { backgroundColor: isDark ? palette.topBg : '#E8F5E9', color: palette.accent },
                   ]}
                 >
-                  {quotaLabel}
+                  Visitado hoy
                 </Text>
-
-                {visitado ? (
-                  <Text
-                    style={[
-                      styles.badge,
-                      { backgroundColor: isDark ? palette.topBg : '#E8F5E9', color: palette.accent },
-                    ]}
-                  >
-                    Visitado hoy
-                  </Text>
-                ) : (
-                  <Text
-                    style={[
-                      styles.badge,
-                      { backgroundColor: isDark ? '#3a2f14' : '#FFF8E1', color: isDark ? '#ffb74d' : '#e65100' },
-                    ]}
-                  >
-                    Pendiente
-                  </Text>
-                )}
-                {!visitado && esNuevo && (
-                  <Text
-                    style={[
-                      styles.badge,
-                      { backgroundColor: isDark ? '#0E2436' : '#E3F2FD', color: '#1565C0' },
-                    ]}
-                  >
-                    Nuevo
-                  </Text>
-                )}
-                <Text style={[styles.badge, { backgroundColor: palette.kpiTrack, color: palette.softText }]}>
-                  {item.modalidad || 'Diaria'}
+              ) : (
+                <Text
+                  style={[
+                    styles.badge,
+                    { backgroundColor: isDark ? '#3a2f14' : '#FFF8E1', color: isDark ? '#ffb74d' : '#e65100' },
+                  ]}
+                >
+                  Pendiente
                 </Text>
-              </View>
-            </View>
-            <View style={styles.right}>
-              <Text style={[styles.moneyCuota, { color: palette.text }]}>
-                ${Number(item.valorCuota || 0).toFixed(0)}
-              </Text>
-              <Text style={[styles.moneySaldo, { color: palette.softText }]}>
-                ${Number(item.restante || 0).toFixed(0)}
+              )}
+              {!visitado && esNuevo && (
+                <Text
+                  style={[
+                    styles.badge,
+                    { backgroundColor: isDark ? '#0E2436' : '#E3F2FD', color: '#1565C0' },
+                  ]}
+                >
+                  Nuevo
+                </Text>
+              )}
+              <Text style={[styles.badge, { backgroundColor: palette.kpiTrack, color: palette.softText }]}>
+                {item.modalidad || 'Diaria'}
               </Text>
             </View>
           </View>
-        </TouchableOpacity>
-      );
-    },
-    [openPagoDirecto, openOpciones, esVisitadoHoy, palette, isDark, tzSession]
+
+          <View style={styles.right}>
+            <Text style={[styles.moneyCuota, { color: palette.text }]}>
+              ${Number(item.valorCuota || 0).toFixed(0)}
+            </Text>
+            <Text style={[styles.moneySaldo, { color: palette.softText }]}>
+              ${Number(item.restante || 0).toFixed(0)}
+            </Text>
+          </View>
+        </View>
+      </TouchableOpacity>
+    );
+  });
+
+  const renderItem: ListRenderItem<Prestamo> = useCallback(
+    ({ item }) => <RowItem item={item} />,
+    [] // RowItem es memo y cierra sobre refs/tema via closure del componente
   );
 
   return (
@@ -697,91 +695,97 @@ export default function PagosDiariosScreen({ route }: any) {
         <TabBtn label="Visitados" active={filtro === 'visitados'} onPress={() => setFiltro('visitados')} palette={palette} />
       </View>
 
-      {/* Overlay opciones (long-press) */}
-      {prestamoSeleccionado && (
-        <InstantOpcionesCliente
-          visible={opcionesVisible}
-          cliente={{
-            nombre: prestamoSeleccionado.concepto,
-            comercio: prestamoSeleccionado.clienteAlias ?? '',
-          }}
-          onCerrar={() => setOpcionesVisible(false)}
-          onSeleccionarOpcion={async (opcion) => {
-            if (opcion === 'pago') {
-              setOpcionesVisible(false);
-              setModalPagoVisible(true);
-            } else if (opcion === 'historial') {
-              setOpcionesVisible(false);
+      {/* Overlay opciones (long-press) — SIEMPRE MONTADO */}
+      <InstantOpcionesCliente
+        visible={opcionesVisible}
+        cliente={{
+          nombre: selectedRef.current?.concepto ?? '',
+          comercio: selectedRef.current?.clienteAlias ?? '',
+        }}
+        onCerrar={() => setOpcionesVisible(false)}
+        onSeleccionarOpcion={async (opcion) => {
+          const prestamoSeleccionado = selectedRef.current;
+          if (!prestamoSeleccionado) return;
 
-              // 🔎 Traer abonos desde SUBCOLECCIÓN para que el historial incluya offline/outbox
-              let abonosCompat: { monto: number; fecha: string }[] = [];
-              try {
-                if (prestamoSeleccionado?.clienteId && prestamoSeleccionado?.id) {
-                  const colRef = collection(
-                    doc(db, 'clientes', prestamoSeleccionado.clienteId),
-                    'prestamos',
-                    prestamoSeleccionado.id,
-                    'abonos'
-                  );
-                  const snap = await getDocs(colRef);
-                  abonosCompat = snap.docs
-                    .map((d) => d.data() as any)
-                    .map((a) => ({
-                      monto: Number(a?.monto) || 0,
-                      fecha: a?.operationalDate ?? normYYYYMMDD(a?.fecha) ?? todayInTZ(pickTZ(prestamoSeleccionado.tz)),
-                    }));
-                }
-              } catch {
-                // Fallback al arreglo legacy del doc si algo falla
-                abonosCompat = (prestamoSeleccionado.abonos || []).map((a: any) => ({
-                  monto: Number(a.monto) || 0,
-                  fecha:
-                    a.operationalDate ?? normYYYYMMDD(a.fecha) ?? todayInTZ(pickTZ(prestamoSeleccionado.tz)),
-                }));
-              }
+          if (opcion === 'pago') {
+            setOpcionesVisible(false);
+            setModalPagoVisible(true);
+          } else if (opcion === 'historial') {
+            setOpcionesVisible(false);
 
-              navigation.navigate('HistorialPagos', {
-                abonos: abonosCompat,
-                nombreCliente: prestamoSeleccionado.concepto ?? 'Cliente',
-                valorCuota: prestamoSeleccionado.valorCuota,
-                totalPrestamo: prestamoSeleccionado.totalPrestamo,
-              });
-            } else if (opcion === 'historialPrestamos') {
-              if (!prestamoSeleccionado?.clienteId) return;
-              setOpcionesVisible(false);
-              navigation.navigate('HistorialPrestamos', {
-                clienteId: prestamoSeleccionado.clienteId as string,
-                nombreCliente: prestamoSeleccionado.concepto ?? 'Cliente',
-                admin,
-              });
-            } else if (opcion === 'info') {
-              if (!prestamoSeleccionado?.clienteId) {
-                Alert.alert('Falta ID', 'Este préstamo no tiene cliente asignado.');
-                return;
+            // 🔎 Traer abonos desde SUBCOLECCIÓN para que el historial incluya offline/outbox
+            let abonosCompat: { monto: number; fecha: string }[] = [];
+            try {
+              if (prestamoSeleccionado?.clienteId && prestamoSeleccionado?.id) {
+                const colRef = collection(
+                  db,
+                  'clientes',
+                  prestamoSeleccionado.clienteId,
+                  'prestamos',
+                  prestamoSeleccionado.id,
+                  'abonos'
+                );
+                const snap = await getDocs(colRef);
+                abonosCompat = snap.docs
+                  .map((d) => d.data() as any)
+                  .map((a) => ({
+                    monto: Number(a?.monto) || 0,
+                    fecha:
+                      a?.operationalDate ??
+                      normYYYYMMDD(a?.fecha) ??
+                      todayInTZ(pickTZ(prestamoSeleccionado.tz)),
+                  }));
               }
-              setOpcionesVisible(false);
-              navigation.navigate('InfoCliente', {
-                clienteId: prestamoSeleccionado.clienteId as string,
-                nombreCliente: prestamoSeleccionado.concepto ?? 'Cliente',
-                admin,
-              });
+            } catch {
+              // Fallback al arreglo legacy del doc si algo falla
+              abonosCompat = (prestamoSeleccionado.abonos || []).map((a: any) => ({
+                monto: Number(a.monto) || 0,
+                fecha:
+                  a.operationalDate ??
+                  normYYYYMMDD(a.fecha) ??
+                  todayInTZ(pickTZ(prestamoSeleccionado.tz)),
+              }));
             }
-          }}
-        />
-      )}
 
-      {/* Modal de pago (tap simple) */}
-      {prestamoSeleccionado && (
-        <ModalRegistroPago
-          visible={modalPagoVisible}
-          onClose={() => setModalPagoVisible(false)}
-          clienteNombre={prestamoSeleccionado?.concepto ?? ''}
-          clienteId={prestamoSeleccionado?.clienteId ?? ''}
-          prestamoId={prestamoSeleccionado?.id ?? ''}
-          admin={admin}
-          onSuccess={() => mostrarMensajeExito('Pago registrado correctamente')}
-        />
-      )}
+            navigation.navigate('HistorialPagos', {
+              abonos: abonosCompat,
+              nombreCliente: prestamoSeleccionado.concepto ?? 'Cliente',
+              valorCuota: prestamoSeleccionado.valorCuota,
+              totalPrestamo: prestamoSeleccionado.totalPrestamo,
+            });
+          } else if (opcion === 'historialPrestamos') {
+            if (!prestamoSeleccionado?.clienteId) return;
+            setOpcionesVisible(false);
+            navigation.navigate('HistorialPrestamos', {
+              clienteId: prestamoSeleccionado.clienteId as string,
+              nombreCliente: prestamoSeleccionado.concepto ?? 'Cliente',
+              admin,
+            });
+          } else if (opcion === 'info') {
+            if (!prestamoSeleccionado?.clienteId) {
+              Alert.alert('Falta ID', 'Este préstamo no tiene cliente asignado.');
+              return;
+            }
+            setOpcionesVisible(false);
+            navigation.navigate('InfoCliente', {
+              clienteId: prestamoSeleccionado.clienteId as string,
+              nombreCliente: prestamoSeleccionado.concepto ?? 'Cliente',
+              admin,
+            });
+          }
+        }}
+      />
+
+      {/* Modal de pago (tap simple) — SIEMPRE MONTADO */}
+      <ModalRegistroPago
+        visible={modalPagoVisible}
+        onClose={() => setModalPagoVisible(false)}
+        clienteNombre={selectedRef.current?.concepto ?? ''}
+        clienteId={selectedRef.current?.clienteId ?? ''}
+        prestamoId={selectedRef.current?.id ?? ''}
+        admin={admin}
+        onSuccess={() => mostrarMensajeExito('Pago registrado correctamente')}
+      />
 
       {mensajeExito !== '' && (
         <View

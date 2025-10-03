@@ -1,152 +1,140 @@
 // utils/cajaResumen.ts
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  getDocs,
-  Timestamp,
-  QuerySnapshot,
-  DocumentData,
-} from 'firebase/firestore';
+import { collection, getDocs, query, where } from 'firebase/firestore';
 import { db } from '../firebase/firebaseConfig';
+import { canonicalTipo, type MovimientoTipo } from './movimientoHelper';
 
-// 👇 normalizador de tipos canónicos (pago→abono, gastoAdmin→gasto_admin, etc.)
-import { canonicalTipo } from './movimientoHelper';
-
-export type CajaItem = {
-  id: string;
-  // Tipos canónicos de Fase 2 (incluimos gasto_cobrador y cierre para no perderlos en la lista)
-  tipo: 'apertura' | 'ingreso' | 'retiro' | 'abono' | 'gasto_admin' | 'gasto_cobrador' | 'cierre';
-  monto: number;               // para 'cierre' usamos balance si viene en el doc
-  nota?: string | null;
-  createdAt?: Timestamp | null;
-};
-
-export type CajaResumen = {
-  apertura: number; // toma la APERTURA más reciente del día (no suma varias aperturas)
-  ingresos: number;
-  abonos: number;
-  retiros: number;
-  gastos: number;   // SOLO gastos administrativos (gasto_admin)
-  neto: number;     // apertura + ingresos + abonos − retiros − gastos
-  items: CajaItem[]; // lista completa para UI (incluye gasto_cobrador y cierre)
-};
-
-// —— helpers numéricos (sin -0.00)
-const r2 = (n: number) => {
-  const v = Math.round((Number(n) || 0) * 100) / 100;
+/** Redondeo amable en 2 decimales (evita -0.00). */
+const round2 = (n: number) => {
+  const v = Math.round(Number(n || 0) * 100) / 100;
   return Math.abs(v) < 0.005 ? 0 : v;
 };
-const n2 = (v: any) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
-function calcResumenFromSnap(snap: QuerySnapshot<DocumentData>): CajaResumen {
-  let aperturaMonto = 0;
-  let aperturaTs = -1; // tomamos la apertura más reciente
-  let ingresos = 0;
-  let abonos = 0;
-  let retiros = 0;
-  let gastosAdmin = 0;
+/** Fila mínima normalizada para sumar. */
+export type RowCaja = {
+  id: string;
+  tipo: MovimientoTipo | null;
+  monto: number;        // monto o balance (ya normalizado)
+  createdAtMs: number;  // para elegir la última apertura del día
+};
 
-  const items: CajaItem[] = [];
+export type KpisDia = {
+  apertura: number;
+  cobrado: number;
+  ingresos: number;
+  retiros: number;
+  gastosAdmin: number;
+  gastosCobrador: number;
+  prestamos: number;
+};
 
-  snap.forEach((d) => {
-    const data = d.data() as any;
-    const tip = canonicalTipo(data?.tipo);
-    if (!tip) return;
+/** Lee TODOS los movimientos de 'cajaDiaria' del día (admin+fecha) y normaliza. */
+export async function leerMovsDelDia(admin: string, ymd: string): Promise<RowCaja[]> {
+  const qy = query(
+    collection(db, 'cajaDiaria'),
+    where('admin', '==', admin),
+    where('operationalDate', '==', ymd)
+  );
 
-    const ts =
-      (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
-      (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
-      0;
+  const snap = await getDocs(qy);
 
-    // Para listado, intentamos siempre tener un monto razonable
-    const montoDoc = n2(data?.monto ?? data?.balance ?? 0);
+  const rows: RowCaja[] = snap.docs.map((d) => {
+    const data: any = d.data();
+    const tipo = canonicalTipo(data?.tipo);
+    const rawMonto = Number(data?.monto ?? data?.balance ?? 0);
+    const monto = round2(Number.isFinite(rawMonto) ? rawMonto : 0);
+    const cam =
+      typeof data?.createdAtMs === 'number'
+        ? data.createdAtMs
+        : typeof data?.createdAt?.seconds === 'number'
+        ? data.createdAt.seconds * 1000
+        : 0;
 
-    // Acumuladores por tipo canónico
-    switch (tip) {
-      case 'apertura': {
-        // quedarse con la última apertura del día
-        if (ts >= aperturaTs) {
-          aperturaTs = ts;
-          aperturaMonto = n2(data?.monto);
-        }
-        break;
-      }
-      case 'ingreso':
-        ingresos += n2(data?.monto);
-        break;
-      case 'abono':
-        abonos += n2(data?.monto);
-        break;
-      case 'retiro':
-        retiros += n2(data?.monto);
-        break;
-      case 'gasto_admin':
-        gastosAdmin += n2(data?.monto);
-        break;
-      case 'gasto_cobrador':
-        // NO cuenta en KPI de gastos del cierre
-        break;
-      case 'cierre':
-        // No suma en KPIs (solo registro). El doc suele traer 'balance'.
-        break;
-      default:
-        break;
-    }
-
-    items.push({
-      id: d.id,
-      tipo: tip as CajaItem['tipo'],
-      monto: r2(montoDoc),
-      nota: (data?.nota ?? null) || null,
-      createdAt: (data?.createdAt as Timestamp) ?? null,
-    });
+    return { id: d.id, tipo, monto, createdAtMs: cam || 0 };
   });
 
-  const apertura = r2(aperturaMonto);
-  const gastos = r2(gastosAdmin);
-  const resumen = {
-    apertura,
-    ingresos: r2(ingresos),
-    abonos: r2(abonos),
-    retiros: r2(retiros),
-    gastos,
+  return rows;
+}
+
+/** Reglas de sumatoria canónicas para KPIs del día (solo cajaDiaria). */
+export function sumarKpis(rows: RowCaja[]): KpisDia {
+  let aperturaVal = 0;
+  let aperturaTs = -1;
+
+  let cobrado = 0;
+  let ingresos = 0;
+  let retiros = 0;
+  let gastosAdmin = 0;
+  let gastosCobrador = 0;
+  let prestamos = 0;
+
+  for (const r of rows) {
+    if (!r?.tipo) continue;
+
+    switch (r.tipo) {
+      case 'apertura':
+        if (r.createdAtMs >= aperturaTs) {
+          aperturaTs = r.createdAtMs;
+          aperturaVal = r.monto;
+        }
+        break;
+
+      case 'abono':
+        cobrado += r.monto;
+        break;
+
+      case 'ingreso':
+        ingresos += r.monto;
+        break;
+
+      case 'retiro':
+        retiros += r.monto;
+        break;
+
+      case 'gasto_admin':
+        gastosAdmin += r.monto;
+        break;
+
+      case 'gasto_cobrador':
+        gastosCobrador += r.monto;
+        break;
+
+      case 'prestamo':
+        // 👇 “Préstamos (día)” = suma exclusiva de cajaDiaria con tipo 'prestamo'
+        prestamos += r.monto;
+        break;
+
+      default:
+        break; // ignora 'cierre' u otros no relevantes para KPIs
+    }
+  }
+
+  return {
+    apertura: round2(aperturaVal),
+    cobrado: round2(cobrado),
+    ingresos: round2(ingresos),
+    retiros: round2(retiros),
+    gastosAdmin: round2(gastosAdmin),
+    gastosCobrador: round2(gastosCobrador),
+    prestamos: round2(prestamos),
   };
-  const neto = r2(resumen.apertura + resumen.ingresos + resumen.abonos - resumen.retiros - resumen.gastos);
-
-  // (opcional) ordenar items por fecha desc:
-  // items.sort((a, b) => (b.createdAt?.seconds ?? 0) - (a.createdAt?.seconds ?? 0));
-
-  return { ...resumen, neto, items };
 }
 
-/** Carga una vez (fetch) */
-export async function fetchCajaResumen(admin: string, operationalDate: string): Promise<CajaResumen> {
-  const qy = query(
-    collection(db, 'cajaDiaria'),
-    where('admin', '==', admin),
-    where('operationalDate', '==', operationalDate)
-  );
-  const snap = await getDocs(qy);
-  return calcResumenFromSnap(snap);
+/** Azúcar: KPIs del día leyendo y sumando en un solo paso. */
+export async function kpisDelDia(admin: string, ymd: string): Promise<KpisDia> {
+  const rows = await leerMovsDelDia(admin, ymd);
+  return sumarKpis(rows);
 }
 
-/** Suscripción en tiempo real (recomendado para Cerrar Día y Caja) */
-export function watchCajaResumen(
-  admin: string,
-  operationalDate: string,
-  cb: (r: CajaResumen) => void,
-  onError?: (e: any) => void
-) {
-  const qy = query(
-    collection(db, 'cajaDiaria'),
-    where('admin', '==', admin),
-    where('operationalDate', '==', operationalDate)
-  );
-  return onSnapshot(
-    qy,
-    (snap) => cb(calcResumenFromSnap(snap)),
-    (err) => onError?.(err)
-  );
+/** Deriva cajaFinal usando sólo KPIs y una base inicial (apertura>0 o cierre de ayer). */
+export function cajaFinalConBase(baseInicial: number, k: KpisDia): number {
+  const val =
+    baseInicial +
+    k.ingresos +
+    k.cobrado -
+    k.retiros -
+    k.prestamos -
+    k.gastosAdmin -
+    k.gastosCobrador;
+
+  return round2(val);
 }

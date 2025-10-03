@@ -1,0 +1,64 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "prestamos",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "creadoPor", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "prestamos",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "creadoPor", "order": "ASCENDING" },
+        { "fieldPath": "restante",  "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "prestamos",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "creadoPor",   "order": "ASCENDING" },
+        { "fieldPath": "createdAtMs", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "prestamos",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "creadoPor", "order": "ASCENDING" },
+        { "fieldPath": "createdDate", "order": "ASCENDING" }
+      ]
+    },
+
+    { 
+      "collectionId": "cajaDiaria",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "admin",           "order": "ASCENDING" },
+        { "fieldPath": "operationalDate", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "cajaDiaria",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "admin",           "order": "ASCENDING" },
+        { "fieldPath": "operationalDate", "order": "ASCENDING" },
+        { "fieldPath": "tipo",            "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionId": "cajaDiaria",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "admin",           "order": "ASCENDING" },
+        { "fieldPath": "operationalDate", "order": "ASCENDING" },
+        { "fieldPath": "tipo",            "order": "ASCENDING" },
+        { "fieldPath": "createdAt",       "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
