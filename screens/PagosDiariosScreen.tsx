@@ -14,9 +14,8 @@ import {
   StatusBar,
   ListRenderItem,
   Keyboard,
-  NativeSyntheticEvent,
-  GestureResponderEvent,
   DeviceEventEmitter,
+  Platform,
 } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -26,7 +25,6 @@ import {
   collection,
   collectionGroup,
   onSnapshot,
-  doc,
   query,
   where,
 } from 'firebase/firestore';
@@ -172,18 +170,6 @@ export default function PagosDiariosScreen({ route }: any) {
   }
   // ====================
 
-  // ====== Inercia: capturar tap y abrir pago directo ======
-  const flatRef = useRef<FlatList<Prestamo>>(null);
-  const lastOffsetRef = useRef(0);
-  const momentumRef = useRef(false);
-  const justHandledCaptureRef = useRef(false);
-
-  const ROW_HEIGHT = 86;
-  const SEP_HEIGHT = 8;
-  const ROW_STRIDE = ROW_HEIGHT + SEP_HEIGHT;
-
-  const filasFiltradasRef = useRef<Prestamo[]>([]);
-
   // ✅ Selección con ref (no re-renderiza toda la lista)
   const selectedRef = useRef<Prestamo | null>(null);
 
@@ -197,39 +183,6 @@ export default function PagosDiariosScreen({ route }: any) {
     selectedRef.current = item;
     setOpcionesVisible(true);
   }, []);
-
-  const handleTouchEndCapture = useCallback(
-    (e: NativeSyntheticEvent<GestureResponderEvent['nativeEvent']> | any) => {
-      if (!momentumRef.current) return;
-      const y = e.nativeEvent?.locationY ?? 0;
-      const contentY = lastOffsetRef.current + y;
-      const index = Math.floor(contentY / ROW_STRIDE);
-
-      const withinRow = (contentY % ROW_STRIDE) <= ROW_HEIGHT;
-      if (!withinRow) {
-        momentumRef.current = false;
-        return;
-      }
-
-      const data = filasFiltradasRef.current;
-      const item = data[index];
-      if (!item) {
-        momentumRef.current = false;
-        return;
-      }
-
-      flatRef.current?.scrollToOffset({ offset: lastOffsetRef.current, animated: false });
-
-      momentumRef.current = false;
-      justHandledCaptureRef.current = true;
-      requestAnimationFrame(() => {
-        openPagoDirecto(item); // tap durante inercia = pago directo
-        requestAnimationFrame(() => { justHandledCaptureRef.current = false; });
-      });
-    },
-    [ROW_STRIDE, openPagoDirecto]
-  );
-  // ========================================================
 
   // Redirección si no hay sesión
   useFocusEffect(
@@ -425,10 +378,6 @@ export default function PagosDiariosScreen({ route }: any) {
     return filasBuscadas;
   }, [filasBuscadas, filtro, esVisitadoHoy, hoySession]);
 
-  useEffect(() => {
-    filasFiltradasRef.current = filasFiltradas;
-  }, [filasFiltradas]);
-
   const abrirModalPago = useCallback(() => {
     const sel = selectedRef.current;
     if (!sel?.clienteId) {
@@ -443,16 +392,6 @@ export default function PagosDiariosScreen({ route }: any) {
     setMensajeExito(mensaje);
     setTimeout(() => setMensajeExito(''), 2500);
   };
-
-  const keyExtractor = useCallback((it: Prestamo) => it.id, []);
-  const getItemLayout = useCallback(
-    (_data: ArrayLike<Prestamo> | null | undefined, index: number) => ({
-      length: ROW_HEIGHT,
-      offset: index * (ROW_HEIGHT + SEP_HEIGHT),
-      index,
-    }),
-    []
-  );
 
   // ===== Fila memoizada =====
   const RowItem = React.memo(function RowItem({
@@ -480,10 +419,7 @@ export default function PagosDiariosScreen({ route }: any) {
       <TouchableOpacity
         activeOpacity={0.85}
         onPressIn={() => Keyboard.dismiss()}
-        onPress={() => {
-          if (justHandledCaptureRef.current) return;
-          openPagoDirecto(item);
-        }}
+        onPress={() => openPagoDirecto(item)}
         onLongPress={() => openOpciones(item)}
         delayLongPress={220}
       >
@@ -607,7 +543,7 @@ export default function PagosDiariosScreen({ route }: any) {
 
   const renderItem: ListRenderItem<Prestamo> = useCallback(
     ({ item }) => <RowItem item={item} />,
-    [] // RowItem es memo y cierra sobre refs/tema via closure del componente
+    []
   );
 
   return (
@@ -649,32 +585,27 @@ export default function PagosDiariosScreen({ route }: any) {
         <ActivityIndicator size="large" style={{ marginTop: 24 }} />
       ) : (
         <FlatList
-          ref={flatRef}
           data={filasFiltradas}
-          keyExtractor={keyExtractor}
+          keyExtractor={(it) => it.id}
           renderItem={renderItem}
           contentContainerStyle={{
             paddingHorizontal: 12,
             paddingBottom: 52 + insets.bottom + 12,
           }}
-          ItemSeparatorComponent={() => <View style={{ height: SEP_HEIGHT }} />}
+          ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
           ListEmptyComponent={
             <View style={{ alignItems: 'center', marginTop: 24 }}>
               <Text style={{ color: palette.softText }}>No hay resultados.</Text>
             </View>
           }
-          initialNumToRender={16}
-          windowSize={7}
-          maxToRenderPerBatch={24}
-          updateCellsBatchingPeriod={16}
-          removeClippedSubviews
-          getItemLayout={getItemLayout}
+          // 🔧 Virtualización estable sin getItemLayout ni hacks de altura fija
+          initialNumToRender={20}
+          maxToRenderPerBatch={20}
+          windowSize={9}
+          updateCellsBatchingPeriod={40}
+          // Evitar parpadeos en Android (sombras/overlays)
+          removeClippedSubviews={Platform.OS === 'ios'}
           keyboardShouldPersistTaps="always"
-          onScroll={(e) => { lastOffsetRef.current = e.nativeEvent.contentOffset.y; }}
-          scrollEventThrottle={16}
-          onMomentumScrollBegin={() => { momentumRef.current = true; }}
-          onMomentumScrollEnd={() => { momentumRef.current = false; }}
-          onTouchEndCapture={handleTouchEndCapture}
           extraData={outboxPulse}
         />
       )}

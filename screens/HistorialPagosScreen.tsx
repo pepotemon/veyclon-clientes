@@ -9,51 +9,88 @@ import {
   SafeAreaView,
   Platform,
 } from 'react-native';
-import { format } from 'date-fns';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { Ionicons } from '@expo/vector-icons';
 import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';
 import { useAppTheme } from '../theme/ThemeProvider';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { todayInTZ, normYYYYMMDD, pickTZ } from '../utils/timezone';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'HistorialPagos'>;
 
+type AbonoIn = {
+  monto: number;
+  operationalDate?: string; // 'YYYY-MM-DD'
+  fecha?: string;           // legacy
+  createdAtMs?: number;     // ms epoch
+  createdAt?: any;          // Firestore Timestamp
+  tz?: string;
+};
+
 export default function HistorialPagosScreen({ route, navigation }: Props) {
-  const { abonos, nombreCliente, valorCuota, totalPrestamo } = route.params;
+  const { abonos = [], nombreCliente, valorCuota, totalPrestamo } = route.params;
   const { palette } = useAppTheme();
   const insets = useSafeAreaInsets();
 
-  const abonosOrdenados = useMemo(
-    () =>
-      [...abonos].sort(
-        (a, b) => new Date(b.fecha).getTime() - new Date(a.fecha).getTime()
-      ),
-    [abonos]
-  );
+  const items = useMemo(() => {
+    const tzFallback = 'America/Sao_Paulo';
+    const norm = (a: AbonoIn) => {
+      const tz = pickTZ(a.tz, tzFallback);
+      const ymd = a.operationalDate ?? normYYYYMMDD(a.fecha) ?? todayInTZ(tz);
+      const ms =
+        typeof a.createdAtMs === 'number'
+          ? a.createdAtMs
+          : (typeof a?.createdAt?.seconds === 'number'
+              ? a.createdAt.seconds * 1000
+              : undefined);
+      return { monto: Number(a.monto) || 0, ymd, ms, tz };
+    };
+    return (abonos as AbonoIn[])
+      .map(norm)
+      .sort((a, b) => {
+        const dm = (b.ms ?? 0) - (a.ms ?? 0);
+        if (dm !== 0) return dm;
+        if (a.ymd === b.ymd) return 0;
+        return a.ymd < b.ymd ? 1 : -1;
+      });
+  }, [abonos]);
 
   const totalAbonado = useMemo(
-    () => abonos.reduce((acc, abono) => acc + Number(abono.monto || 0), 0),
-    [abonos]
+    () => items.reduce((acc, it) => acc + (Number(it.monto) || 0), 0),
+    [items]
   );
-
+  const pagosRealizados = items.length;
   const cuotasPagadas = useMemo(
-    () => (valorCuota > 0 ? Math.floor(totalAbonado / valorCuota) : 0),
+    () => (Number(valorCuota) > 0 ? Math.floor(totalAbonado / Number(valorCuota)) : 0),
     [totalAbonado, valorCuota]
   );
-
-  const pagosRealizados = abonos.length;
-
   const saldoEstimado = useMemo(
     () => Math.max((Number(totalPrestamo) || 0) - totalAbonado, 0),
     [totalPrestamo, totalAbonado]
   );
 
-  const isToday = (isoOrDateLike: string) => {
-    const d = new Date(isoOrDateLike);
-    const today = new Date();
-    return d.toDateString() === today.toDateString();
+  const renderDate = (ymd: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return ymd;
+    const [Y, M, D] = ymd.split('-');
+    return `${D}/${M}/${Y}`;
+    };
+  const renderTime = (ms?: number, tz?: string) => {
+    if (!ms) return '—';
+    try {
+      return new Intl.DateTimeFormat('es-ES', {
+        timeZone: tz || 'America/Sao_Paulo',
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(new Date(ms));
+    } catch {
+      const d = new Date(ms);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      return `${hh}:${mm}`;
+    }
   };
+  const esHoy = (ymd: string, tz?: string) => ymd === todayInTZ(pickTZ(tz, 'America/Sao_Paulo'));
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
@@ -91,7 +128,6 @@ export default function HistorialPagosScreen({ route, navigation }: Props) {
 
       {/* KPIs */}
       <View style={styles.kpiRow}>
-        {/* Total abonado */}
         <View
           style={[
             styles.kpiBox,
@@ -102,7 +138,6 @@ export default function HistorialPagosScreen({ route, navigation }: Props) {
           <Text style={[styles.kpiValue, { color: palette.text }]}>R$ {totalAbonado.toFixed(2)}</Text>
         </View>
 
-        {/* Cuotas pagadas + Pagos realizados (mini-dúo) */}
         <View
           style={[
             styles.kpiBox,
@@ -114,6 +149,7 @@ export default function HistorialPagosScreen({ route, navigation }: Props) {
               <Text style={[styles.kpiMiniLabel, { color: palette.softText }]}>Cuotas realiz.</Text>
               <Text style={[styles.kpiMiniValue, { color: palette.text }]}>{cuotasPagadas}</Text>
             </View>
+            {/* 🔧 FIX: sin className en RN */}
             <View style={styles.kpiDuoDivider} />
             <View style={{ flex: 1, alignItems: 'flex-end' }}>
               <Text style={[styles.kpiMiniLabel, { color: palette.softText }]}>Pagos realiz.</Text>
@@ -122,7 +158,6 @@ export default function HistorialPagosScreen({ route, navigation }: Props) {
           </View>
         </View>
 
-        {/* Saldo estimado */}
         <View
           style={[
             styles.kpiBox,
@@ -153,20 +188,19 @@ export default function HistorialPagosScreen({ route, navigation }: Props) {
         <Text style={styles.detailBtnTxt}>Ver detalle de cuotas</Text>
       </TouchableOpacity>
 
-      {/* Lista de abonos (compacta + respeta home-indicator) */}
+      {/* Lista */}
       <FlatList
-        data={abonosOrdenados}
-        keyExtractor={(_, index) => index.toString()}
+        data={items}
+        keyExtractor={(_, index) => String(index)}
         contentContainerStyle={{
           paddingHorizontal: 12,
           paddingTop: 8,
-          paddingBottom: insets.bottom + 16, // evita que el último item se esconda
+          paddingBottom: insets.bottom + 16,
         }}
         scrollIndicatorInsets={{ bottom: insets.bottom }}
         ItemSeparatorComponent={() => <View style={{ height: 6 }} />}
         renderItem={({ item }) => {
-          const fecha = new Date(item.fecha);
-          const hoy = isToday(item.fecha);
+          const hoy = esHoy(item.ymd, item.tz);
           return (
             <View
               style={[
@@ -193,7 +227,7 @@ export default function HistorialPagosScreen({ route, navigation }: Props) {
                 <View style={styles.itemMetaRow}>
                   <MIcon name="calendar" size={12} color={palette.softText} />
                   <Text style={[styles.itemFecha, { color: palette.softText }]}>
-                    {format(fecha, 'dd/MM/yyyy HH:mm')}
+                    {renderDate(item.ymd)} {renderTime(item.ms, item.tz)}
                   </Text>
                   {hoy && (
                     <Text
@@ -265,7 +299,6 @@ const styles = StyleSheet.create({
   kpiLabel: { fontSize: 10.5, fontWeight: '700' },
   kpiValue: { fontSize: 15, fontWeight: '800', marginTop: 1 },
 
-  // mini-dúo dentro de la caja central
   kpiDuoRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',
@@ -299,7 +332,6 @@ const styles = StyleSheet.create({
   },
   detailBtnTxt: { color: '#fff', fontWeight: '800', fontSize: 13.5 },
 
-  // Ítems compactos
   itemCard: {
     borderRadius: 9,
     paddingVertical: 8,
