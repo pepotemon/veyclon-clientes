@@ -4,7 +4,6 @@ import {
   View,
   Text,
   StyleSheet,
-  SafeAreaView,
   ActivityIndicator,
   FlatList,
   TouchableOpacity,
@@ -12,7 +11,9 @@ import {
   Modal,
   TextInput,
   Platform,
+  AppState,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
@@ -31,7 +32,7 @@ import {
   doc,
 } from 'firebase/firestore';
 
-import { todayInTZ } from '../utils/timezone';
+import { todayInTZ, nextMidnightDelayInTZ } from '../utils/timezone';
 import { logAudit, pick } from '../utils/auditLogs';
 import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';
 
@@ -69,12 +70,31 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   const { palette, isDark } = useAppTheme();
   const insets = useSafeAreaInsets();
 
-  const hoy = useMemo(() => todayInTZ(tz), []);
+  // 🔁 Día “vivo” en TZ (con rollover automático + al volver a primer plano)
+  const [hoy, setHoy] = useState(() => todayInTZ(tz));
+  useEffect(() => {
+    let t: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      t = setTimeout(() => {
+        setHoy(todayInTZ(tz));
+        schedule();
+      }, nextMidnightDelayInTZ(tz));
+    };
+    schedule();
+    const sub = AppState.addEventListener('change', (s) => {
+      if (s === 'active') setHoy(todayInTZ(tz));
+    });
+    return () => {
+      if (t) clearTimeout(t);
+      sub.remove();
+    };
+  }, []);
 
   const [cargando, setCargando] = useState(true);
 
   // KPIs desde cajaDiaria
-  const [apertura, setApertura] = useState(0); // SOLO lectura (no seteamos caja inicial desde aquí)
+  const [apertura, setApertura] = useState(0); // SOLO lectura
+  const [tieneApertura, setTieneApertura] = useState(false); // ✅ nuevo
   const [abonos, setAbonos] = useState(0);
   const [ingresos, setIngresos] = useState(0);
   const [retiros, setRetiros] = useState(0);
@@ -93,10 +113,10 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     [movsCaja]
   );
 
-  // Caja inicial DERIVADA: si hay apertura hoy, esa es la inicial; si no, la base
+  // Caja inicial DERIVADA: si hubo apertura hoy, esa manda; si no, el cierre de ayer
   const cajaInicial = useMemo(
-    () => (apertura > 0 ? apertura : cajaInicialBase),
-    [apertura, cajaInicialBase]
+    () => (tieneApertura ? apertura : cajaInicialBase),
+    [tieneApertura, apertura, cajaInicialBase]
   );
 
   // Caja final (viva)
@@ -124,7 +144,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
     if (cierreSnap.exists()) return Number(cierreSnap.data()?.balance || 0);
 
-    // 2) Último cierre de AYER (sin orderBy para evitar índice compuesto → elegimos en cliente el más reciente)
+    // 2) Último cierre de AYER (sin orderBy)
     const qC = query(
       collection(db, 'cajaDiaria'),
       where('admin', '==', adminId),
@@ -154,7 +174,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     return 0;
   }
 
-  // --- Cargar CAJA INICIAL BASE = cierre de AYER
+  // --- Cargar CAJA INICIAL BASE = cierre de AYER (se recalcula si cambia 'hoy')
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -175,7 +195,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   useEffect(() => {
     setCargando(true);
     try {
-      // ❌ Sin orderBy para evitar índices compuestos → ordenamos en cliente
+      // ❌ Sin orderBy → ordenamos en cliente
       const qDia = query(
         collection(db, 'cajaDiaria'),
         where('admin', '==', admin),
@@ -190,7 +210,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
           let _abonos = 0;
           let _ingresos = 0;
           let _retiros = 0;
-          let _prestamos = 0; // ✅ suma de capital entregado hoy
+          let _prestamos = 0; // ✅ capital entregado hoy
 
           const _movsCaja: MovimientoCaja[] = [];
 
@@ -199,12 +219,11 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
             const tip = canonicalTipo(data?.tipo);
             if (!tip) return;
 
-          const m = Number(
-  tip === 'apertura' || tip === 'cierre'
-    ? (data?.monto ?? data?.balance ?? 0)  // 🟢 tomar monto o balance
-    : (data?.monto ?? 0)
-);
-
+            const m = Number(
+              tip === 'apertura' || tip === 'cierre'
+                ? (data?.monto ?? data?.balance ?? 0) // 🟢 tomar monto o balance
+                : (data?.monto ?? 0)
+            );
             if (!Number.isFinite(m)) return;
 
             const ts =
@@ -216,7 +235,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
               case 'apertura':
                 if (ts >= lastAperturaTs) {
                   lastAperturaTs = ts;
-                  lastAperturaMonto = m;
+                  lastAperturaMonto = m; // puede ser 0 válido
                 }
                 break;
 
@@ -235,8 +254,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                   tz: data?.tz || tz,
                   admin: data?.admin || admin,
                   createdAt: data?.createdAt,
-                  createdAtMs:
-                    typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
                 });
                 break;
 
@@ -251,8 +269,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                   tz: data?.tz || tz,
                   admin: data?.admin || admin,
                   createdAt: data?.createdAt,
-                  createdAtMs:
-                    typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
                 });
                 break;
 
@@ -267,13 +284,11 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                   tz: data?.tz || tz,
                   admin: data?.admin || admin,
                   createdAt: data?.createdAt,
-                  createdAtMs:
-                    typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
                 });
                 break;
 
               case 'prestamo':
-                // ✅ capital entregado hoy, resta caja y va a KPI “Préstamos”
                 _prestamos += m;
                 break;
 
@@ -283,26 +298,29 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
             }
           });
 
-          // ⛔ NO setear cajaInicialBase aquí (evita pisar con 0 por carreras)
+          // ✅ ahora sabemos si hubo apertura (aunque sea 0)
+          setTieneApertura(lastAperturaTs >= 0);
           setApertura(lastAperturaMonto);
 
-          // Orden descendente por timestamp (cliente)
-          _movsCaja.sort(
-            (a, b) =>
-              (b.createdAtMs ?? (b as any).createdAt?.seconds ?? 0) -
-              (a.createdAtMs ?? (a as any).createdAt?.seconds ?? 0)
-          );
+          // Orden descendente por timestamp (todos en ms)
+          const getMs = (x: MovimientoCaja) =>
+            typeof x.createdAtMs === 'number'
+              ? x.createdAtMs
+              : ((x as any).createdAt?.seconds ? (x as any).createdAt.seconds * 1000 : 0);
+
+          _movsCaja.sort((a, b) => getMs(b) - getMs(a));
 
           setAbonos(_abonos);
           setIngresos(_ingresos);
           setRetiros(_retiros);
-          setPrestamosDelDia(_prestamos); // ✅ sólo de cajaDiaria
+          setPrestamosDelDia(_prestamos);
           setMovsCaja(_movsCaja);
           setCargando(false);
         },
         (err) => {
           console.warn('[CajaDiaria] snapshot error:', err?.code || err?.message || err);
           Alert.alert('Atención', 'No fue posible leer la caja del día.');
+          setTieneApertura(false);
           setApertura(0);
           setAbonos(0);
           setIngresos(0);
@@ -503,7 +521,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
               <Text style={[styles.kpiLabel, { color: palette.softText }]}>Caja final (viva)</Text>
               <Text style={[styles.kpiVal, { color: palette.text }]}>R$ {cajaFinal.toFixed(2)}</Text>
             </View>
-            {!!apertura && (
+            {!!tieneApertura && (
               <View
                 style={[
                   styles.kpi,
@@ -532,6 +550,11 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
               ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
               renderItem={renderMovimiento}
               contentContainerStyle={{ paddingBottom: 120 + Math.max(0, insets.bottom) }}
+              initialNumToRender={20}
+              maxToRenderPerBatch={20}
+              windowSize={9}
+              removeClippedSubviews={Platform.OS === 'ios'}
+              updateCellsBatchingPeriod={40}
             />
           )}
         </>

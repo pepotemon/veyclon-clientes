@@ -66,6 +66,11 @@ import {
   closeMissingDays,
 } from './utils/cajaEstado';
 
+// ⏱️ NUEVO: bloqueo por inactividad (no dibuja UI)
+import AppInactivityLock from './security/AppInactivityLock';
+// 🌐 NUEVO: referencia global de navegación
+import { navigationRef } from './navigation/navigationRef';
+
 // Tipado de navegación
 export type RootStackParamList = {
   // 🕹️ nueva ruta inicial (señuelo)
@@ -152,7 +157,7 @@ function AppNavigator() {
   const bg = navigationTheme.colors.background;
 
   return (
-    <NavigationContainer theme={navigationTheme}>
+    <NavigationContainer theme={navigationTheme} ref={navigationRef}>
       {/* StatusBar sin animación y con color de fondo real */}
       <StatusBar
         barStyle={isDark ? 'light-content' : 'dark-content'}
@@ -382,6 +387,8 @@ export default function App() {
   return (
     <SafeAreaProvider /* @ts-ignore */ style={{ backgroundColor: '#0000' }}>
       <ThemeProvider>
+        {/* ⏱️ Cierre de sesión automático tras 3 min en background/inactive */}
+        <AppInactivityLock idleMs={3 * 60_000} countWhileInactive />
         <AppNavigator />
       </ThemeProvider>
     </SafeAreaProvider>

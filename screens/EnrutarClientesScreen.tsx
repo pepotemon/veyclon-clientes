@@ -1,9 +1,10 @@
 // screens/EnrutarClientesScreen.tsx
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import {
-  SafeAreaView, View, Text, StyleSheet, FlatList, TouchableOpacity,
+import { View, Text, StyleSheet, FlatList, TouchableOpacity,
   ActivityIndicator, Alert, Modal, Pressable, ScrollView,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';

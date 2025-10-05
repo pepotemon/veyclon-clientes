@@ -1,9 +1,10 @@
 // screens/PreferenciasUsuarioScreen.tsx
 import React, { useEffect, useState } from 'react';
-import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import {  View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '../theme/ThemeProvider';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 // 👇 Exportamos la clave para usarla en el flujo de registro de pago
 export const KEY_SEND_RECEIPT_CONFIRM = 'prefs:sendReceiptConfirm';

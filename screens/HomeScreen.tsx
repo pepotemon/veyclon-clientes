@@ -1,16 +1,17 @@
-import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef, useTransition } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   ActivityIndicator,
-  SafeAreaView,
   Modal,
   FlatList,
   Alert,
   ScrollView,
+  InteractionManager,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { db } from '../firebase/firebaseConfig';
@@ -129,7 +130,6 @@ export default function HomeScreen({ route, navigation }: Props) {
   // Outbox
   const [outboxCount, setOutboxCount] = useState(0);
   const showResendIcon = outboxCount > 0;
-  const prevOutboxCountRef = useRef<number>(0);
 
   // 💰 Caja diaria KPI
   const [cobradoHoy, setCobradoHoy] = useState(0);
@@ -140,11 +140,14 @@ export default function HomeScreen({ route, navigation }: Props) {
   const [refreshKey, setRefreshKey] = useState(0);
   const handleManualRefresh = () => {
     setCargando(true);
-    setRefreshKey((k) => k + 1);
+    startTransition(() => setRefreshKey((k) => k + 1));
   };
 
   // ⬇️ NUEVO: ids de clientes ordenados guardados por EnrutarClientes
   const [routeOrderIds, setRouteOrderIds] = useState<string[]>([]);
+
+  // ⬇️ NUEVO: transiciones no bloqueantes
+  const [isPending, startTransition] = useTransition();
 
   // Asegura sesión/admin si no vino por params
   useFocusEffect(
@@ -172,31 +175,31 @@ export default function HomeScreen({ route, navigation }: Props) {
     }, [navigation, route.params?.admin])
   );
 
-  // 🔔 Refresco ligero cuando cambie la cola (pendientes procesados/añadidos)
-  useEffect(() => {
-    let unsubEvt: (() => void) | null = null;
-    try {
-      unsubEvt = subscribeOutbox(() => {
-        setRefreshKey((k) => k + 1);
-      });
-    } catch {
-      unsubEvt = null;
-    }
 
-    const unsubCount = subscribeCount((n) => {
-      const prev = prevOutboxCountRef.current;
-      setOutboxCount(n);
-      if (n !== prev) {
-        prevOutboxCountRef.current = n;
-        setRefreshKey((k) => k + 1);
-     }
+useEffect(() => {
+  let unsubEvt: (() => void) | null = null;
+  try {
+    unsubEvt = subscribeOutbox(() => {
+      setRefreshKey((k) => k + 1);
     });
+  } catch {
+    unsubEvt = null;
+  }
 
-    return () => {
-      if (unsubEvt) unsubEvt();
-      unsubCount && unsubCount();
-    };
-  }, []);
+  const unsubCount = subscribeCount((n) => {
+    // 👇 comparamos contra el estado previo sin refs
+    setOutboxCount((prev) => {
+      if (n !== prev) setRefreshKey((k) => k + 1);
+      return n;
+    });
+  });
+
+  return () => {
+    if (unsubEvt) unsubEvt();
+    unsubCount && unsubCount();
+  };
+}, []);
+
 
   const { storageKeyV, storageKeyO } = useMemo(() => {
     const d = hoyApp;
@@ -275,8 +278,10 @@ export default function HomeScreen({ route, navigation }: Props) {
         if (!admin) return;
         const snap = await loadCatalogSnapshot(admin);
         if (alive && snap) {
-          setPrestamosRaw(Array.isArray(snap.prestamos) ? (snap.prestamos as any) : []);
-          setUltimaActualizacion(snap.ts || Date.now());
+          startTransition(() => {
+            setPrestamosRaw(Array.isArray(snap.prestamos) ? (snap.prestamos as any) : []);
+            setUltimaActualizacion(snap.ts || Date.now());
+          });
         }
       } catch {
         // ignore cache errors
@@ -336,6 +341,8 @@ export default function HomeScreen({ route, navigation }: Props) {
     if (!admin) return;
 
     let unsub: (() => void) | undefined;
+    // ⬇️ para cancelar la reconciliación diferida si desmonta/recambia
+    let cancelled = false;
 
     const suscribir = () => {
       setCargando(true);
@@ -395,64 +402,72 @@ export default function HomeScreen({ route, navigation }: Props) {
               });
             });
 
-            setPrestamosRaw(lista);
-            setPrestamosLoaded(true);
-            setCargando(false);
-            setCargaPrestamosOk(true);
+            // ⬇️ aplicar setStates en transición (no bloquea interacciones)
+            startTransition(() => {
+              setPrestamosRaw(lista);
+              setPrestamosLoaded(true);
+              setCargando(false);
+              setCargaPrestamosOk(true);
+            });
 
-            // Reconciliación limitada (máx 10 docs) — prioriza mayor restante (sin índices)
-            (async () => {
-              const candidatos = [...lista]
-                .sort((a, b) => Number(b.restante || 0) - Number(a.restante || 0))
-                .slice(0, 10);
+            // ⬇️ Reconciliación limitada: diferida hasta que terminen interacciones
+            InteractionManager.runAfterInteractions(() => {
+              if (cancelled) return;
 
-              for (const p of candidatos) {
-                try {
-                  const hoyLocal = todayInTZ(pickTZ(p?.tz, tzSession));
-                  const diasHabiles =
-                    Array.isArray(p?.diasHabiles) && p.diasHabiles.length
-                      ? p.diasHabiles
-                      : [1, 2, 3, 4, 5, 6];
-                  const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
-                  const pausas = Array.isArray(p?.pausas) ? p?.pausas : [];
-                  const modo = (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
-                  const permitirAdelantar = !!p?.permitirAdelantar;
-                  const cuotas =
-                    Number(p?.cuotas || 0) ||
-                    Math.ceil(
-                      Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
-                    );
+              (async () => {
+                const candidatos = [...lista]
+                  .sort((a, b) => Number(b.restante || 0) - Number(a.restante || 0))
+                  .slice(0, 10);
 
-                  const calc = calcularDiasAtraso({
-                    fechaInicio: p?.fechaInicio || hoyLocal,
-                    hoy: hoyLocal,
-                    cuotas,
-                    valorCuota: Number(p?.valorCuota || 0),
-                    abonos: (p?.abonos || []).map((a: any) => ({
-                      monto: Number(a.monto) || 0,
-                      operationalDate: a.operationalDate,
-                      fecha: a.fecha,
-                    })),
-                    diasHabiles,
-                    feriados,
-                    pausas,
-                    modo,
-                    permitirAdelantar,
-                  });
+                for (const p of candidatos) {
+                  if (cancelled) break;
+                  try {
+                    const hoyLocal = todayInTZ(pickTZ(p?.tz, tzSession));
+                    const diasHabiles =
+                      Array.isArray(p?.diasHabiles) && p.diasHabiles.length
+                        ? p.diasHabiles
+                        : [1, 2, 3, 4, 5, 6];
+                    const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
+                    const pausas = Array.isArray(p?.pausas) ? p?.pausas : [];
+                    const modo = (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
+                    const permitirAdelantar = !!p?.permitirAdelantar;
+                    const cuotas =
+                      Number(p?.cuotas || 0) ||
+                      Math.ceil(
+                        Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1)
+                      );
 
-                  if (calc.atraso !== Number(p.diasAtraso ?? -1)) {
-                    const ref = doc(db, 'clientes', p.clienteId!, 'prestamos', p.id);
-                    await updateDoc(ref, {
-                      diasAtraso: calc.atraso,
-                      faltas: calc.faltas || [],
-                      ultimaReconciliacion: serverTimestamp(),
+                    const calc = calcularDiasAtraso({
+                      fechaInicio: p?.fechaInicio || hoyLocal,
+                      hoy: hoyLocal,
+                      cuotas,
+                      valorCuota: Number(p?.valorCuota || 0),
+                      abonos: (p?.abonos || []).map((a: any) => ({
+                        monto: Number(a.monto) || 0,
+                        operationalDate: a.operationalDate,
+                        fecha: a.fecha,
+                      })),
+                      diasHabiles,
+                      feriados,
+                      pausas,
+                      modo,
+                      permitirAdelantar,
                     });
+
+                    if (calc.atraso !== Number(p.diasAtraso ?? -1)) {
+                      const ref = doc(db, 'clientes', p.clienteId!, 'prestamos', p.id);
+                      await updateDoc(ref, {
+                        diasAtraso: calc.atraso,
+                        faltas: calc.faltas || [],
+                        ultimaReconciliacion: serverTimestamp(),
+                      });
+                    }
+                  } catch {
+                    // best-effort
                   }
-                } catch (e) {
-                  // best-effort
                 }
-              }
-            })();
+              })();
+            });
           },
           (err) => {
             console.warn('[prestamos] snapshot error:', err?.code || err?.message || err);
@@ -476,6 +491,7 @@ export default function HomeScreen({ route, navigation }: Props) {
 
     suscribir();
     return () => {
+      cancelled = true;
       try { unsub && unsub(); } catch {}
     };
   }, [admin, tzSession]);
@@ -1356,6 +1372,12 @@ export default function HomeScreen({ route, navigation }: Props) {
       )}
     </SafeAreaView>
   );
+}
+
+/** --- util interno pequeño para throttle sin re-render --- */
+function useRefLike<T>(initial: T) {
+  const r = useRef<T>(initial);
+  return r.current;
 }
 
 /** --- Componentes pequeños --- */

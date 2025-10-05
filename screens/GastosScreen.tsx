@@ -2,9 +2,11 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, TextInput, FlatList, Alert,
-  SafeAreaView, ActivityIndicator, KeyboardAvoidingView, Platform, Keyboard,
+  ActivityIndicator, KeyboardAvoidingView, Platform, Keyboard,
   TouchableWithoutFeedback,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';

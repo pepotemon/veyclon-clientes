@@ -1,7 +1,6 @@
 // screens/CalculadoraScreen.tsx
 import React, { useMemo, useState } from 'react';
 import {
-  SafeAreaView,
   View,
   Text,
   TextInput,
@@ -12,6 +11,8 @@ import {
   Keyboard,
   TouchableOpacity,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { useAppTheme } from '../theme/ThemeProvider';
 import { MaterialCommunityIcons as MIcon } from '@expo/vector-icons';
 

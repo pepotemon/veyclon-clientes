@@ -1,5 +1,13 @@
 // screens/PagosDiariosScreen.tsx
-import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import React, {
+  useEffect,
+  useMemo,
+  useState,
+  useCallback,
+  useRef,
+  useTransition,
+  useDeferredValue,
+} from 'react';
 import {
   View,
   Text,
@@ -7,7 +15,6 @@ import {
   TextInput,
   StyleSheet,
   TouchableOpacity,
-  SafeAreaView,
   ActivityIndicator,
   Alert,
   AppState,
@@ -17,6 +24,7 @@ import {
   DeviceEventEmitter,
   Platform,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { db } from '../firebase/firebaseConfig';
@@ -117,6 +125,9 @@ export default function PagosDiariosScreen({ route }: any) {
   const [outboxPulse, setOutboxPulse] = useState(0);
 
   const tzSession = 'America/Sao_Paulo';
+
+  // 💫 transiciones no bloqueantes (igual que en Home)
+  const [isPending, startTransition] = useTransition();
 
   // ===== Helpers =====
   function toYYYYMMDDInTZ(date: Date, tz: string) {
@@ -314,8 +325,11 @@ export default function PagosDiariosScreen({ route }: any) {
               });
             });
 
-            setPrestamos(lista);
-            setCargando(false);
+            // ⬇️ transición para no bloquear al entrar muchos docs
+            startTransition(() => {
+              setPrestamos(lista);
+              setCargando(false);
+            });
           },
           (err) => {
             console.warn('[pagosDiarios] snapshot error:', err?.code || err?.message || err);
@@ -359,9 +373,10 @@ export default function PagosDiariosScreen({ route }: any) {
       });
   }, [prestamos, admin, outboxPulse]);
 
-  // ====== Búsqueda ligera sobre campos denormalizados ======
+  // ====== Búsqueda ligera (defer al tipear) ======
+  const busquedaDeferred = useDeferredValue(busqueda);
   const filasBuscadas = useMemo(() => {
-    const q = busqueda.trim().toLowerCase();
+    const q = busquedaDeferred.trim().toLowerCase();
     if (!q) return filas;
     return filas.filter((x) => {
       const hay = [x.concepto, x.clienteAlias, x.clienteDireccion1, x.clienteDireccion2, x.clienteTelefono1, x.clienteId]
@@ -370,7 +385,7 @@ export default function PagosDiariosScreen({ route }: any) {
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [filas, busqueda]);
+  }, [filas, busquedaDeferred]);
 
   const filasFiltradas = useMemo(() => {
     if (filtro === 'pendientes') return filasBuscadas.filter((p) => !esVisitadoHoy(p));

@@ -1,9 +1,10 @@
 // screens/DefinirCajaScreen.tsx
 import React, { useMemo, useState } from 'react';
-import {
-  SafeAreaView, View, Text, StyleSheet, TouchableOpacity, TextInput,
+import { View, Text, StyleSheet, TouchableOpacity, TextInput,
   Alert, KeyboardAvoidingView, Platform
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
