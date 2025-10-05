@@ -66,10 +66,9 @@ import {
   closeMissingDays,
 } from './utils/cajaEstado';
 
-// ⏱️ NUEVO: bloqueo por inactividad (no dibuja UI)
-import AppInactivityLock from './security/AppInactivityLock';
-// 🌐 NUEVO: referencia global de navegación
+// 👇 NUEVO: ref de navegación + gate de inactividad
 import { navigationRef } from './navigation/navigationRef';
+import InactivityGate from './security/InactivityGate';
 
 // Tipado de navegación
 export type RootStackParamList = {
@@ -387,9 +386,10 @@ export default function App() {
   return (
     <SafeAreaProvider /* @ts-ignore */ style={{ backgroundColor: '#0000' }}>
       <ThemeProvider>
-        {/* ⏱️ Cierre de sesión automático tras 3 min en background/inactive */}
-        <AppInactivityLock idleMs={3 * 60_000} countWhileInactive />
-        <AppNavigator />
+        {/* ⬇️ NUEVO: cierre de sesión por inactividad global (3 min) */}
+        <InactivityGate idleMs={180000}>
+          <AppNavigator />
+        </InactivityGate>
       </ThemeProvider>
     </SafeAreaProvider>
   );

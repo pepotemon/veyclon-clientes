@@ -201,7 +201,10 @@ export default function CalculadoraScreen() {
 
   // ─────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}

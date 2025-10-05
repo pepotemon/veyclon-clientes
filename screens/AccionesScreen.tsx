@@ -97,7 +97,10 @@ export default function AccionesScreen({ route, navigation }: Props) {
     ) : null;
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <View style={[styles.header, { borderBottomColor: palette.topBorder, backgroundColor: palette.topBg }]}>
         <Text style={[styles.headerTxt, { color: palette.text }]}>Acciones</Text>
       </View>

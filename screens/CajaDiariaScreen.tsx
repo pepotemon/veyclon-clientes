@@ -435,7 +435,10 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   };
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <View
         style={[styles.header, { backgroundColor: palette.topBg, borderBottomColor: palette.topBorder }]}
       >

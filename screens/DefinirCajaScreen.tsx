@@ -100,7 +100,10 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
   };
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
         <View style={[styles.container, { padding: 16 }]}>
           <Text style={[styles.title, { color: palette.text }]}>Definir caja</Text>

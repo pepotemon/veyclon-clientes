@@ -93,7 +93,10 @@ export default function HistorialPagosScreen({ route, navigation }: Props) {
   const esHoy = (ymd: string, tz?: string) => ymd === todayInTZ(pickTZ(tz, 'America/Sao_Paulo'));
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       {/* Header */}
       <View
         style={[

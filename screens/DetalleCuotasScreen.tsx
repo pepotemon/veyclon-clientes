@@ -30,7 +30,10 @@ export default function DetalleCuotasScreen({ route, navigation }: Props) {
   const faltante = sobrante > 0 ? valorCuota - sobrante : 0;
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       {/* Header */}
       <View
         style={[

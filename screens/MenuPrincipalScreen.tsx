@@ -158,7 +158,10 @@ export default function MenuPrincipalScreen({ navigation }: Props) {
   ];
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: palette.screenBg }]}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <Text style={[styles.title, { color: palette.text }]}>Menú Principal</Text>
 
       <View style={styles.grid}>

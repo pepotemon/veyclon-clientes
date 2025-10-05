@@ -881,7 +881,10 @@ useEffect(() => {
 
   // ===== Render =====
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right',]}   // 👈 evita el hueco
+  >
       {/* TopBar */}
       <View
         style={[

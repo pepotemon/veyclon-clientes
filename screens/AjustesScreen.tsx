@@ -103,7 +103,10 @@ export default function AjustesScreen({ navigation }: Props) {
   );
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+  <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
       <View
         style={[

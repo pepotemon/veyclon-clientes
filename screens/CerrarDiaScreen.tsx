@@ -302,7 +302,10 @@ export default function CerrarDiaScreen({ route }: Props) {
 
   // ====== UI ======
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+     <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       {/* Header */}
       <View style={[styles.header, { borderBottomColor: palette.topBorder }]}>
         <View>

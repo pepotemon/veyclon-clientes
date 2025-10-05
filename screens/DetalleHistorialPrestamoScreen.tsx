@@ -126,7 +126,10 @@ export default function DetalleHistorialPrestamoScreen({ route, navigation }: Pr
   }, [docData]);
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       {/* Header */}
       <View
         style={[

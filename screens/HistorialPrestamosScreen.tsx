@@ -98,7 +98,10 @@ export default function HistorialPrestamosScreen({ route, navigation }: Props) {
   }, [clienteId, admin]);
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       {/* Header */}
       <View
         style={[

@@ -110,7 +110,10 @@ export default function PantallaInformes({ navigation, route }: Props) {
   ];
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: palette.screenBg }]}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
 
       <Text style={[styles.titulo, { color: palette.text }]}>Informes</Text>

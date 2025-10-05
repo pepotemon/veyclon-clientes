@@ -252,7 +252,10 @@ export default function EnrutarClientesScreen({ route }: Props) {
   const { cardBg, cardBorder, text, softText, topBg, topBorder } = palette;
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }}>
+      <SafeAreaView
+    style={{ flex: 1, backgroundColor: palette.screenBg }}
+    edges={['left','right','bottom']}   // 👈 evita el hueco
+  >
       <View style={[styles.header, { backgroundColor: topBg, borderBottomColor: topBorder }]}>
         <Text style={[styles.headerTxt, { color: text }]}>Enrutar clientes</Text>
       </View>
