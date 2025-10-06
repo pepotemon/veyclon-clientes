@@ -245,7 +245,7 @@ export default function PagosDiariosScreen({ route }: any) {
       const tz = pickTZ(p.tz, tzSession);
       const hoy = todayInTZ(tz);
 
-      // 1) Legacy: arreglo embebido en el documento (todavía puede existir)
+      // 1) Legacy
       const viaArray =
         Array.isArray(p.abonos) &&
         p.abonos.some((a) => {
@@ -255,14 +255,14 @@ export default function PagosDiariosScreen({ route }: any) {
 
       if (viaArray) return true;
 
-      // 2) Nuevo: marcamos lastAbonoAt en el préstamo cuando se reenvía un abono (subcolección)
+      // 2) lastAbonoAt
       const lastYmd = anyDateToYYYYMMDD(p.lastAbonoAt, tz);
       return lastYmd === hoy;
     },
     [tzSession]
   );
 
-  // ======== Stream de préstamos (SIN índices compuestos) — filtrado en cliente ========
+  // ======== Stream de préstamos ========
   useEffect(() => {
     let unsub: undefined | (() => void);
 
@@ -270,7 +270,6 @@ export default function PagosDiariosScreen({ route }: any) {
       try {
         setCargando(true);
 
-        // 🔸 Solo filtramos por admin en servidor; el resto en cliente
         const qPrestamos = query(
           collectionGroup(db, 'prestamos'),
           where('creadoPor', '==', admin)
@@ -296,7 +295,7 @@ export default function PagosDiariosScreen({ route }: any) {
                 modalidad: data.modalidad ?? 'Diaria',
                 clienteId: data.clienteId,
 
-                // denormalizados (NO join)
+                // denormalizados
                 clienteAlias: data.clienteAlias ?? data.clienteNombre ?? '',
                 clienteDireccion1: data.clienteDireccion1 ?? '',
                 clienteDireccion2: data.clienteDireccion2 ?? '',
@@ -318,14 +317,12 @@ export default function PagosDiariosScreen({ route }: any) {
 
                 lastAbonoAt: data.lastAbonoAt,
 
-                // claves de orden baratas en el doc
                 routeOrder: typeof data.routeOrder === 'number' ? data.routeOrder : undefined,
                 proximoVencimiento: typeof data.proximoVencimiento === 'string' ? data.proximoVencimiento : undefined,
                 status: data.status,
               });
             });
 
-            // ⬇️ transición para no bloquear al entrar muchos docs
             startTransition(() => {
               setPrestamos(lista);
               setCargando(false);
@@ -349,16 +346,12 @@ export default function PagosDiariosScreen({ route }: any) {
     };
   }, [admin]);
 
-  // ====== Orden barato por UNA sola clave: routeOrder o proximoVencimiento; fallback: concepto ======
+  // ====== Orden barato ======
   const filas: Prestamo[] = useMemo(() => {
     const BIG = 1e9;
     const normDate = (s?: string) => (s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : '9999-12-31');
 
     return [...prestamos]
-      // 🔸 Filtrado en cliente para evitar índice compuesto:
-      //   - del admin
-      //   - status 'activo' (legacy: si no hay status, lo consideramos activo)
-      //   - restante > 0
       .filter((p) => p.creadoPor === admin && (p.status ? p.status === 'activo' : true) && Number(p.restante) > 0)
       .sort((a, b) => {
         const ra = typeof a.routeOrder === 'number' ? a.routeOrder : BIG;
@@ -373,7 +366,7 @@ export default function PagosDiariosScreen({ route }: any) {
       });
   }, [prestamos, admin, outboxPulse]);
 
-  // ====== Búsqueda ligera (defer al tipear) ======
+  // ====== Búsqueda ======
   const busquedaDeferred = useDeferredValue(busqueda);
   const filasBuscadas = useMemo(() => {
     const q = busquedaDeferred.trim().toLowerCase();
@@ -408,12 +401,52 @@ export default function PagosDiariosScreen({ route }: any) {
     setTimeout(() => setMensajeExito(''), 2500);
   };
 
+  // ✅ Handler de éxito: optimista + confirmación final
+  const handlePagoSuccess = useCallback((payload?: {
+    clienteId: string;
+    prestamoId: string;
+    monto: number;
+    restanteNuevo?: number;
+    optimistic?: boolean;
+  }) => {
+    if (!payload) {
+      // Compat: si el modal aún no envía payload, al menos mostramos el toast
+      mostrarMensajeExito('Pago registrado correctamente');
+      return;
+    }
+
+    const { prestamoId, monto, restanteNuevo, optimistic } = payload;
+
+    // Pintar verde y ajustar restante **al instante** en la lista local
+    setPrestamos((prev) =>
+      prev.map((it) => {
+        if (it.id !== prestamoId) return it;
+        const base = {
+          ...it,
+          // Marcamos "visitado hoy" con un timestamp local; esVisitadoHoy lo detecta
+          lastAbonoAt: Date.now(),
+        };
+
+        if (optimistic) {
+          const rest = Math.max((it.restante ?? 0) - (monto ?? 0), 0);
+          return { ...base, restante: rest };
+        }
+
+        // Confirmación final: usamos el restante real si viene
+        return typeof restanteNuevo === 'number'
+          ? { ...base, restante: Math.max(restanteNuevo, 0) }
+          : base;
+      })
+    );
+
+    // Mostramos el toast solo cuando no es optimista (para evitar duplicado)
+    if (!optimistic) {
+      mostrarMensajeExito('Pago registrado correctamente');
+    }
+  }, []);
+
   // ===== Fila memoizada =====
-  const RowItem = React.memo(function RowItem({
-    item,
-  }: {
-    item: Prestamo;
-  }) {
+  const RowItem = React.memo(function RowItem({ item }: { item: Prestamo }) {
     const visitado = esVisitadoHoy(item);
     const esNuevo = !visitado && esNuevoHoyOPas48h(item);
 
@@ -562,10 +595,10 @@ export default function PagosDiariosScreen({ route }: any) {
   );
 
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right']}   // 👈 evita el hueco
-  >
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: palette.screenBg }}
+      edges={['left','right']}   // 👈 evita el hueco
+    >
       <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
 
       {/* Header */}
@@ -616,12 +649,11 @@ export default function PagosDiariosScreen({ route }: any) {
               <Text style={{ color: palette.softText }}>No hay resultados.</Text>
             </View>
           }
-          // 🔧 Virtualización estable sin getItemLayout ni hacks de altura fija
+          // 🔧 Virtualización
           initialNumToRender={20}
           maxToRenderPerBatch={20}
           windowSize={9}
           updateCellsBatchingPeriod={40}
-          // Evitar parpadeos en Android (sombras/overlays)
           removeClippedSubviews={Platform.OS === 'ios'}
           keyboardShouldPersistTaps="always"
           extraData={outboxPulse}
@@ -662,7 +694,7 @@ export default function PagosDiariosScreen({ route }: any) {
           } else if (opcion === 'historial') {
             setOpcionesVisible(false);
 
-            // 🔎 Traer abonos desde SUBCOLECCIÓN para que el historial incluya offline/outbox
+            // 🔎 Traer abonos desde SUBCOLECCIÓN
             let abonosCompat: { monto: number; fecha: string }[] = [];
             try {
               if (prestamoSeleccionado?.clienteId && prestamoSeleccionado?.id) {
@@ -733,7 +765,8 @@ export default function PagosDiariosScreen({ route }: any) {
         clienteId={selectedRef.current?.clienteId ?? ''}
         prestamoId={selectedRef.current?.id ?? ''}
         admin={admin}
-        onSuccess={() => mostrarMensajeExito('Pago registrado correctamente')}
+        // ✅ usa el handler optimista/confirmación
+        onSuccess={handlePagoSuccess}
       />
 
       {mensajeExito !== '' && (

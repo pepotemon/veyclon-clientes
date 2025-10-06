@@ -5,17 +5,15 @@ import {
   Text,
   TextInput,
   StyleSheet,
-  ScrollView,
   TouchableOpacity,
   Alert,
   Modal,
   Pressable,
-  KeyboardAvoidingView,
-  Platform,
-  TouchableWithoutFeedback,
   Keyboard,
   BackHandler,
   ActivityIndicator,
+  Platform,
+  findNodeHandle,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -23,16 +21,12 @@ import NetInfo from '@react-native-community/netinfo';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { db } from '../firebase/firebaseConfig';
-import {
-  collection,
-  doc,
-  serverTimestamp,
-  writeBatch,
-} from 'firebase/firestore';
+import { collection, doc, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { todayInTZ, pickTZ } from '../utils/timezone';
 import { useAppTheme } from '../theme/ThemeProvider';
 import { logAudit, pick } from '../utils/auditLogs';
 import { addToOutbox } from '../utils/outbox';
+import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoPrestamo'>;
 
@@ -74,6 +68,20 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
   // 👇 refs para Enter → siguiente
   const refValorNeto = useRef<TextInput>(null);
   const refCuotas = useRef<TextInput>(null);
+
+  // 👇 ref del scroll + helper para centrar el campo enfocado
+  const scrollRef = useRef<any>(null);
+  const focusAndScrollTo = (r: React.RefObject<TextInput | null>) => {
+    setTimeout(() => {
+      const node = r.current ? findNodeHandle(r.current) : null;
+      r.current?.focus();
+      if (node && scrollRef.current?.scrollToFocusedInput) {
+        setTimeout(() => {
+          scrollRef.current.scrollToFocusedInput(node, 90); // margen extra sobre teclado
+        }, 16);
+      }
+    }, 0);
+  };
 
   useEffect(() => {
     const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -197,13 +205,8 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
               fechaInicio: fechaInicioOperativa,
               tz,
               operationalDate: hoyIso,
-              // Dinero que sale de caja al entregar el préstamo (retiro)
               retiroCaja: valor,
-              meta: {
-                modalidad: prestamo.modalidad,
-                interesPct,
-                valorNeto: valor,
-              },
+              meta: { modalidad: prestamo.modalidad, interesPct, valorNeto: valor },
             },
           });
 
@@ -222,10 +225,10 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         }
       }
 
-      // ========== ONLINE: batch (2–4 writes efectivos) ==========
+      // ========== ONLINE: batch ==========
       const batch = writeBatch(db);
 
-      // 1) Crear/actualizar cliente en /clientes
+      // 1) Cliente
       let clienteRef;
       if (existingClienteId) {
         clienteRef = doc(db, 'clientes', existingClienteId);
@@ -237,8 +240,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
           actualizadoEn: serverTimestamp(),
         };
         batch.set(clienteRef, updatePayload, { merge: true });
-
-        // 🔍 AUDIT (best-effort)
         void logAudit({
           userId: admin,
           action: 'update',
@@ -248,15 +249,8 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       } else {
         clienteRef = doc(collection(db, 'clientes'));
         const clienteId = clienteRef.id;
-        const createPayload = {
-          ...cliente,
-          creadoPor: admin,
-          creadoEn: serverTimestamp(),
-          id: clienteId,
-        };
+        const createPayload = { ...cliente, creadoPor: admin, creadoEn: serverTimestamp(), id: clienteId };
         batch.set(clienteRef, createPayload);
-
-        // 🔍 AUDIT
         void logAudit({
           userId: admin,
           action: 'create',
@@ -265,51 +259,43 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         });
       }
 
-      // 2) Crear préstamo con campos **denormalizados** y **agregados** iniciales
-      const prestamoRef = doc(collection(clienteRef, 'prestamos')); // ID anticipado (para caja)
+      // 2) Préstamo
+      const prestamoRef = doc(collection(clienteRef, 'prestamos'));
       const prestamoPayload = {
-        // Identidad / tracking
         creadoPor: admin,
         creadoEn: serverTimestamp(),
         createdAtMs: Date.now(),
-        createdDate: hoyIso, // ✅ YYYY-MM-DD en TZ del préstamo
+        createdDate: hoyIso,
         clienteId: existingClienteId ?? clienteRef.id,
-
-        // Denormalizados del cliente (para evitar joins)
         clienteNombre: concepto,
         clienteAlias: cliente?.alias ?? '',
         clienteDireccion1: cliente?.direccion1 ?? '',
         clienteTelefono1: cliente?.telefono1 ?? '',
-
-        // Esquema de negocio
-        concepto, // visible en UI
+        concepto,
         modalidad: prestamo.modalidad,
         interes: interesPct,
         valorNeto: valor,
-        totalPrestamo: total, // alias
-        montoTotal: total, // compat
+        totalPrestamo: total,
+        montoTotal: total,
         valorCuota: vCuota,
-        cuotas: cuotasNum, // compat
-        cuotasTotales: cuotasNum, // ✅ agregado explícito
-        cuotasPagadas: 0, // ✅ agregado
-        restante: total, // ✅ agregado
-        diasAtraso: 0, // ✅ agregado
-        status: 'activo' as const, // ✅ filtro principal
+        cuotas: cuotasNum,
+        cuotasTotales: cuotasNum,
+        cuotasPagadas: 0,
+        restante: total,
+        diasAtraso: 0,
+        status: 'activo' as const,
         permitirAdelantar: true,
-
-        // Calendario / control
         fechaInicio: fechaInicioOperativa,
-        tz,
-        diasHabiles,
+        tz: pickTZ((cliente as any)?.tz),
+        diasHabiles: [1, 2, 3, 4, 5, 6],
         feriados: [],
         pausas: [],
-        proximoVencimiento: fechaInicioOperativa, // ✅ agregado
-        dueToday: false, // ✅ agregado
+        proximoVencimiento: fechaInicioOperativa,
+        dueToday: false,
       };
       batch.set(prestamoRef, prestamoPayload);
 
-      // 3) CajaDiaria: asiento del **capital entregado** (tipo 'prestamo')
-      //    ID determinístico para evitar duplicados si el usuario toca dos veces
+      // 3) CajaDiaria
       const cajaDocId = `loan_${prestamoRef.id}`;
       const cajaRef = doc(collection(db, 'cajaDiaria'), cajaDocId);
       const cajaPayload = {
@@ -317,7 +303,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         admin,
         monto: Number(valor),
         operationalDate: hoyIso,
-        tz,
+        tz: pickTZ((cliente as any)?.tz),
         clienteId: existingClienteId ?? clienteRef.id,
         prestamoId: prestamoRef.id,
         clienteNombre: concepto,
@@ -327,7 +313,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       };
       batch.set(cajaRef, cajaPayload);
 
-      // 4) (Opcional pero recomendado) Índice clientesDisponibles
+      // 4) Índice clientesDisponibles
       const idxRef = doc(db, 'clientesDisponibles', existingClienteId ?? clienteRef.id);
       const idxPayload = {
         id: existingClienteId ?? clienteRef.id,
@@ -341,10 +327,8 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       };
       batch.set(idxRef, idxPayload, { merge: true });
 
-      // Commit único
       await batch.commit();
 
-      // 🔍 AUDIT: préstamo creado (best-effort)
       void logAudit({
         userId: admin,
         action: 'create',
@@ -379,10 +363,10 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
   };
 
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right','bottom']}   // 👈 evita el hueco
-  >
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: palette.screenBg }}
+      edges={['left','right','bottom']}   // 👈 evita el hueco
+    >
       {/* Header */}
       <View
         style={[
@@ -393,124 +377,132 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         <Text style={[styles.headerTitle, { color: palette.text }]}>Nuevo préstamo</Text>
       </View>
 
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        style={{ flex: 1 }}
+      {/* Scroll que acompaña al teclado y centra el input enfocado */}
+      <KeyboardAwareScrollView
+        ref={scrollRef}
+        enableOnAndroid
+        enableAutomaticScroll
+        extraScrollHeight={100}
+        keyboardOpeningTime={0}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={styles.container}
       >
-        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-          <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-            {/* Card 1: Parámetros */}
-            <View
+        {/* Card 1: Parámetros */}
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
+          ]}
+        >
+          <Text style={[styles.sectionTitle, { color: palette.text }]}>Parámetros</Text>
+
+          <Label palette={palette}>Modalidad *</Label>
+          <TouchableOpacity
+            style={[
+              styles.selector,
+              { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
+            ]}
+            onPress={() => {
+              Keyboard.dismiss();
+              setModalidadVisible(true);
+            }}
+            activeOpacity={0.85}
+          >
+            <Text
               style={[
-                styles.card,
-                { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
+                styles.selectorText,
+                { color: toNum(prestamo.modalidad ? '1' : '0') > 0 ? palette.text : palette.softText },
               ]}
             >
-              <Text style={[styles.sectionTitle, { color: palette.text }]}>Parámetros</Text>
+              {prestamo.modalidad || 'Seleccionar'}
+            </Text>
+          </TouchableOpacity>
 
-              <Label palette={palette}>Modalidad *</Label>
-              <TouchableOpacity
-                style={[
-                  styles.selector,
-                  { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
-                ]}
-                onPress={() => setModalidadVisible(true)}
-                activeOpacity={0.85}
-              >
-                <Text
-                  style={[
-                    styles.selectorText,
-                    { color: prestamo.modalidad ? palette.text : palette.softText },
-                  ]}
-                >
-                  {prestamo.modalidad || 'Seleccionar'}
-                </Text>
-              </TouchableOpacity>
-
-              <Label palette={palette}>Interés (%) *</Label>
-              <TouchableOpacity
-                style={[
-                  styles.selector,
-                  { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
-                ]}
-                onPress={() => setInteresVisible(true)}
-                activeOpacity={0.85}
-              >
-                <Text
-                  style={[
-                    styles.selectorText,
-                    { color: toNum(prestamo.interes) > 0 ? palette.text : palette.softText },
-                  ]}
-                >
-                  {toNum(prestamo.interes) > 0 ? `${prestamo.interes}%` : 'Seleccionar'}
-                </Text>
-              </TouchableOpacity>
-
-              <Text style={{ color: palette.softText, fontSize: 10, marginTop: 4 }}>
-                * Adelantar cuotas está activo por defecto para este préstamo.
-              </Text>
-            </View>
-
-            {/* Card 2: Montos */}
-            <View
+          <Label palette={palette}>Interés (%) *</Label>
+          <TouchableOpacity
+            style={[
+              styles.selector,
+              { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
+            ]}
+            onPress={() => {
+              Keyboard.dismiss();
+              setInteresVisible(true);
+            }}
+            activeOpacity={0.85}
+          >
+            <Text
               style={[
-                styles.card,
-                { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
+                styles.selectorText,
+                { color: toNum(prestamo.interes) > 0 ? palette.text : palette.softText },
               ]}
             >
-              <Text style={[styles.sectionTitle, { color: palette.text }]}>Montos</Text>
+              {toNum(prestamo.interes) > 0 ? `${prestamo.interes}%` : 'Seleccionar'}
+            </Text>
+          </TouchableOpacity>
 
-              <Field
-                label="Valor neto (R$)"
-                value={prestamo.valorNeto}
-                onChangeText={(v) => handleChange('valorNeto', v)}
-                keyboardType="numeric"
-                palette={palette}
-                inputRef={refValorNeto}
-                returnKeyType="next"
-                blurOnSubmit={false}
-                onSubmitEditing={() => refCuotas.current?.focus()}
-              />
+          <Text style={{ color: palette.softText, fontSize: 10, marginTop: 4 }}>
+            * Adelantar cuotas está activo por defecto para este préstamo.
+          </Text>
+        </View>
 
-              <Field
-                label="Total préstamo (calculado)"
-                value={prestamo.totalPrestamo}
-                editable={false}
-                palette={palette}
-              />
+        {/* Card 2: Montos */}
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
+          ]}
+        >
+          <Text style={[styles.sectionTitle, { color: palette.text }]}>Montos</Text>
 
-              <Field
-                label="Número de cuotas"
-                value={prestamo.cuotas}
-                onChangeText={(v) => handleChange('cuotas', v)}
-                keyboardType="numeric"
-                palette={palette}
-                inputRef={refCuotas}
-                returnKeyType="done"
-                blurOnSubmit={true}
-                onSubmitEditing={confirmarGuardado}
-              />
+          <Field
+            label="Valor neto (R$)"
+            value={prestamo.valorNeto}
+            onChangeText={(v) => handleChange('valorNeto', v)}
+            keyboardType="numeric"
+            palette={palette}
+            inputRef={refValorNeto}
+            returnKeyType="next"
+            blurOnSubmit={false}
+            onSubmitEditing={() => focusAndScrollTo(refCuotas)}
+          />
 
-              <Field
-                label="Valor por cuota (calculado)"
-                value={prestamo.valorCuota}
-                editable={false}
-                palette={palette}
-              />
-            </View>
+          <Field
+            label="Total préstamo (calculado)"
+            value={prestamo.totalPrestamo}
+            editable={false}
+            palette={palette}
+          />
 
-            {/* Botón guardar */}
-            <TouchableOpacity
-              style={[styles.btn, { backgroundColor: palette.accent }, guardando && { opacity: 0.7 }]}
-              onPress={confirmarGuardado}
-              disabled={guardando}
-              activeOpacity={0.9}
-            >
-              {guardando ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnTxt}>Guardar</Text>}
-            </TouchableOpacity>
-          </ScrollView>
-        </TouchableWithoutFeedback>
-      </KeyboardAvoidingView>
+          <Field
+            label="Número de cuotas"
+            value={prestamo.cuotas}
+            onChangeText={(v) => handleChange('cuotas', v)}
+            keyboardType="numeric"
+            palette={palette}
+            inputRef={refCuotas}
+            returnKeyType="done"
+            blurOnSubmit
+            onSubmitEditing={confirmarGuardado}
+          />
+
+          <Field
+            label="Valor por cuota (calculado)"
+            value={prestamo.valorCuota}
+            editable={false}
+            palette={palette}
+          />
+        </View>
+
+        {/* Botón guardar */}
+        <TouchableOpacity
+          style={[styles.btn, { backgroundColor: palette.accent }, guardando && { opacity: 0.7 }]}
+          onPress={confirmarGuardado}
+          disabled={guardando}
+          activeOpacity={0.9}
+        >
+          {guardando ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnTxt}>Guardar</Text>}
+        </TouchableOpacity>
+      </KeyboardAwareScrollView>
 
       {/* Picker Modalidad */}
       <Modal
@@ -522,28 +514,26 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         statusBarTranslucent
         hardwareAccelerated
       >
-        <TouchableWithoutFeedback onPress={() => setModalidadVisible(false)}>
-          <View style={styles.sheetOverlay}>
-            <View style={[styles.sheet, { backgroundColor: palette.cardBg }]}>
-              {['Diaria', 'Semanal', 'Quincenal', 'Mensual'].map((modo) => (
-                <Pressable
-                  key={modo}
-                  onPress={() => {
-                    setModalidadVisible(false);
-                    handleChange('modalidad', modo);
-                  }}
-                  style={({ pressed }) => [
-                    styles.optionRow,
-                    { borderBottomColor: palette.cardBorder },
-                    pressed && { opacity: 0.9 },
-                  ]}
-                >
-                  <Text style={[styles.optionTxt, { color: palette.text }]}>{modo}</Text>
-                </Pressable>
-              ))}
-            </View>
+        <View style={styles.sheetOverlay}>
+          <View style={[styles.sheet, { backgroundColor: palette.cardBg }]}>
+            {['Diaria', 'Semanal', 'Quincenal', 'Mensual'].map((modo) => (
+              <Pressable
+                key={modo}
+                onPress={() => {
+                  setModalidadVisible(false);
+                  handleChange('modalidad', modo);
+                }}
+                style={({ pressed }) => [
+                  styles.optionRow,
+                  { borderBottomColor: palette.cardBorder },
+                  pressed && { opacity: 0.9 },
+                ]}
+              >
+                <Text style={[styles.optionTxt, { color: palette.text }]}>{modo}</Text>
+              </Pressable>
+            ))}
           </View>
-        </TouchableWithoutFeedback>
+        </View>
       </Modal>
 
       {/* Picker Interés */}
@@ -556,28 +546,26 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         statusBarTranslucent
         hardwareAccelerated
       >
-        <TouchableWithoutFeedback onPress={() => setInteresVisible(false)}>
-          <View style={styles.sheetOverlay}>
-            <View style={[styles.sheet, { backgroundColor: palette.cardBg }]}>
-              {[10, 20, 25, 26].map((int) => (
-                <Pressable
-                  key={int}
-                  onPress={() => {
-                    setInteresVisible(false);
-                    handleChange('interes', String(int));
-                  }}
-                  style={({ pressed }) => [
-                    styles.optionRow,
-                    { borderBottomColor: palette.cardBorder },
-                    pressed && { opacity: 0.9 },
-                  ]}
-                >
-                  <Text style={[styles.optionTxt, { color: palette.text }]}>{int}%</Text>
-                </Pressable>
-              ))}
-            </View>
+        <View style={styles.sheetOverlay}>
+          <View style={[styles.sheet, { backgroundColor: palette.cardBg }]}>
+            {[10, 20, 25, 26].map((int) => (
+              <Pressable
+                key={int}
+                onPress={() => {
+                  setInteresVisible(false);
+                  handleChange('interes', String(int));
+                }}
+                style={({ pressed }) => [
+                  styles.optionRow,
+                  { borderBottomColor: palette.cardBorder },
+                  pressed && { opacity: 0.9 },
+                ]}
+              >
+                <Text style={[styles.optionTxt, { color: palette.text }]}>{int}%</Text>
+              </Pressable>
+            ))}
           </View>
-        </TouchableWithoutFeedback>
+        </View>
       </Modal>
     </SafeAreaView>
   );

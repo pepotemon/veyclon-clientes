@@ -15,6 +15,14 @@ import { logAudit, pick } from '../utils/auditLogs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { addToOutbox } from '../utils/outbox';
 
+type SuccessPayload = {
+  clienteId: string;
+  prestamoId: string;
+  monto: number;
+  restanteNuevo?: number;
+  optimistic?: boolean;
+};
+
 type Props = {
   visible: boolean;
   onClose: () => void;
@@ -22,14 +30,14 @@ type Props = {
   clienteId?: string;
   prestamoId?: string;
   admin: string;
-  onSuccess?: () => void;
+  onSuccess?: (p?: SuccessPayload) => void;
   clienteTelefono?: string;
 };
 
 const quotaCache: Record<string, { cuota: number; saldo: number }> = {};
 const KEY_SEND_RECEIPT_CONFIRM = 'prefs:sendReceiptConfirm';
 
-/** ✅ Abrir WhatsApp sin número: deep-link → fallback web. */
+/** Abrir WhatsApp sin número: deep-link → fallback web. */
 async function openWhats(text: string) {
   const encoded = encodeURIComponent(text || '');
   const deep = `whatsapp://send?text=${encoded}`;
@@ -75,9 +83,13 @@ export default function ModalRegistroPago({
 
   const [valorCuota, setValorCuota] = useState<number>(0);
   const [saldoPendiente, setSaldoPendiente] = useState<number>(0);
+  const [loadingCuota, setLoadingCuota] = useState(false); // ← evita “Usar cuota” con dato viejo
 
   const [prefConfirmReceipt, setPrefConfirmReceipt] = useState(false);
   const hasOpenedWhatsRef = useRef(false);
+
+  // Token anti “race condition” entre aperturas rápidas
+  const requestTokenRef = useRef<string>('');
 
   const [contentReady, setContentReady] = useState(false);
   useEffect(() => {
@@ -97,22 +109,47 @@ export default function ModalRegistroPago({
     const cargarInfo = async () => {
       if (!visible) return;
 
+      // 1) Reset duro al abrir/cambiar cliente → evita “heredar” cuota anterior
+      setMonto('');
+      setValorCuota(0);
+      setSaldoPendiente(0);
+      setLoading(false);
+      setLoadingCuota(true);
+
+      // token para este ciclo de carga
+      const token = `${clienteId ?? ''}:${prestamoId ?? ''}:${Date.now()}`;
+      requestTokenRef.current = token;
+
       try {
         const v = await AsyncStorage.getItem(KEY_SEND_RECEIPT_CONFIRM);
-        setPrefConfirmReceipt(v === '1');
-      } catch { setPrefConfirmReceipt(false); }
-
-      if (!clienteId || !prestamoId) return;
-
-      const cacheHit = quotaCache[prestamoId];
-      if (cacheHit) {
-        setValorCuota(cacheHit.cuota);
-        setSaldoPendiente(cacheHit.saldo);
+        if (requestTokenRef.current === token) {
+          setPrefConfirmReceipt(v === '1');
+        }
+      } catch {
+        if (requestTokenRef.current === token) setPrefConfirmReceipt(false);
       }
 
+      if (!clienteId || !prestamoId) {
+        if (requestTokenRef.current === token) setLoadingCuota(false);
+        return;
+      }
+
+      // 2) Cache: si existe, úsalo YA
+      const cacheHit = quotaCache[prestamoId];
+      if (cacheHit) {
+        if (requestTokenRef.current === token) {
+          setValorCuota(cacheHit.cuota);
+          setSaldoPendiente(cacheHit.saldo);
+          setLoadingCuota(false);
+        }
+      }
+
+      // 3) Lectura fresca (asíncrona, puede llegar más tarde)
       try {
         const ref = doc(db, 'clientes', clienteId, 'prestamos', prestamoId);
         const snap = await getDoc(ref);
+        if (requestTokenRef.current !== token) return; // respuesta de una apertura anterior
+
         if (snap.exists()) {
           const d = snap.data() as any;
           const cuota = Number(d?.valorCuota ?? 0) || 0;
@@ -127,9 +164,14 @@ export default function ModalRegistroPago({
           setValorCuota(0);
           setSaldoPendiente(0);
         }
-      } catch {}
+      } catch {
+        // silencioso
+      } finally {
+        if (requestTokenRef.current === token) setLoadingCuota(false);
+      }
     };
-    cargarInfo();
+
+    void cargarInfo();
     if (!visible) setMonto('');
   }, [visible, clienteId, prestamoId]);
 
@@ -145,7 +187,6 @@ export default function ModalRegistroPago({
       Alert.alert('Monto inválido', 'Ingresa un monto mayor a 0.');
       return;
     }
-    // ✅ BLOQUEO: no permitir monto mayor al saldo pendiente
     if (montoNum > saldoPendiente) {
       Alert.alert(
         'Monto demasiado alto',
@@ -164,6 +205,9 @@ export default function ModalRegistroPago({
     if (!clienteId || !prestamoId) return;
     if (loading) return;
 
+    // Optimista inmediato → que la lista pinte en verde ya
+    onSuccess?.({ clienteId, prestamoId, monto: montoNum, optimistic: true });
+
     onClose();
     setLoading(true);
     Keyboard.dismiss();
@@ -172,7 +216,7 @@ export default function ModalRegistroPago({
     const abonoRef: DocumentReference = doc(collection(prestamoRef, 'abonos'));
 
     try {
-      // ====================== TRANSACCIÓN ======================
+      // ====================== HOT PATH: TRANSACCIÓN (único paso bloqueante) ======================
       const txResult = await runTransaction(db, async (tx) => {
         const snap = await tx.get(prestamoRef);
         if (!snap.exists()) throw new Error('El préstamo no existe.');
@@ -189,14 +233,21 @@ export default function ModalRegistroPago({
         const valorCuotaTx = Number(data?.valorCuota || 0);
         const cuotasTotalesTx =
           Number(data?.cuotasTotales || data?.cuotas || 0) ||
-          Math.ceil(Number(data.totalPrestamo || data.montoTotal || 0) / (valorCuotaTx || 1)) ||
+          Math.ceil(
+            Number(data.totalPrestamo || data.montoTotal || 0) /
+              (valorCuotaTx || 1)
+          ) ||
           0;
 
         const prevCuotasPagadas =
           typeof data?.cuotasPagadas === 'number'
             ? Number(data.cuotasPagadas)
             : valorCuotaTx > 0
-              ? Math.floor((Number(data.totalPrestamo || data.montoTotal || 0) - restanteActual) / valorCuotaTx)
+              ? Math.floor(
+                  (Number(data.totalPrestamo || data.montoTotal || 0) -
+                    restanteActual) /
+                    valorCuotaTx
+                )
               : 0;
 
         const nowMs = Date.now();
@@ -210,16 +261,19 @@ export default function ModalRegistroPago({
           source: 'app',
         };
 
-        // 1) Guardar el abono en SUBCOLECCIÓN
+        // 1) Abono (subcolección)
         tx.set(abonoRef, nuevoAbono);
 
-        // 2) Actualizar **solo agregados** del préstamo (🚫 sin array abonos)
+        // 2) Agregados del préstamo
         const nuevoRestante = Math.max(restanteActual - montoNum, 0);
         const deltaCuotas = valorCuotaTx > 0 ? Math.floor(montoNum / valorCuotaTx) : 0;
-        const nuevasCuotasPagadas = Math.min(
-          cuotasTotalesTx || (prevCuotasPagadas + deltaCuotas),
-          (cuotasTotalesTx || 0)
-        ) || (prevCuotasPagadas + deltaCuotas);
+
+        // ✅ FIX: tope correcto sin caer a 0 por el "|| 0" anterior
+        const maxCuotas = cuotasTotalesTx > 0 ? cuotasTotalesTx : Number.MAX_SAFE_INTEGER;
+        const nuevasCuotasPagadas = Math.max(
+          0,
+          Math.min(prevCuotasPagadas + deltaCuotas, maxCuotas)
+        );
 
         tx.update(prestamoRef, {
           restante: nuevoRestante,
@@ -229,7 +283,16 @@ export default function ModalRegistroPago({
         });
 
         return {
-          prestamoBefore: pick(data, ['restante','valorCuota','totalPrestamo','clienteId','concepto','cuotasPagadas','cuotas','cuotasTotales']),
+          prestamoBefore: pick(data, [
+            'restante',
+            'valorCuota',
+            'totalPrestamo',
+            'clienteId',
+            'concepto',
+            'cuotasPagadas',
+            'cuotas',
+            'cuotasTotales',
+          ]),
           nuevoRestante,
           valorCuotaTx,
           cuotasTotalesTx,
@@ -240,17 +303,29 @@ export default function ModalRegistroPago({
         };
       });
 
-      // ====================== POST-TX: RECIBO (NO BLOQUEA) ======================
+      // UI libre + notificación final (no-optimista)
+      setMonto('');
+      setLoading(false);
+      onSuccess?.({
+        clienteId: clienteId!,
+        prestamoId: prestamoId!,
+        monto: montoNum,
+        restanteNuevo: txResult.nuevoRestante,
+        optimistic: false,
+      });
+
+      // ====================== RECIBO (no bloquea la UI) ======================
       if (prefConfirmReceipt && !hasOpenedWhatsRef.current) {
-        // Línea de "parcela" amistosa (estimada)
         let linhaParcela: string | undefined;
         if (txResult.valorCuotaTx > 0 && txResult.cuotasTotalesTx > 0) {
           const pagosCompletos = txResult.nuevasCuotasPagadas;
           if (pagosCompletos > 0) {
-            linhaParcela = `Parcela: R$ ${txResult.valorCuotaTx.toFixed(2)} (#${Math.min(pagosCompletos, txResult.cuotasTotalesTx)}/${txResult.cuotasTotalesTx})`;
+            linhaParcela = `Parcela: R$ ${txResult.valorCuotaTx.toFixed(2)} (#${Math.min(
+              pagosCompletos,
+              txResult.cuotasTotalesTx
+            )}/${txResult.cuotasTotalesTx})`;
           }
         }
-
         const texto = buildReceiptPT({
           nombre: clienteNombre || 'Cliente',
           montoPagado: montoNum,
@@ -259,166 +334,181 @@ export default function ModalRegistroPago({
           linhaParcela,
         });
         hasOpenedWhatsRef.current = true;
-        setLoading(false);
-        void openWhats(texto);
+        setTimeout(() => void openWhats(texto), 0);
       }
 
-      // ====================== POST-TX: CAJA (writeBatch idempotente) ======================
-      try {
-        const batch = writeBatch(db);
-        const cajaId = `pay_${abonoRef.id}`;
-        const cajaRef = doc(collection(db, 'cajaDiaria'), cajaId);
-        batch.set(cajaRef, {
-          tipo: 'abono' as const,
-          admin,
-          clienteId: clienteId!,
-          prestamoId: prestamoId!,
-          clienteNombre: clienteNombre || 'Cliente',
-          monto: Number(montoNum.toFixed(2)),
-          tz: txResult.tz,
-          operationalDate: txResult.operativoHoy,
-          createdAtMs: Date.now(),
-          createdAt: serverTimestamp(),
-          source: 'app',
-          meta: { abonoRefId: abonoRef.id },
-        });
-        await batch.commit();
-
-        // Audit (fire-and-forget, no bloquea)
-        void logAudit({
-          userId: admin,
-          action: 'create',
-          docPath: cajaRef.path,
-          after: {
-            tipo: 'abono',
+      // ====================== TODO LO PESADO → BACKGROUND ======================
+      setTimeout(async () => {
+        try {
+          // Caja (idempotente)
+          const batch = writeBatch(db);
+          const cajaId = `pay_${abonoRef.id}`;
+          const cajaRef = doc(collection(db, 'cajaDiaria'), cajaId);
+          batch.set(cajaRef, {
+            tipo: 'abono' as const,
             admin,
-            clienteId,
-            prestamoId,
+            clienteId: clienteId!,
+            prestamoId: prestamoId!,
+            clienteNombre: clienteNombre || 'Cliente',
             monto: Number(montoNum.toFixed(2)),
+            tz: txResult.tz,
             operationalDate: txResult.operativoHoy,
-          },
-        });
-      } catch (e) {
-        // best-effort, no rompe la UX
-        console.warn('[cajaDiaria] no se pudo registrar en batch:', e);
-      }
-
-      // ====================== AUDIT ABONO (no bloquea) ======================
-      void logAudit({
-        userId: admin,
-        action: 'create',
-        docPath: abonoRef.path,
-        after: pick(txResult.abonoNuevo, ['monto','operationalDate','tz']),
-      });
-
-      // ====================== RECALC ATRASO (subcolección, local a este préstamo) ======================
-      try {
-        const pSnap = await getDoc(prestamoRef);
-        if (pSnap.exists()) {
-          const p = pSnap.data() as any;
-
-          // Leer subcolección de abonos SOLAMENTE de este préstamo
-          const abonosSnap = await getDocs(collection(prestamoRef, 'abonos'));
-          const abonos = abonosSnap.docs.map((d) => {
-            const a = d.data() as any;
-            return {
-              monto: Number(a?.monto) || 0,
-              operationalDate: a?.operationalDate,
-              fecha: a?.fecha, // compat
-            };
+            createdAtMs: Date.now(),
+            createdAt: serverTimestamp(),
+            source: 'app',
+            meta: { abonoRefId: abonoRef.id },
           });
-
-          const tzDoc = pickTZ(p?.tz);
-          const hoy = p?.operationalDate || todayInTZ(tzDoc);
-          const diasHabiles = Array.isArray(p?.diasHabiles) && p.diasHabiles.length ? p.diasHabiles : [1, 2, 3, 4, 5, 6];
-          const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
-          const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
-          const modo = (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
-          const permitirAdelantar = !!p?.permitirAdelantar;
-          const cuotas =
-            Number(p?.cuotasTotales || p?.cuotas || 0) ||
-            Math.ceil(Number(p.totalPrestamo || p.montoTotal || 0) / (Number(p.valorCuota) || 1));
-
-          const res = calcularDiasAtraso({
-            fechaInicio: p?.fechaInicio || hoy,
-            hoy,
-            cuotas,
-            valorCuota: Number(p?.valorCuota || 0),
-            abonos,
-            diasHabiles,
-            feriados,
-            pausas,
-            modo,
-            permitirAdelantar,
-          });
-
-          await updateDoc(prestamoRef, {
-            diasAtraso: res.atraso,
-            faltas: res.faltas || [],
-            ultimaReconciliacion: serverTimestamp(),
-          });
-
-          // Audit (no bloquea)
+          await batch.commit();
           void logAudit({
             userId: admin,
-            action: 'update',
-            ref: prestamoRef,
-            before: txResult.prestamoBefore,
-            after: { restante: txResult.nuevoRestante, cuotasPagadas: txResult.nuevasCuotasPagadas, diasAtraso: res.atraso },
-          });
-        }
-      } catch (e) {
-        // tolerante a fallos
-      }
-
-      // ====================== CIERRE: mover a historial si terminó ======================
-      if (txResult.nuevoRestante === 0) {
-        try {
-          const snap = await getDoc(prestamoRef);
-          const p = snap.exists() ? (snap.data() as any) : {};
-
-          const historialRef = collection(db, 'clientes', clienteId!, 'historialPrestamos');
-          const histRef = await addDoc(historialRef, {
-            ...p,
-            restante: 0,
-            diasAtraso: 0,
-            faltas: [],
-            finalizadoEn: serverTimestamp(),
-            finalizadoPor: admin,
-          });
-
-          void logAudit({
-            userId: admin, action: 'create', ref: histRef,
-            after: { clienteId, prestamoId, restante: 0, finalizadoPor: admin },
-          });
-
-          await deleteDoc(prestamoRef);
-
-          void logAudit({
-            userId: admin, action: 'delete', ref: prestamoRef,
-            before: txResult.prestamoBefore, after: null,
+            action: 'create',
+            docPath: cajaRef.path,
+            after: {
+              tipo: 'abono',
+              admin,
+              clienteId,
+              prestamoId,
+              monto: Number(montoNum.toFixed(2)),
+              operationalDate: txResult.operativoHoy,
+            },
           });
         } catch (e) {
-          // si falla, se queda activo; se puede reintentar luego
+          console.warn('[BG] cajaDiaria fallo:', e);
         }
-      }
 
-      // ====================== Cache local + callback ======================
-      if (prestamoId) {
-        quotaCache[prestamoId] = {
-          cuota: Number(valorCuota ?? txResult.valorCuotaTx ?? 0) || 0,
-          saldo: txResult.nuevoRestante || 0,
-        };
-      }
+        try {
+          // Audit abono
+          void logAudit({
+            userId: admin,
+            action: 'create',
+            docPath: abonoRef.path,
+            after: pick(txResult.abonoNuevo, ['monto', 'operationalDate', 'tz']),
+          });
+        } catch {}
 
-      setMonto('');
-      onSuccess?.(); // refresca PagosDelDia y Home
+        try {
+          // Recalc atraso (pesado)
+          const pSnap = await getDoc(prestamoRef);
+          if (pSnap.exists()) {
+            const p = pSnap.data() as any;
+
+            const abonosSnap = await getDocs(collection(prestamoRef, 'abonos'));
+            const abonos = abonosSnap.docs.map((d) => {
+              const a = d.data() as any;
+              return {
+                monto: Number(a?.monto) || 0,
+                operationalDate: a?.operationalDate,
+                fecha: a?.fecha,
+              };
+            });
+
+            const tzDoc = pickTZ(p?.tz);
+            const hoy = p?.operationalDate || todayInTZ(tzDoc);
+            const diasHabiles =
+              Array.isArray(p?.diasHabiles) && p.diasHabiles.length
+                ? p.diasHabiles
+                : [1, 2, 3, 4, 5, 6];
+            const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
+            const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
+            const modo =
+              (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
+            const permitirAdelantar = !!p?.permitirAdelantar;
+            const cuotas =
+              Number(p?.cuotasTotales || p?.cuotas || 0) ||
+              Math.ceil(
+                Number(p.totalPrestamo || p.montoTotal || 0) /
+                  (Number(p.valorCuota) || 1)
+              );
+
+            const res = calcularDiasAtraso({
+              fechaInicio: p?.fechaInicio || hoy,
+              hoy,
+              cuotas,
+              valorCuota: Number(p?.valorCuota || 0),
+              abonos,
+              diasHabiles,
+              feriados,
+              pausas,
+              modo,
+              permitirAdelantar,
+            });
+
+            await updateDoc(prestamoRef, {
+              diasAtraso: res.atraso,
+              faltas: res.faltas || [],
+              ultimaReconciliacion: serverTimestamp(),
+            });
+
+            void logAudit({
+              userId: admin,
+              action: 'update',
+              ref: prestamoRef,
+              before: txResult.prestamoBefore,
+              after: {
+                restante: txResult.nuevoRestante,
+                cuotasPagadas: txResult.nuevasCuotasPagadas,
+                diasAtraso: res.atraso,
+              },
+            });
+          }
+        } catch (e) {
+          console.warn('[BG] recalc atraso fallo:', e);
+        }
+
+        try {
+          // Cierre si saldo 0
+          if (txResult.nuevoRestante === 0) {
+            const snap = await getDoc(prestamoRef);
+            const p = snap.exists() ? (snap.data() as any) : {};
+            const historialRef = collection(
+              db,
+              'clientes',
+              clienteId!,
+              'historialPrestamos'
+            );
+            const histRef = await addDoc(historialRef, {
+              ...p,
+              restante: 0,
+              diasAtraso: 0,
+              faltas: [],
+              finalizadoEn: serverTimestamp(),
+              finalizadoPor: admin,
+            });
+            void logAudit({
+              userId: admin,
+              action: 'create',
+              ref: histRef,
+              after: { clienteId, prestamoId, restante: 0, finalizadoPor: admin },
+            });
+            await deleteDoc(prestamoRef);
+            void logAudit({
+              userId: admin,
+              action: 'delete',
+              ref: prestamoRef,
+              before: txResult.prestamoBefore,
+              after: null,
+            });
+          }
+        } catch (e) {
+          console.warn('[BG] cierre a historial fallo:', e);
+        }
+
+        try {
+          // Refrescar cache local
+          if (prestamoId) {
+            quotaCache[prestamoId] = {
+              cuota: Number(valorCuota ?? txResult.valorCuotaTx ?? 0) || 0,
+              saldo: txResult.nuevoRestante || 0,
+            };
+          }
+        } catch {}
+      }, 0);
+
     } catch (error: any) {
-      // 🔌 Offline o fallo en la escritura remota → encolar en OUTBOX
+      // 🔌 Offline → OUTBOX
       try {
         const tz = pickTZ();
         const operationalDate = todayInTZ(tz);
-
         await addToOutbox({
           kind: 'abono',
           payload: {
@@ -433,22 +523,28 @@ export default function ModalRegistroPago({
             cajaPayload: { tipo: 'abono' as const, clienteNombre },
           },
         });
-
-        Alert.alert('Sin conexión', 'El pago se guardó en "Pendientes" y podrás reenviarlo cuando tengas internet.');
+        Alert.alert(
+          'Sin conexión',
+          'El pago se guardó en "Pendientes" y podrás reenviarlo cuando tengas internet.'
+        );
+        // Incluso offline, el optimista ya pintó verde.
       } catch (enqueueErr: any) {
         const msg = (enqueueErr?.message || '').toString();
         if (msg.includes('ya tiene un pago pendiente')) {
           Alert.alert('Pago ya pendiente', 'Este cliente ya tiene un pago pendiente sin enviar.');
         } else {
-          Alert.alert('Error', 'No se pudo registrar el pago ni guardarlo en pendientes. Inténtalo nuevamente.');
+          Alert.alert(
+            'Error',
+            'No se pudo registrar el pago ni guardarlo en pendientes. Inténtalo nuevamente.'
+          );
         }
+      } finally {
+        setLoading(false);
       }
-    } finally {
-      setLoading(false);
     }
   };
 
-  const hasCuota = valorCuota > 0;
+  const hasCuota = !loadingCuota && valorCuota > 0;
   const cuotaNum = valorCuota;
 
   return (
@@ -521,10 +617,12 @@ export default function ModalRegistroPago({
                 <TouchableOpacity
                   onPress={solicitarConfirmacion}
                   style={[styles.btnGuardar, loading && { opacity: 0.7 }]}
-                  disabled={loading}
+                  disabled={loading}  
                   activeOpacity={0.9}
                 >
-                  <Text style={styles.btnGuardarTexto}>{loading ? 'Guardando…' : 'Guardar'}</Text>
+                  <Text style={styles.btnGuardarTexto}>
+                    {loading ? 'Guardando…' : 'Guardar'}
+                  </Text>
                 </TouchableOpacity>
               </View>
             </View>

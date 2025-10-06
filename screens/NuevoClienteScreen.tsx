@@ -5,19 +5,15 @@ import {
   Text,
   TextInput,
   StyleSheet,
-  ScrollView,
   TouchableOpacity,
-  KeyboardAvoidingView,
-  Platform,
-  TouchableWithoutFeedback,
   Keyboard,
+  findNodeHandle,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoCliente'>;
 
@@ -45,7 +41,7 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
     []
   );
 
-  // Refs para Enter → siguiente
+  // Refs inputs
   const refNombre = useRef<TextInput>(null);
   const refAlias = useRef<TextInput>(null);
   const refNit = useRef<TextInput>(null);
@@ -54,6 +50,24 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
   const refBarrio = useRef<TextInput>(null);
   const refTel1 = useRef<TextInput>(null);
   const refTel2 = useRef<TextInput>(null);
+
+  // Ref del scroll para forzar scroll a input enfocado
+  const scrollRef = useRef<any>(null);
+
+  // 👇 Enfoca y desplaza garantizando que el input quede visible sobre el teclado
+  const focusAndScrollTo = (r: React.RefObject<TextInput | null>) => {
+    // Pequeño delay para que RN procese el submit y el teclado empiece a animar
+    setTimeout(() => {
+      const node = r.current ? findNodeHandle(r.current) : null;
+      r.current?.focus();
+      if (node && scrollRef.current?.scrollToFocusedInput) {
+        // micro-delay para evitar “sube y baja” en pares (rows dobles)
+        setTimeout(() => {
+          scrollRef.current.scrollToFocusedInput(node, 90); // 90px extra por seguridad
+        }, 16);
+      }
+    }, 0);
+  };
 
   const handleChange = (key: keyof typeof cliente, value: any) => {
     setCliente((c) => ({ ...c, [key]: value }));
@@ -78,7 +92,6 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
     }
     if (Object.keys(nuevos).length) {
       setErrores(nuevos);
-      // Foco en el primer campo con error
       if (nuevos.nombre) refNombre.current?.focus();
       else if (nuevos.nit) refNit.current?.focus();
       else if (nuevos.direccion1) refDir1.current?.focus();
@@ -99,14 +112,16 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
       barrio: cliente.barrio.trim(),
     };
 
+    Keyboard.dismiss();
     navigation.navigate('NuevoPrestamo', { cliente: payload, admin });
   };
 
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right','bottom']}   // 👈 evita el hueco
-  >
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: palette.screenBg }}
+      edges={['left', 'right', 'bottom']} // 👈 sin hueco arriba
+    >
+      {/* Header */}
       <View
         style={[
           styles.header,
@@ -116,176 +131,172 @@ export default function NuevoClienteScreen({ navigation, route }: Props) {
         <Text style={[styles.headerTitle, { color: palette.text }]}>Nuevo cliente</Text>
       </View>
 
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        keyboardVerticalOffset={68}
+      {/* Scroll que se auto-ajusta con el teclado */}
+      <KeyboardAwareScrollView
+        ref={scrollRef}
+        enableOnAndroid
+        enableAutomaticScroll
+        extraScrollHeight={100}
+        keyboardOpeningTime={0}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={[styles.container, { paddingBottom: 92 + insets.bottom }]}
       >
-        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-          <ScrollView
-            contentContainerStyle={[
-              styles.container,
-              { paddingBottom: 92 + insets.bottom },
-            ]}
-            keyboardShouldPersistTaps="handled"
-          >
-            <View
-              style={[
-                styles.card,
-                { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
-              ]}
-            >
-              <Text style={[styles.sectionTitle, { color: palette.text }]}>
-                Datos del cliente
-              </Text>
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: palette.cardBg, borderColor: palette.cardBorder },
+          ]}
+        >
+          <Text style={[styles.sectionTitle, { color: palette.text }]}>
+            Datos del cliente
+          </Text>
 
-              <Field
-                label="Nombre"
-                value={cliente.nombre}
-                onChangeText={(t) => handleChange('nombre', t)}
-                error={errores.nombre}
-                autoCapitalize="words"
-                palette={palette}
-                inputRef={refNombre}
-                returnKeyType="next"
-                blurOnSubmit={false}
-                onSubmitEditing={() => refAlias.current?.focus()}
-              />
+          <Field
+            label="Nombre"
+            value={cliente.nombre}
+            onChangeText={(t) => handleChange('nombre', t)}
+            error={errores.nombre}
+            autoCapitalize="words"
+            palette={palette}
+            inputRef={refNombre}
+            returnKeyType="next"
+            blurOnSubmit={false}
+            onSubmitEditing={() => focusAndScrollTo(refAlias)}
+          />
 
-              <View style={styles.row2}>
-                <Field
-                  label="Alias"
-                  value={cliente.alias}
-                  onChangeText={(t) => handleChange('alias', t)}
-                  autoCapitalize="words"
-                  palette={palette}
-                  compact
-                  inputRef={refAlias}
-                  returnKeyType="next"
-                  blurOnSubmit={false}
-                  onSubmitEditing={() => refNit.current?.focus()}
-                />
-                <Field
-                  label="NIT"
-                  value={cliente.nit}
-                  onChangeText={(t) => handleChange('nit', t)}
-                  error={errores.nit}
-                  autoCapitalize="characters"
-                  palette={palette}
-                  compact
-                  inputRef={refNit}
-                  returnKeyType="next"
-                  blurOnSubmit={false}
-                  onSubmitEditing={() => refDir1.current?.focus()}
-                />
-              </View>
+          <View style={styles.row2}>
+            <Field
+              label="Alias"
+              value={cliente.alias}
+              onChangeText={(t) => handleChange('alias', t)}
+              autoCapitalize="words"
+              palette={palette}
+              compact
+              inputRef={refAlias}
+              returnKeyType="next"
+              blurOnSubmit={false}
+              onSubmitEditing={() => focusAndScrollTo(refNit)}
+            />
+            <Field
+              label="NIT"
+              value={cliente.nit}
+              onChangeText={(t) => handleChange('nit', t)}
+              error={errores.nit}
+              autoCapitalize="characters"
+              palette={palette}
+              compact
+              inputRef={refNit}
+              returnKeyType="next"
+              blurOnSubmit={false}
+              onSubmitEditing={() => focusAndScrollTo(refDir1)}
+            />
+          </View>
 
-              <Field
-                label="Dirección 1"
-                value={cliente.direccion1}
-                onChangeText={(t) => handleChange('direccion1', t)}
-                error={errores.direccion1}
-                autoCapitalize="words"
-                palette={palette}
-                inputRef={refDir1}
-                returnKeyType="next"
-                blurOnSubmit={false}
-                onSubmitEditing={() => refDir2.current?.focus()}
-              />
+          <Field
+            label="Dirección 1"
+            value={cliente.direccion1}
+            onChangeText={(t) => handleChange('direccion1', t)}
+            error={errores.direccion1}
+            autoCapitalize="words"
+            palette={palette}
+            inputRef={refDir1}
+            returnKeyType="next"
+            blurOnSubmit={false}
+            onSubmitEditing={() => focusAndScrollTo(refDir2)}
+          />
 
-              <View style={styles.row2}>
-                <Field
-                  label="Dirección 2"
-                  value={cliente.direccion2}
-                  onChangeText={(t) => handleChange('direccion2', t)}
-                  autoCapitalize="words"
-                  palette={palette}
-                  compact
-                  inputRef={refDir2}
-                  returnKeyType="next"
-                  blurOnSubmit={false}
-                  onSubmitEditing={() => refBarrio.current?.focus()}
-                />
-                <Field
-                  label="Barrio"
-                  value={cliente.barrio}
-                  onChangeText={(t) => handleChange('barrio', t)}
-                  error={errores.barrio}
-                  autoCapitalize="words"
-                  palette={palette}
-                  compact
-                  inputRef={refBarrio}
-                  returnKeyType="next"
-                  blurOnSubmit={false}
-                  onSubmitEditing={() => refTel1.current?.focus()}
-                />
-              </View>
+          <View style={styles.row2}>
+            <Field
+              label="Dirección 2"
+              value={cliente.direccion2}
+              onChangeText={(t) => handleChange('direccion2', t)}
+              autoCapitalize="words"
+              palette={palette}
+              compact
+              inputRef={refDir2}
+              returnKeyType="next"
+              blurOnSubmit={false}
+              onSubmitEditing={() => focusAndScrollTo(refBarrio)}
+            />
+            <Field
+              label="Barrio"
+              value={cliente.barrio}
+              onChangeText={(t) => handleChange('barrio', t)}
+              error={errores.barrio}
+              autoCapitalize="words"
+              palette={palette}
+              compact
+              inputRef={refBarrio}
+              returnKeyType="next"
+              blurOnSubmit={false}
+              onSubmitEditing={() => focusAndScrollTo(refTel1)}
+            />
+          </View>
 
-              <View style={styles.row2}>
-                <Field
-                  label="Teléfono"
-                  value={cliente.telefono1}
-                  onChangeText={(t) => handleChange('telefono1', t)}
-                  error={errores.telefono1}
-                  keyboardType="phone-pad"
-                  palette={palette}
-                  compact
-                  inputRef={refTel1}
-                  returnKeyType="next"
-                  blurOnSubmit={false}
-                  onSubmitEditing={() => refTel2.current?.focus()}
-                />
-                <Field
-                  label="Teléfono 2"
-                  value={cliente.telefono2}
-                  onChangeText={(t) => handleChange('telefono2', t)}
-                  keyboardType="phone-pad"
-                  palette={palette}
-                  compact
-                  inputRef={refTel2}
-                  returnKeyType="done"
-                  blurOnSubmit
-                  onSubmitEditing={continuar}
-                />
-              </View>
+          <View style={styles.row2}>
+            <Field
+              label="Teléfono"
+              value={cliente.telefono1}
+              onChangeText={(t) => handleChange('telefono1', t)}
+              error={errores.telefono1}
+              keyboardType="phone-pad"
+              palette={palette}
+              compact
+              inputRef={refTel1}
+              returnKeyType="next"
+              blurOnSubmit={false}
+              onSubmitEditing={() => focusAndScrollTo(refTel2)}
+            />
+            <Field
+              label="Teléfono 2"
+              value={cliente.telefono2}
+              onChangeText={(t) => handleChange('telefono2', t)}
+              keyboardType="phone-pad"
+              palette={palette}
+              compact
+              inputRef={refTel2}
+              returnKeyType="done"
+              blurOnSubmit
+              onSubmitEditing={continuar}
+            />
+          </View>
 
-              <Text style={[styles.label, { color: palette.softText }]}>Género</Text>
-              <View style={styles.genderRow}>
-                {['Femenino', 'Masculino'].map((g) => {
-                  const active = cliente.genero === g;
-                  return (
-                    <TouchableOpacity
-                      key={g}
-                      style={[
-                        styles.genderPill,
-                        {
-                          backgroundColor: active ? palette.topBg : palette.kpiBg,
-                          borderColor: active ? palette.accent : palette.cardBorder,
-                        },
-                      ]}
-                      onPress={() => handleChange('genero', g)}
-                      activeOpacity={0.9}
-                    >
-                      <Text
-                        style={[
-                          styles.genderTxt,
-                          { color: active ? palette.accent : palette.softText },
-                        ]}
-                      >
-                        {g}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
-              {errores.genero ? (
-                <Text style={[styles.error, { color: '#d32f2f' }]}>{errores.genero}</Text>
-              ) : null}
-            </View>
-          </ScrollView>
-        </TouchableWithoutFeedback>
-      </KeyboardAvoidingView>
+          <Text style={[styles.label, { color: palette.softText }]}>Género</Text>
+          <View style={styles.genderRow}>
+            {['Femenino', 'Masculino'].map((g) => {
+              const active = cliente.genero === g;
+              return (
+                <TouchableOpacity
+                  key={g}
+                  style={[
+                    styles.genderPill,
+                    {
+                      backgroundColor: active ? palette.topBg : palette.kpiBg,
+                      borderColor: active ? palette.accent : palette.cardBorder,
+                    },
+                  ]}
+                  onPress={() => handleChange('genero', g)}
+                  activeOpacity={0.9}
+                >
+                  <Text
+                    style={[
+                      styles.genderTxt,
+                      { color: active ? palette.accent : palette.softText },
+                    ]}
+                  >
+                    {g}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          {errores.genero ? (
+            <Text style={[styles.error, { color: '#d32f2f' }]}>{errores.genero}</Text>
+          ) : null}
+        </View>
+      </KeyboardAwareScrollView>
 
+      {/* CTA fija (no sube con el teclado) */}
       <View
         style={[
           styles.ctaBar,
@@ -330,7 +341,6 @@ function Field({
   autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
   compact?: boolean;
   palette: ReturnType<typeof useAppTheme>['palette'];
-  /** 👇 Acepta refs que pueden ser null */
   inputRef?: React.RefObject<TextInput | null>;
   returnKeyType?: 'done' | 'next' | 'go' | 'send' | 'search';
   blurOnSubmit?: boolean;
