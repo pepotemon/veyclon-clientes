@@ -72,6 +72,43 @@ function buildReceiptPT(opts: {
   ].join('\n');
 }
 
+// 🔸 helper: construye la “linhaParcela” correcta (completa o parcial)
+function makeLinhaParcela(opts: {
+  valorCuota: number;
+  cuotasTotales: number;         // 0 si desconocido
+  restanteNuevo: number;         // post-abono
+  totalPrestamoAprox: number;    // si no hay total exacto, usar aproximación
+}) {
+  const v = Number(opts.valorCuota) || 0;
+  if (v <= 0) return undefined;
+
+  const n = Number(opts.cuotasTotales) || 0; // puede ser 0 (desconocido)
+  const total = Number.isFinite(opts.totalPrestamoAprox) ? Math.max(0, opts.totalPrestamoAprox) : 0;
+  if (total <= 0) return undefined;
+
+  // Pago acumulado tras el abono
+  const paidAfter = Math.max(0, total - (Number(opts.restanteNuevo) || 0));
+
+  // Cuotas completas acumuladas y resto parcial
+  const completas = Math.floor(paidAfter / v);
+  const resto = +(paidAfter - completas * v).toFixed(2);
+
+  // Caso: hay al menos una cuota completa (exacta)
+  if (resto < 0.01) {
+    const k = n > 0 ? Math.min(completas, n) : completas;
+    return n > 0
+      ? `Parcela: R$ ${v.toFixed(2)} (#${k}/${n})`
+      : `Parcela: R$ ${v.toFixed(2)} (#${k})`;
+  }
+
+  // Caso: parcial — cuánto falta para completar la siguiente
+  const faltam = +(v - resto).toFixed(2);
+  const prox = completas + 1;
+  return n > 0
+    ? `Faltam R$ ${faltam.toFixed(2)} para completar a parcela #${prox}/${n}`
+    : `Faltam R$ ${faltam.toFixed(2)} para completar a parcela #${prox}`;
+}
+
 export default function ModalRegistroPago({
   visible, onClose, clienteNombre, clienteId, prestamoId, admin, onSuccess,
 }: Props) {
@@ -316,16 +353,20 @@ export default function ModalRegistroPago({
 
       // ====================== RECIBO (no bloquea la UI) ======================
       if (prefConfirmReceipt && !hasOpenedWhatsRef.current) {
-        let linhaParcela: string | undefined;
-        if (txResult.valorCuotaTx > 0 && txResult.cuotasTotalesTx > 0) {
-          const pagosCompletos = txResult.nuevasCuotasPagadas;
-          if (pagosCompletos > 0) {
-            linhaParcela = `Parcela: R$ ${txResult.valorCuotaTx.toFixed(2)} (#${Math.min(
-              pagosCompletos,
-              txResult.cuotasTotalesTx
-            )}/${txResult.cuotasTotalesTx})`;
-          }
-        }
+        // 🧠 línea de parcela correcta (completa o parcial)
+        const totalAprox =
+          Number((txResult as any).prestamoBefore?.totalPrestamo) ||
+          (txResult.cuotasTotalesTx > 0 && txResult.valorCuotaTx > 0
+            ? txResult.cuotasTotalesTx * txResult.valorCuotaTx
+            : 0);
+
+        const linhaParcela = makeLinhaParcela({
+          valorCuota: txResult.valorCuotaTx,
+          cuotasTotales: txResult.cuotasTotalesTx,
+          restanteNuevo: txResult.nuevoRestante,
+          totalPrestamoAprox: totalAprox,
+        });
+
         const texto = buildReceiptPT({
           nombre: clienteNombre || 'Cliente',
           montoPagado: montoNum,
@@ -617,7 +658,7 @@ export default function ModalRegistroPago({
                 <TouchableOpacity
                   onPress={solicitarConfirmacion}
                   style={[styles.btnGuardar, loading && { opacity: 0.7 }]}
-                  disabled={loading}  
+                  disabled={loading}
                   activeOpacity={0.9}
                 >
                   <Text style={styles.btnGuardarTexto}>
