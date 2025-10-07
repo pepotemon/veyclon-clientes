@@ -1,5 +1,5 @@
 // screens/CerrarDiaScreen.tsx
-import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator, Alert, TouchableOpacity, FlatList, Modal, Platform } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
@@ -11,14 +11,13 @@ import {
   collectionGroup,
   doc,
   getDoc,
-  getDocs,
-  onSnapshot,
-  orderBy,
   query,
   where,
+  orderBy,
   limit,
+  type QuerySnapshot,
+  type DocumentData,
 } from 'firebase/firestore';
-import type { QuerySnapshot, DocumentData } from 'firebase/firestore';
 import { Ionicons } from '@expo/vector-icons';
 import { pickTZ, todayInTZ } from '../utils/timezone';
 import { ensureAperturaDeHoy, closeMissingDays } from '../utils/cajaEstado';
@@ -67,7 +66,7 @@ function rangeLastDays(tz: string, n = 30) {
 
 export default function CerrarDiaScreen({ route }: Props) {
   const { admin } = route.params;
-  const { palette, isDark } = useAppTheme();
+  const { palette } = useAppTheme();
 
   const tz = pickTZ(undefined, TZ_DEFAULT);
   const hoy = todayInTZ(tz);
@@ -97,41 +96,64 @@ export default function CerrarDiaScreen({ route }: Props) {
     dt.setUTCDate(dt.getUTCDate() - 1);
     const ayer = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
 
-    // 1) Preferimos cierre idempotente
-    const cierreId = `cierre_${adminId}_${ayer}`;
-    const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
-    if (cierreSnap.exists()) return Number(cierreSnap.data()?.balance || 0);
+    // 1) Preferimos cierre idempotente EXACTO de AYER
+    try {
+      const cierreId = `cierre_${adminId}_${ayer}`;
+      const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
+      if (cierreSnap.exists()) return Number(cierreSnap.data()?.balance || 0);
+    } catch {}
 
-    // 2) Último cierre “no idempotente” (compat) — con fallback sin orderBy
+    // 2) Último cierre ≤ AYER (main con índices; fallback sin índices, filtrando en cliente)
     const qCMain = query(
       collection(db, 'cajaDiaria'),
       where('admin', '==', adminId),
-      where('operationalDate', '==', ayer),
       where('tipo', '==', 'cierre'),
+      where('operationalDate', '<=', ayer),
+      orderBy('operationalDate', 'desc'),
       orderBy('createdAt', 'desc'),
-      limit(1)
+      limit(25)
     );
     const qCFallback = query(
       collection(db, 'cajaDiaria'),
       where('admin', '==', adminId),
-      where('operationalDate', '==', ayer),
       where('tipo', '==', 'cierre')
     );
 
-    const sC = await getDocsWithFallback(qCMain, qCFallback);
-    if (!sC.empty) {
-      const best = sC.docs.reduce((acc, d) => {
-        const data: any = d.data();
-        const ms =
-          (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
-          (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
-          0;
-        if (!acc) return { d, ms };
-        return ms > acc.ms ? { d, ms } : acc;
-      }, null as null | { d: typeof sC.docs[number]; ms: number });
-      const base = Number((best?.d?.data() as any)?.balance || 0);
-      return Number.isFinite(base) ? base : 0;
+   try {
+  const snap = await getDocsWithFallback(qCMain, qCFallback);
+
+  // ✅ acumuladores primitivos (evita 'never')
+  let bestOp: string = '';
+  let bestMs: number = -1;
+  let bestBal: number = 0;
+
+  snap.forEach((d: any) => {
+    const data = d.data ? d.data() : d;
+    const op = String(data?.operationalDate || '');
+    if (!op || op > ayer) return; // solo ≤ AYER
+
+    const ms =
+      (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
+      (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
+      0;
+
+    const bal = Number(data?.balance || 0);
+
+    // Prioridad: fecha operativa más reciente; si empata, el createdAt más nuevo
+    if (!bestOp || op > bestOp || (op === bestOp && ms > bestMs)) {
+      bestOp = op;
+      bestMs = ms;
+      bestBal = bal;
     }
+  });
+
+  if (bestMs >= 0) {
+    return Number.isFinite(bestBal) ? bestBal : 0;
+  }
+} catch {
+  // silencioso: seguimos al retorno 0
+}
+    // 3) Sin cierres históricos → 0
     return 0;
   }
 
@@ -187,10 +209,10 @@ export default function CerrarDiaScreen({ route }: Props) {
     return { apertura, cobrado, ingresos, retiros, gastos, prestamos, abonosCount };
   }
 
-  // —— Listener LIGERO de “programados” (préstamos activos del admin) — SOLO HOY
+  // —— Listener LIGERO de “programados” — SOLO HOY
   useEffect(() => {
     if (selectedYmd !== hoy) {
-      setProgramadosCount(0); // lo podremos sobreescribir si el snapshot histórico lo trae
+      setProgramadosCount(0);
       setLoadingProg(false);
       return;
     }
@@ -242,7 +264,7 @@ export default function CerrarDiaScreen({ route }: Props) {
       setLoadingCaja(true);
       setKpiCaja(EMPTY_TOTALES);
 
-      // 1) Caja inicial: cierre del día anterior al seleccionado
+      // 1) Caja inicial: cierre del día anterior al seleccionado (heredado)
       try {
         const base = await getCajaInicialUI(admin, selectedYmd);
         setCajaInicial(Number.isFinite(base) ? base : 0);

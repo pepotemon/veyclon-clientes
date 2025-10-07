@@ -44,6 +44,9 @@ import {
   type MovimientoTipo,
 } from '../utils/movimientoHelper';
 
+// ✅ saneadores
+import { closeMissingDays, ensureAperturaDeHoy } from '../utils/cajaEstado';
+
 type Props = NativeStackScreenProps<RootStackParamList, 'CajaDiaria'>;
 
 type MovimientoBase = {
@@ -94,14 +97,14 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
   // KPIs desde cajaDiaria
   const [apertura, setApertura] = useState(0); // SOLO lectura
-  const [tieneApertura, setTieneApertura] = useState(false); // ✅ nuevo
+  const [tieneApertura, setTieneApertura] = useState(false);
   const [abonos, setAbonos] = useState(0);
   const [ingresos, setIngresos] = useState(0);
   const [retiros, setRetiros] = useState(0);
-  const [prestamosDelDia, setPrestamosDelDia] = useState(0); // ✅ desde cajaDiaria (tipo:'prestamo')
+  const [prestamosDelDia, setPrestamosDelDia] = useState(0);
   const [movsCaja, setMovsCaja] = useState<MovimientoCaja[]>([]);
 
-  // Caja inicial base = CIERRE DE AYER (nunca se pisa desde snapshot)
+  // Caja inicial base = CIERRE HEREDADO
   const [cajaInicialBase, setCajaInicialBase] = useState(0);
 
   // Total de gastos admin
@@ -113,7 +116,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     [movsCaja]
   );
 
-  // Caja inicial DERIVADA: si hubo apertura hoy, esa manda; si no, el cierre de ayer
+  // Caja inicial DERIVADA: si hubo apertura hoy, esa manda; si no, el cierre heredado
   const cajaInicial = useMemo(
     () => (tieneApertura ? apertura : cajaInicialBase),
     [tieneApertura, apertura, cajaInicialBase]
@@ -128,53 +131,60 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     [cajaInicial, ingresos, abonos, retiros, totalGastos, prestamosDelDia]
   );
 
-  /** ======= MISMA LÓGICA QUE CerrarDia: caja inicial base = cierre de AYER ======= */
+  /** ======= Caja inicial base: cierre heredado (último cierre <= AYER) ======= */
   async function getCajaInicialUI(adminId: string, hoyYmd: string): Promise<number> {
     // AYER a partir de 'hoy'
     const [Y, M, D] = hoyYmd.split('-').map((n) => parseInt(n, 10));
     const dt = new Date(Date.UTC(Y, M - 1, D));
     dt.setUTCDate(dt.getUTCDate() - 1);
-    const ayer = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(
-      2,
-      '0'
-    )}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+    const ayer = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(
+      dt.getUTCDate()
+    ).padStart(2, '0')}`;
 
     // 1) Preferimos cierre idempotente
-    const cierreId = `cierre_${adminId}_${ayer}`;
-    const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
-    if (cierreSnap.exists()) return Number(cierreSnap.data()?.balance || 0);
+    try {
+      const cierreId = `cierre_${adminId}_${ayer}`;
+      const cierreSnap = await getDoc(doc(db, 'cajaDiaria', cierreId));
+      if (cierreSnap.exists()) return Number(cierreSnap.data()?.balance || 0);
+    } catch {}
 
-    // 2) Último cierre de AYER (sin orderBy)
-    const qC = query(
-      collection(db, 'cajaDiaria'),
-      where('admin', '==', adminId),
-      where('operationalDate', '==', ayer),
-      where('tipo', '==', 'cierre')
-    );
-    const sC = await getDocs(qC);
-    if (!sC.empty) {
-      let bestTs = -1;
-      let bestBalance = 0;
-      sC.forEach((d) => {
+    // 2) Buscar ÚLTIMO cierre <= AYER (filtrado en cliente para evitar índices)
+    try {
+      const qAll = query(
+        collection(db, 'cajaDiaria'),
+        where('admin', '==', adminId),
+        where('tipo', '==', 'cierre')
+      );
+      const s = await getDocs(qAll);
+      let bestOp = ''; // YYYY-MM-DD
+      let bestMs = -1;
+      let bestBal = 0;
+
+      s.forEach((d) => {
         const data: any = d.data();
-        const bal = Number(data?.balance || 0);
-        const ts =
+        const op = String(data?.operationalDate || '');
+        if (!op || op > ayer) return; // solo <= AYER
+        const ms =
           (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
           (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
           0;
-        if (ts >= bestTs) {
-          bestTs = ts;
-          bestBalance = bal;
+        const bal = Number(data?.balance || 0);
+
+        if (!bestOp || op > bestOp || (op === bestOp && ms > bestMs)) {
+          bestOp = op;
+          bestMs = ms;
+          bestBal = bal;
         }
       });
-      return bestBalance;
-    }
 
-    // 3) Nada → 0
+      if (bestOp) return bestBal;
+    } catch {}
+
+    // 3) Nada → 0 (inicio absoluto, esta pantalla no usa cajaEstado como fallback)
     return 0;
   }
 
-  // --- Cargar CAJA INICIAL BASE = cierre de AYER (se recalcula si cambia 'hoy')
+  // --- Cargar CAJA INICIAL BASE = cierre heredado (se recalcula si cambia 'hoy')
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -191,11 +201,22 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     };
   }, [admin, hoy]);
 
+  // ✅ SANEADORES al cambiar de día (genera cierres faltantes y apertura de hoy)
+  useEffect(() => {
+    (async () => {
+      try {
+        await closeMissingDays(admin, hoy, tz);
+        await ensureAperturaDeHoy(admin, hoy, tz);
+      } catch (e) {
+        console.warn('[CajaDiaria] saneadores:', e);
+      }
+    })();
+  }, [admin, hoy]);
+
   // Snapshot de movimientos del día (todas las KPIs salen de aquí)
   useEffect(() => {
     setCargando(true);
     try {
-      // ❌ Sin orderBy → ordenamos en cliente
       const qDia = query(
         collection(db, 'cajaDiaria'),
         where('admin', '==', admin),
@@ -210,7 +231,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
           let _abonos = 0;
           let _ingresos = 0;
           let _retiros = 0;
-          let _prestamos = 0; // ✅ capital entregado hoy
+          let _prestamos = 0;
 
           const _movsCaja: MovimientoCaja[] = [];
 
@@ -221,7 +242,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
             const m = Number(
               tip === 'apertura' || tip === 'cierre'
-                ? (data?.monto ?? data?.balance ?? 0) // 🟢 tomar monto o balance
+                ? (data?.monto ?? data?.balance ?? 0)
                 : (data?.monto ?? 0)
             );
             if (!Number.isFinite(m)) return;
@@ -298,7 +319,6 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
             }
           });
 
-          // ✅ ahora sabemos si hubo apertura (aunque sea 0)
           setTieneApertura(lastAperturaTs >= 0);
           setApertura(lastAperturaMonto);
 
@@ -435,10 +455,10 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   };
 
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right','bottom']}   // 👈 evita el hueco
-  >
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: palette.screenBg }}
+      edges={['left','right','bottom']}   // 👈 evita el hueco
+    >
       <View
         style={[styles.header, { backgroundColor: palette.topBg, borderBottomColor: palette.topBorder }]}
       >

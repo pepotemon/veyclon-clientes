@@ -48,37 +48,92 @@ function prevDay(ymd: string): string {
   return `${y}-${m}-${d}`;
 }
 
-/** Caja inicial BASE = CIERRE DE AYER (compat: usa cajaEstado.saldoActual si > 0). */
+/** Detecta si hubo APERTURA (aunque sea 0) en un día dado. */
+async function existsApertura(admin: string, ymd: string): Promise<boolean> {
+  const qHoy = query(
+    collection(db, 'cajaDiaria'),
+    where('admin', '==', admin),
+    where('operationalDate', '==', ymd)
+  );
+  const snap = await getDocs(qHoy);
+  let ok = false;
+  snap.forEach((d) => {
+    const tip = canonicalTipo((d.data() as any)?.tipo);
+    if (tip === 'apertura') ok = true;
+  });
+  return ok;
+}
+
+/** Caja inicial BASE = último CIERRE <= AYER (heredado). */
 export async function getCajaInicialBase(admin: string, hoy: string): Promise<number> {
   const ayer = prevDay(hoy);
 
-  // 1) Cierre idempotente preferido
-  const cierreIdem = await getDoc(doc(db, 'cajaDiaria', `cierre_${admin}_${ayer}`));
-  if (cierreIdem.exists()) {
-    const v = Number(cierreIdem.data()?.balance || 0);
-    return Number.isFinite(v) ? v : 0;
-  }
+  // 1) Cierre idempotente preferido (exacto de AYER)
+  try {
+    const cierreIdem = await getDoc(doc(db, 'cajaDiaria', `cierre_${admin}_${ayer}`));
+    if (cierreIdem.exists()) {
+      const v = Number(cierreIdem.data()?.balance || 0);
+      return Number.isFinite(v) ? v : 0;
+    }
+  } catch {}
 
-  // 2) Último cierre "no idempotente" de AYER
-  const qAyer = query(
-    collection(db, 'cajaDiaria'),
-    where('admin', '==', admin),
-    where('operationalDate', '==', ayer),
-    where('tipo', '==', 'cierre'),
-    orderBy('createdAt', 'desc'),
-    limit(1)
-  );
-  const sA = await getDocs(qAyer);
-  if (!sA.empty) {
-    const v = Number(sA.docs[0].data()?.balance || 0);
-    return Number.isFinite(v) ? v : 0;
-  }
+  // 2) Último cierre "no idempotente" de AYER (compat)
+  try {
+    const qAyer = query(
+      collection(db, 'cajaDiaria'),
+      where('admin', '==', admin),
+      where('operationalDate', '==', ayer),
+      where('tipo', '==', 'cierre'),
+      orderBy('createdAt', 'desc'),
+      limit(1)
+    );
+    const sA = await getDocs(qAyer);
+    if (!sA.empty) {
+      const v = Number(sA.docs[0].data()?.balance || 0);
+      return Number.isFinite(v) ? v : 0;
+    }
+  } catch {}
 
-  // 3) Fallback: saldo persistente (> 0) o 0
-  const estadoRef = doc(db, 'cajaEstado', admin);
-  const estadoSnap = await getDoc(estadoRef);
-  const sal = Number(estadoSnap.data()?.saldoActual || 0);
-  return Number.isFinite(sal) && sal > 0 ? sal : 0;
+  // 3) Buscar el ÚLTIMO cierre <= AYER (sin exigir índice; filtrado en cliente)
+  try {
+    const qAll = query(
+      collection(db, 'cajaDiaria'),
+      where('admin', '==', admin),
+      where('tipo', '==', 'cierre')
+    );
+    const s = await getDocs(qAll);
+    let bestOp = ''; // YYYY-MM-DD
+    let bestMs = -1;
+    let bestBal = 0;
+
+    s.forEach((d) => {
+      const data: any = d.data();
+      const op = String(data?.operationalDate || '');
+      if (!op || op > ayer) return; // sólo <= AYER
+      const ms =
+        (typeof data?.createdAtMs === 'number' && data.createdAtMs) ||
+        (typeof data?.createdAt?.seconds === 'number' && data.createdAt.seconds * 1000) ||
+        0;
+      const bal = Number(data?.balance || 0);
+      if (!bestOp || op > bestOp || (op === bestOp && ms > bestMs)) {
+        bestOp = op;
+        bestMs = ms;
+        bestBal = bal;
+      }
+    });
+
+    if (bestOp) return bestBal;
+  } catch {}
+
+  // 4) Fallback: saldo persistente (RESPETA NEGATIVOS y 0)
+  try {
+    const estadoRef = doc(db, 'cajaEstado', admin);
+    const estadoSnap = await getDoc(estadoRef);
+    const sal = Number(estadoSnap.data()?.saldoActual ?? 0);
+    return Number.isFinite(sal) ? sal : 0;
+  } catch {
+    return 0;
+  }
 }
 
 // ———————————————————————————————————————————————
@@ -227,15 +282,18 @@ export async function registrarCierre(
 
 /** -----------------------------------------------------------
  *  Cálculo “en vivo” de cajaFinal para un YYYY-MM-DD
- *  - Base: apertura del día (si existe) o CIERRE DE AYER
+ *  - Base: APERTURA si EXISTE (aunque sea 0) o CIERRE HEREDADO
  *  - Movimientos del día: SOLO desde cajaDiaria (kpisDelDia)
  * ----------------------------------------------------------- */
 async function computeCajaFinalForDay(admin: string, ymd: string) {
   // KPIs del día (solo cajaDiaria)
   const k = await kpisDelDia(admin, ymd);
 
-  // Base inicial derivada: apertura si existe; si no, cierre de AYER
-  const baseInicial = k.apertura > 0 ? k.apertura : await getCajaInicialBase(admin, ymd);
+  // Detectar si existió un documento de apertura (aunque el monto sea 0)
+  const huboApertura = await existsApertura(admin, ymd);
+
+  // Base inicial derivada
+  const baseInicial = huboApertura ? k.apertura : await getCajaInicialBase(admin, ymd);
 
   // Caja final viva
   const cajaFinal = cajaFinalConBase(baseInicial, k);
@@ -305,7 +363,7 @@ export async function updateCajaEstadoLive(admin: string, ymd: string, tz: strin
 
 /**
  * Cierra en CADENA todos los días pendientes (hasta N días atrás) ANTES de abrir HOY.
- * - Caja inicial de cada día = apertura del día (si existe) o cierre de AYER.
+ * - Caja inicial de cada día = apertura del día (si existe) o cierre HEREDADO de AYER.
  * - Usa sólo `cajaDiaria` para KPIs (sin CG de préstamos).
  */
 export async function closeMissingDays(
@@ -343,18 +401,13 @@ export async function closeMissingDays(
   missing.reverse();
 
   for (const ymd of missing) {
-    // KPIs del día (solo cajaDiaria)
     const k = await kpisDelDia(admin, ymd);
 
-    // ¿Hubo algo ese día? (sin contar apertura)
-    const huboAlgo = [k.ingresos, k.cobrado, k.retiros, k.gastosAdmin, k.gastosCobrador, k.prestamos]
-      .some((v) => Number(v) > 0);
-    if (!huboAlgo) continue;
+    // Caja inicial derivada SIEMPRE (apertura si existe; si no, cierre heredado)
+    const huboApertura = await existsApertura(admin, ymd);
+    const baseInicial = huboApertura ? k.apertura : await getCajaInicialBase(admin, ymd);
 
-    // Caja inicial derivada
-    const baseInicial = k.apertura > 0 ? k.apertura : await getCajaInicialBase(admin, ymd);
-
-    // Caja final
+    // Movimientos del día (si no hubo nada, queda igual al baseInicial)
     const cajaFinal = cajaFinalConBase(baseInicial, k);
 
     await ensureCierreIdempotente({
@@ -385,7 +438,7 @@ export async function ensureAperturaDeHoy(admin: string, hoy: string, tz: string
   });
   if (yaHayApertura) return;
 
-  // Monto = cierre de AYER (o saldo persistente > 0)
+  // Monto = cierre HEREDADO de AYER (respeta negativos y 0)
   const montoApertura = await getCajaInicialBase(admin, hoy);
   if (!Number.isFinite(montoApertura)) return;
 
