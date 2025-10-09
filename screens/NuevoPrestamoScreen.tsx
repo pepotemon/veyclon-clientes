@@ -56,7 +56,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
 
   const [prestamo, setPrestamo] = useState({
     modalidad: '',
-    interes: '0',
+    interes: '0',        // ✅ default 0%
     valorNeto: '',
     totalPrestamo: '',
     cuotas: '',
@@ -134,8 +134,9 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       Alert.alert('Falta modalidad', 'Selecciona la modalidad del préstamo.');
       return;
     }
-    if (interesPct <= 0) {
-      Alert.alert('Falta interés', 'Selecciona el % de interés.');
+    // ✅ permite 0% pero exige que haya un valor numérico válido (>= 0)
+    if (prestamo.interes === '' || !Number.isFinite(interesPct) || interesPct < 0) {
+      Alert.alert('Interés inválido', 'Selecciona un % de interés (puede ser 0%).');
       return;
     }
     if (valor <= 0) {
@@ -273,7 +274,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         clienteTelefono1: cliente?.telefono1 ?? '',
         concepto,
         modalidad: prestamo.modalidad,
-        interes: interesPct,
+        interes: interesPct,                 // ✅ puede ser 0
         valorNeto: valor,
         totalPrestamo: total,
         montoTotal: total,
@@ -309,7 +310,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         clienteNombre: concepto,
         createdAt: serverTimestamp(),
         createdAtMs: Date.now(),
-        meta: { modalidad: prestamo.modalidad, interesPct },
+        meta: { modalidad: prestamo.modalidad, interesPct }, // ✅ 0 permitido
       };
       batch.set(cajaRef, cajaPayload);
 
@@ -411,7 +412,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
             <Text
               style={[
                 styles.selectorText,
-                { color: toNum(prestamo.modalidad ? '1' : '0') > 0 ? palette.text : palette.softText },
+                { color: prestamo.modalidad ? palette.text : palette.softText },
               ]}
             >
               {prestamo.modalidad || 'Seleccionar'}
@@ -433,10 +434,11 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
             <Text
               style={[
                 styles.selectorText,
-                { color: toNum(prestamo.interes) > 0 ? palette.text : palette.softText },
+                // ✅ si hay string vacío, mostramos placeholder; si no, mostramos el % (incluye 0%)
+                { color: prestamo.interes === '' ? palette.softText : palette.text },
               ]}
             >
-              {toNum(prestamo.interes) > 0 ? `${prestamo.interes}%` : 'Seleccionar'}
+              {prestamo.interes === '' ? 'Seleccionar' : `${toNum(prestamo.interes)}%`}
             </Text>
           </TouchableOpacity>
 
@@ -548,7 +550,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       >
         <View style={styles.sheetOverlay}>
           <View style={[styles.sheet, { backgroundColor: palette.cardBg }]}>
-            {[10, 20, 25, 26].map((int) => (
+            {[0, 10, 20, 25, 26].map((int) => (  // ✅ incluye 0%
               <Pressable
                 key={int}
                 onPress={() => {
