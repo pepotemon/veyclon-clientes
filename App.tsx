@@ -1,7 +1,8 @@
 // App.tsx
 import 'react-native-gesture-handler';
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { StatusBar, Text, AppState } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -148,15 +149,43 @@ export type RootStackParamList = {
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
-/**
- * Navegador principal que consume el tema desde el contexto
- */
+/** Navegador principal que consume el tema desde el contexto */
 function AppNavigator() {
   const { navigationTheme, isDark } = useAppTheme();
   const bg = navigationTheme.colors.background;
 
+  // 🚦 Arranque dinámico: si hay sesión → Home; si no → Señuelo
+  const [bootReady, setBootReady] = useState(false);
+  const [initialRoute, setInitialRoute] = useState<keyof RootStackParamList>('DecoyRetro');
+  const [initialAdmin, setInitialAdmin] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const admin = await getSessionUser();
+        if (admin) {
+          setInitialAdmin(admin);
+          setInitialRoute('Home');
+        } else {
+          setInitialAdmin(undefined);
+          setInitialRoute('DecoyRetro');
+        }
+      } catch {
+        setInitialAdmin(undefined);
+        setInitialRoute('DecoyRetro');
+      } finally {
+        setBootReady(true);
+      }
+    })();
+  }, []);
+
+  if (!bootReady) return null;
+
   return (
-    <NavigationContainer theme={navigationTheme} ref={navigationRef}>
+    <NavigationContainer
+      theme={navigationTheme}
+      ref={navigationRef}
+    >
       {/* StatusBar sin animación y con color de fondo real */}
       <StatusBar
         barStyle={isDark ? 'light-content' : 'dark-content'}
@@ -166,7 +195,7 @@ function AppNavigator() {
       />
 
       <Stack.Navigator
-        initialRouteName="DecoyRetro" // 🕹️ ahora el señuelo es la ruta inicial
+        initialRouteName={initialRoute}
         screenOptions={{
           animation: 'none',
           gestureEnabled: false,
@@ -192,19 +221,16 @@ function AppNavigator() {
         }}
       >
         {/* 🕹️ Señuelo retro (sin header) */}
-        <Stack.Screen
-          name="DecoyRetro"
-          component={DecoyRetroScreen}
-          options={{ headerShown: false }}
-        />
+        <Stack.Screen name="DecoyRetro" component={DecoyRetroScreen} options={{ headerShown: false }} />
 
         {/* Frecuentes */}
+        <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
         <Stack.Screen
-          name="Login"
-          component={LoginScreen}
-          options={{ headerShown: false }}
+          name="Home"
+          component={HomeScreen}
+          // Pasamos admin si había sesión para que Home cargue sin parpadeo
+          initialParams={initialAdmin ? { admin: initialAdmin } : undefined}
         />
-        <Stack.Screen name="Home" component={HomeScreen} />
         <Stack.Screen name="NuevoCliente" component={NuevoClienteScreen} />
         <Stack.Screen name="NuevoPrestamo" component={NuevoPrestamoScreen} />
         <Stack.Screen name="PagosDiarios" component={PagosDiariosScreen} />
@@ -213,11 +239,7 @@ function AppNavigator() {
         <Stack.Screen name="PantallaInformes" component={PantallaInformes} />
         <Stack.Screen name="PagosDelDia" component={PagosDelDiaScreen} />
         <Stack.Screen name="VentasNuevas" component={VentasNuevasScreen} />
-        <Stack.Screen
-          name="InfoCliente"
-          component={InfoClienteScreen}
-          options={{ headerShown: false }}
-        />
+        <Stack.Screen name="InfoCliente" component={InfoClienteScreen} options={{ headerShown: false }} />
 
         {/* KPIs/gestión */}
         <Stack.Screen name="CajaDiaria" component={CajaDiariaScreen} />
@@ -226,11 +248,7 @@ function AppNavigator() {
         <Stack.Screen name="Gastos" component={GastosScreen} />
         <Stack.Screen name="Calculadora" component={CalculadoraScreen} />
         <Stack.Screen name="Pendientes" component={PendientesScreen} />
-        <Stack.Screen
-          name="DefinirCaja"
-          component={DefinirCajaScreen}
-          options={{ title: 'Definir caja' }}
-        />
+        <Stack.Screen name="DefinirCaja" component={DefinirCajaScreen} options={{ title: 'Definir caja' }} />
         <Stack.Screen name="CerrarDia" component={CerrarDiaScreen} />
         <Stack.Screen name="GastosDelDia" component={GastosDelDiaScreen} />
         <Stack.Screen name="RetirosDelDia" component={RetirosDelDiaScreen} />
@@ -244,26 +262,28 @@ function AppNavigator() {
           options={{ title: 'Preferencias de Usuario' }}
         />
         <Stack.Screen name="Acciones" component={AccionesScreen} />
-        <Stack.Screen
-          name="EnrutarClientes"
-          component={EnrutarClientesScreen}
-          options={{ title: 'Enrutar clientes' }}
-        />
+        <Stack.Screen name="EnrutarClientes" component={EnrutarClientesScreen} options={{ title: 'Enrutar clientes' }} />
 
         {/* Historiales y detalles */}
         <Stack.Screen name="HistorialPagos" component={HistorialPagosScreen} />
         <Stack.Screen name="DetalleCuotas" component={DetalleCuotasScreen} />
         <Stack.Screen name="HistorialPrestamos" component={HistorialPrestamosScreen} />
-        <Stack.Screen
-          name="DetalleHistorialPrestamo"
-          component={DetalleHistorialPrestamoScreen}
-        />
+        <Stack.Screen name="DetalleHistorialPrestamo" component={DetalleHistorialPrestamoScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );
 }
 
 export default function App() {
+  // 🔧 Limpieza única de claves legadas que podían forzar "Ruta1"
+  useEffect(() => {
+    (async () => {
+      try {
+        await AsyncStorage.multiRemove(['usuarioSesion', 'usuarioPerfil']); // legacy
+      } catch {}
+    })();
+  }, []);
+
   // 👉 PATCH: listeners Outbox (NetInfo/AppState)
   useEffect(() => {
     // Drenado inicial pequeño por si había pendientes al arrancar

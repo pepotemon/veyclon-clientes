@@ -2,6 +2,7 @@
 import {
   doc, getDoc, setDoc, updateDoc, serverTimestamp,
   collection, query, where, getDocs, addDoc, orderBy, limit,
+  QueryConstraint,
 } from 'firebase/firestore';
 import { db } from '../firebase/firebaseConfig';
 import { logAudit, pick } from './auditLogs';
@@ -15,7 +16,6 @@ export type CajaEstado = {
   tz?: string | null;
 };
 
-/** Tipos de documentos en cajaDiaria (payloads) */
 type CierreDoc = {
   tipo: 'cierre';
   admin: string;
@@ -49,13 +49,16 @@ function prevDay(ymd: string): string {
 }
 
 /** Detecta si hubo APERTURA (aunque sea 0) en un día dado. */
-async function existsApertura(admin: string, ymd: string): Promise<boolean> {
-  const qHoy = query(
-    collection(db, 'cajaDiaria'),
+async function existsApertura(admin: string, ymd: string, tenantId?: string | null): Promise<boolean> {
+  const constraints: QueryConstraint[] = [
     where('admin', '==', admin),
-    where('operationalDate', '==', ymd)
-  );
+    where('operationalDate', '==', ymd),
+  ];
+  if (tenantId) constraints.push(where('tenantId', '==', tenantId));
+
+  const qHoy = query(collection(db, 'cajaDiaria'), ...constraints);
   const snap = await getDocs(qHoy);
+
   let ok = false;
   snap.forEach((d) => {
     const tip = canonicalTipo((d.data() as any)?.tipo);
@@ -65,7 +68,11 @@ async function existsApertura(admin: string, ymd: string): Promise<boolean> {
 }
 
 /** Caja inicial BASE = último CIERRE <= AYER (heredado). */
-export async function getCajaInicialBase(admin: string, hoy: string): Promise<number> {
+export async function getCajaInicialBase(
+  admin: string,
+  hoy: string,
+  tenantId?: string | null,
+): Promise<number> {
   const ayer = prevDay(hoy);
 
   // 1) Cierre idempotente preferido (exacto de AYER)
@@ -77,16 +84,18 @@ export async function getCajaInicialBase(admin: string, hoy: string): Promise<nu
     }
   } catch {}
 
-  // 2) Último cierre "no idempotente" de AYER (compat)
+  // 2) Último cierre “no idempotente” de AYER (compat)
   try {
-    const qAyer = query(
-      collection(db, 'cajaDiaria'),
+    const constraints: QueryConstraint[] = [
       where('admin', '==', admin),
       where('operationalDate', '==', ayer),
       where('tipo', '==', 'cierre'),
       orderBy('createdAt', 'desc'),
-      limit(1)
-    );
+      limit(1),
+    ];
+    if (tenantId) constraints.splice(1, 0, where('tenantId', '==', tenantId)); // después de admin
+
+    const qAyer = query(collection(db, 'cajaDiaria'), ...constraints);
     const sA = await getDocs(qAyer);
     if (!sA.empty) {
       const v = Number(sA.docs[0].data()?.balance || 0);
@@ -96,12 +105,15 @@ export async function getCajaInicialBase(admin: string, hoy: string): Promise<nu
 
   // 3) Buscar el ÚLTIMO cierre <= AYER (sin exigir índice; filtrado en cliente)
   try {
-    const qAll = query(
-      collection(db, 'cajaDiaria'),
+    const constraintsAll: QueryConstraint[] = [
       where('admin', '==', admin),
-      where('tipo', '==', 'cierre')
-    );
+      where('tipo', '==', 'cierre'),
+    ];
+    if (tenantId) constraintsAll.splice(1, 0, where('tenantId', '==', tenantId));
+
+    const qAll = query(collection(db, 'cajaDiaria'), ...constraintsAll);
     const s = await getDocs(qAll);
+
     let bestOp = ''; // YYYY-MM-DD
     let bestMs = -1;
     let bestBal = 0;
@@ -211,8 +223,8 @@ export async function ensureCierreIdempotente({
   tz,
   source = 'auto',
 }: {
-  admin: string;
-  operationalDate: string; // YYYY-MM-DD
+  admin: string;                 // 👈 pasa authAdminId
+  operationalDate: string;       // YYYY-MM-DD
   balance: number;
   tz?: string | null;
   source?: 'auto' | 'manual' | 'system';
@@ -253,7 +265,6 @@ export async function ensureCierreIdempotente({
     after: pick(payload, ['tipo', 'balance', 'operationalDate', 'tz', 'source']),
   });
 
-  // arrastre
   await setSaldoActual(admin, payload.balance, tz ?? undefined);
   try {
     await updateDoc(doc(db, 'cajaEstado', admin), {
@@ -266,9 +277,9 @@ export async function ensureCierreIdempotente({
 }
 
 export async function registrarCierre(
-  admin: string,
-  hoy: string,          // 'YYYY-MM-DD'
-  balanceFinal: number, // saldo final calculado
+  admin: string,                 // 👈 pasa authAdminId
+  hoy: string,
+  balanceFinal: number,
   tz?: string
 ) {
   await ensureCierreIdempotente({
@@ -285,15 +296,21 @@ export async function registrarCierre(
  *  - Base: APERTURA si EXISTE (aunque sea 0) o CIERRE HEREDADO
  *  - Movimientos del día: SOLO desde cajaDiaria (kpisDelDia)
  * ----------------------------------------------------------- */
-async function computeCajaFinalForDay(admin: string, ymd: string) {
-  // KPIs del día (solo cajaDiaria)
-  const k = await kpisDelDia(admin, ymd);
+async function computeCajaFinalForDay(
+  admin: string,
+  ymd: string,
+  tenantId?: string | null,
+) {
+  // kpisDelDia debe usar admin (authAdminId). Si soporta tenantId, pásalo aquí.
+  const k = await kpisDelDia(admin, ymd /* , tenantId */);
 
   // Detectar si existió un documento de apertura (aunque el monto sea 0)
-  const huboApertura = await existsApertura(admin, ymd);
+  const huboApertura = await existsApertura(admin, ymd, tenantId);
 
   // Base inicial derivada
-  const baseInicial = huboApertura ? k.apertura : await getCajaInicialBase(admin, ymd);
+  const baseInicial = huboApertura
+    ? k.apertura
+    : await getCajaInicialBase(admin, ymd, tenantId);
 
   // Caja final viva
   const cajaFinal = cajaFinalConBase(baseInicial, k);
@@ -313,7 +330,12 @@ async function computeCajaFinalForDay(admin: string, ymd: string) {
 /** -----------------------------------------------------------
  *  Cierre automático de un día (idempotente) + arrastre
  * ----------------------------------------------------------- */
-export async function autoCloseDay(admin: string, ymd: string, tz: string) {
+export async function autoCloseDay(
+  admin: string,                 // 👈 authAdminId
+  ymd: string,
+  tz: string,
+  tenantId?: string | null,
+) {
   const ref = doc(db, 'cajaDiaria', `cierre_${admin}_${ymd}`);
   const ex = await getDoc(ref);
   if (ex.exists()) {
@@ -328,7 +350,7 @@ export async function autoCloseDay(admin: string, ymd: string, tz: string) {
     return;
   }
 
-  const kpi = await computeCajaFinalForDay(admin, ymd);
+  const kpi = await computeCajaFinalForDay(admin, ymd, tenantId);
   await ensureCierreIdempotente({
     admin,
     operationalDate: ymd,
@@ -341,10 +363,14 @@ export async function autoCloseDay(admin: string, ymd: string, tz: string) {
 /** -----------------------------------------------------------
  *  Actualiza EN VIVO cajaEstado.saldoActual con la “cajaFinal” parcial
  * ----------------------------------------------------------- */
-export async function updateCajaEstadoLive(admin: string, ymd: string, tz: string) {
-  const kpi = await computeCajaFinalForDay(admin, ymd);
+export async function updateCajaEstadoLive(
+  admin: string,                 // 👈 authAdminId
+  ymd: string,
+  tz: string,
+  tenantId?: string | null,
+) {
+  const kpi = await computeCajaFinalForDay(admin, ymd, tenantId);
   await setSaldoActual(admin, kpi.cajaFinal, tz);
-  // (opcional) meta info para debug/monitor
   try {
     await updateDoc(doc(db, 'cajaEstado', admin), {
       liveOperationalDate: ymd,
@@ -367,10 +393,11 @@ export async function updateCajaEstadoLive(admin: string, ymd: string, tz: strin
  * - Usa sólo `cajaDiaria` para KPIs (sin CG de préstamos).
  */
 export async function closeMissingDays(
-  admin: string,
+  admin: string,                 // 👈 authAdminId
   hoy: string,
   tz: string,
-  maxDaysBack = 7
+  maxDaysBack = 7,
+  tenantId?: string | null,
 ) {
   const tzUse = pickTZ(tz);
 
@@ -401,13 +428,13 @@ export async function closeMissingDays(
   missing.reverse();
 
   for (const ymd of missing) {
-    const k = await kpisDelDia(admin, ymd);
+    // KPIs del día (filtra por admin internamente). Si kpisDelDia soporta tenantId, pásalo.
+    const k = await kpisDelDia(admin, ymd /* , tenantId */);
 
     // Caja inicial derivada SIEMPRE (apertura si existe; si no, cierre heredado)
-    const huboApertura = await existsApertura(admin, ymd);
-    const baseInicial = huboApertura ? k.apertura : await getCajaInicialBase(admin, ymd);
+    const huboApertura = await existsApertura(admin, ymd, tenantId);
+    const baseInicial = huboApertura ? k.apertura : await getCajaInicialBase(admin, ymd, tenantId);
 
-    // Movimientos del día (si no hubo nada, queda igual al baseInicial)
     const cajaFinal = cajaFinalConBase(baseInicial, k);
 
     await ensureCierreIdempotente({
@@ -423,14 +450,22 @@ export async function closeMissingDays(
 // ———————————————————————————————————————————————
 // Asegura una "apertura" automática HOY (idempotente)
 // ———————————————————————————————————————————————
-export async function ensureAperturaDeHoy(admin: string, hoy: string, tz: string) {
+export async function ensureAperturaDeHoy(
+  admin: string,                 // 👈 authAdminId
+  hoy: string,
+  tz: string,
+  tenantId?: string | null,
+) {
   // Compat: si ya existe ALGUNA apertura hoy (cualquier id), no crear otra
-  const qHoy = query(
-    collection(db, 'cajaDiaria'),
+  const constraints: QueryConstraint[] = [
     where('admin', '==', admin),
-    where('operationalDate', '==', hoy)
-  );
+    where('operationalDate', '==', hoy),
+  ];
+  if (tenantId) constraints.push(where('tenantId', '==', tenantId));
+
+  const qHoy = query(collection(db, 'cajaDiaria'), ...constraints);
   const snapHoy = await getDocs(qHoy);
+
   let yaHayApertura = false;
   snapHoy.forEach((d) => {
     const tip = canonicalTipo((d.data() as any)?.tipo);
@@ -439,15 +474,17 @@ export async function ensureAperturaDeHoy(admin: string, hoy: string, tz: string
   if (yaHayApertura) return;
 
   // Monto = cierre HEREDADO de AYER (respeta negativos y 0)
-  const montoApertura = await getCajaInicialBase(admin, hoy);
+  const montoApertura = await getCajaInicialBase(admin, hoy, tenantId);
   if (!Number.isFinite(montoApertura)) return;
+
+  const tzUse = pickTZ(tz);
 
   const aperturaPayload: AperturaDoc = {
     tipo: 'apertura',
     admin,
     monto: Math.round(Number(montoApertura || 0) * 100) / 100,
     operationalDate: hoy,
-    tz,
+    tz: tzUse,
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
     source: 'auto',

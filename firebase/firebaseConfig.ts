@@ -1,13 +1,14 @@
 // firebase/firebaseConfig.ts
 import { Platform } from 'react-native';
 import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
 import {
   getFirestore,
   initializeFirestore,
-  Firestore,
+  type Firestore,
 } from 'firebase/firestore';
 
-// ⚠️ Tus credenciales (apiKey no es secreta en Firebase Web)
+// ⚠️ Credenciales Web (apiKey no es secreta en proyectos Firebase Web)
 const firebaseConfig = {
   apiKey: 'AIzaSyAm0ZZWZ0MrGTj0HsgG8LdRLJs-ezv2PLQ',
   authDomain: 'cobrox-43ba7.firebaseapp.com',
@@ -18,28 +19,34 @@ const firebaseConfig = {
   measurementId: 'G-TP2W5FVB8P',
 };
 
-// Evita “Firebase App named '[DEFAULT]' already exists” en dev/HMR
+// Evita “Firebase App named '[DEFAULT]' already exists” con HMR
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
-// Inicializa Firestore con settings seguros en RN/Expo.
-// Nota: initializeFirestore solo puede llamarse ANTES de la 1ª obtención.
-// Si el app ya existía (HMR), no podemos reconfigurar; usamos getFirestore().
+// ---------- Auth ----------
+// Usamos getAuth (sin persistencia RN explícita) para evitar errores de tipos.
+// Si en el futuro actualizas el SDK y quieres persistencia en RN:
+//   import { initializeAuth, getReactNativePersistence } from 'firebase/auth'
+//   import AsyncStorage from '@react-native-async-storage/async-storage'
+//   const auth = initializeAuth(app, { persistence: getReactNativePersistence(AsyncStorage) })
+const auth = getAuth(app);
+
+// ---------- Firestore ----------
 let db: Firestore;
-if (getApps().length > 1) {
-  // HMR muy agresivo; por si acaso
-  db = getFirestore(getApp());
-} else if (Platform.OS !== 'web') {
-  // React Native: long-polling auto y sin undefined
-  db = initializeFirestore(app, {
-    ignoreUndefinedProperties: true,
-    experimentalAutoDetectLongPolling: true,
-    // Si tu red es complicada y aún hay problemas, puedes forzar:
-    // experimentalForceLongPolling: true,
-    // useFetchStreams: false,
-  });
+
+if (Platform.OS !== 'web') {
+  // En RN usar long-polling ayuda en redes móviles / emuladores
+  try {
+    db = initializeFirestore(app, {
+      ignoreUndefinedProperties: true,
+      experimentalAutoDetectLongPolling: true,
+      // experimentalForceLongPolling: true, // <- si tu red es muy restrictiva, puedes descomentar esta línea
+    });
+  } catch {
+    // Si ya fue inicializado (HMR), cae aquí
+    db = getFirestore(app);
+  }
 } else {
-  // Web
   db = getFirestore(app);
 }
 
-export { app, db };
+export { app, auth, db };

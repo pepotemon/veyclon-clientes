@@ -1,12 +1,14 @@
 // security/AppInactivityLock.tsx
 import React, { useEffect, useRef } from 'react';
 import { AppState, AppStateStatus } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { resetTo } from '../navigation/navigationRef';
+import { navigationRef } from '../navigation/navigationRef';
+import { clearSession } from '../utils/session';
 
 type Props = {
-  idleMs?: number;            // tiempo de inactividad (ms)
-  countWhileInactive?: boolean; // cuenta cuando la app está inactive/background
+  /** Tiempo de inactividad antes de bloquear (ms). Default: 3min */
+  idleMs?: number;
+  /** Si cuenta tiempo cuando la app está inactive/background. Default: true */
+  countWhileInactive?: boolean;
 };
 
 export default function AppInactivityLock({
@@ -23,14 +25,24 @@ export default function AppInactivityLock({
     }
   };
 
+  const goToDecoy = () => {
+    if (navigationRef.isReady()) {
+      navigationRef.resetRoot({
+        index: 0,
+        routes: [{ name: 'DecoyRetro' as never }],
+      });
+    }
+  };
+
   const scheduleTimer = () => {
     clearTimer();
     timerRef.current = setTimeout(async () => {
       try {
-        await AsyncStorage.removeItem('usuarioSesion');
+        // Limpia la sesión real (coincide con el resto de la app)
+        await clearSession();
       } finally {
         // Volver al señuelo (antes del Login)
-        resetTo('DecoyRetro');
+        goToDecoy();
       }
     }, idleMs);
   };
@@ -41,6 +53,7 @@ export default function AppInactivityLock({
       if (s === 'background' || s === 'inactive') {
         if (countWhileInactive) scheduleTimer();
       } else if (s === 'active') {
+        // App vuelve a primer plano → cancelamos el timer
         clearTimer();
       }
     });

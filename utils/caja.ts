@@ -13,7 +13,7 @@ import {
 import { db } from '../firebase/firebaseConfig';
 import { logAudit, pick } from './auditLogs';
 
-// 👇 Intérprete canónico (mapea: pago->abono, venta->retiro, gasto/gastoAdmin->gasto_* ...)
+// 👇 Intérprete canónico (mapea: pago->abono, gasto/gastoAdmin->gasto_*, venta->prestamo)
 import {
   canonicalTipo,
   type MovimientoTipo,
@@ -28,7 +28,7 @@ type LegacyMovimientoTipo =
   | 'gastoAdmin'
   | 'pago'
   | 'aperturaAuto'
-  | 'venta'; // <- alias legacy para "retiro"
+  | 'venta'; // ← legacy; hoy se registra como 'prestamo' (salida de caja)
 
 type AnyMovimientoTipo = MovimientoTipo | LegacyMovimientoTipo;
 
@@ -45,10 +45,15 @@ export type MovimientoCaja = {
   meta?: Record<string, any>;
   categoria?: string;      // para gasto_admin / gasto_cobrador
   source?: 'manual' | 'auto' | 'system';
-  // 👇 Nuevos campos top-level para UI/Informes
-  clienteNombre?: string;
-  clienteId?: string;
-  prestamoId?: string;
+
+  // —— Top-level para UI/Informes
+  clienteNombre?: string | null;
+  clienteId?: string | null;
+  prestamoId?: string | null;
+
+  // —— Scoping (para no mezclar sesiones/rutas)
+  tenantId?: string | null;
+  rutaId?: string | null;
 };
 
 const MIN_AMOUNT = 0.01;
@@ -78,9 +83,16 @@ function sanitizeInput(
     categoria?: string;
     meta?: Record<string, any>;
     source?: MovimientoCaja['source'];
+
+    // top-level visibles / scoping
+    clienteNombre?: string | null;
+    clienteId?: string | null;
+    prestamoId?: string | null;
+    tenantId?: string | null;
+    rutaId?: string | null;
   }
 ) {
-  // canonicalTipo DEBE mapear: pago->abono, venta->retiro, gasto/gastoAdmin->gasto_*.
+  // canonicalTipo mapea: pago→abono, gasto/gastoAdmin→gasto_*, venta→prestamo, etc.
   const tip = canonicalTipo(String(data.tipo));
   if (!tip) throw new Error(`Tipo de movimiento inválido: ${String(data.tipo)}`);
 
@@ -101,25 +113,33 @@ function sanitizeInput(
   const meta = data.meta && typeof data.meta === 'object' ? data.meta : undefined;
   const source: MovimientoCaja['source'] = data.source || 'manual';
 
-  return { tip, admin, monto, operationalDate, tz, nota, categoria, meta, source };
+  // —— scoping / visibles
+  const clienteNombre = (data.clienteNombre ?? null) as string | null;
+  const clienteId     = (data.clienteId ?? null) as string | null;
+  const prestamoId    = (data.prestamoId ?? null) as string | null;
+  const tenantId      = (data.tenantId ?? null) as string | null;
+  const rutaId        = (data.rutaId ?? null) as string | null;
+
+  return {
+    tip, admin, monto, operationalDate, tz,
+    nota, categoria, meta, source,
+    clienteNombre, clienteId, prestamoId,
+    tenantId, rutaId,
+  };
 }
 
 // =============== Escritura clásica (no idempotente) ===============
-/** Escribe un movimiento en 'cajaDiaria'. Acepta tipos legacy y los mapea a canónicos. */
+// Escribe un movimiento en 'cajaDiaria'. Acepta tipos legacy y los mapea a canónicos.
 export async function addMovimiento(
   _admin: string,
   data: Omit<MovimientoCaja, 'tipo' | 'admin' | 'createdAt' | 'createdAtMs' | 'source'> & {
     tipo: AnyMovimientoTipo;
     admin?: string;
     source?: MovimientoCaja['source'];
-    // top-level opcionales:
-    clienteNombre?: string;
-    clienteId?: string;
-    prestamoId?: string;
   }
 ) {
   const refCol = collection(db, 'cajaDiaria');
-  const s = sanitizeInput(_admin, data);
+  const s = sanitizeInput(_admin, data as any);
 
   const payload = {
     tipo: s.tip, // 👈 siempre canónico
@@ -133,33 +153,26 @@ export async function addMovimiento(
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
     source: s.source,
-    // 👇 Top-level para UI/Informes
-    clienteNombre: (data as any).clienteNombre,
-    clienteId: (data as any).clienteId,
-    prestamoId: (data as any).prestamoId,
+
+    // —— Top-level para UI/Informes y scoping
+    clienteNombre: s.clienteNombre,
+    clienteId: s.clienteId,
+    prestamoId: s.prestamoId,
+    tenantId: s.tenantId,
+    rutaId: s.rutaId,
   };
 
   const docRef = await addDoc(refCol, stripUndefined(payload));
 
-  // ---- AUDIT
+  // ---- AUDIT (genérico para no romper nada)
   await logAudit({
     userId: s.admin,
     action: 'create',
     ref: doc(db, 'cajaDiaria', docRef.id),
     before: null,
     after: pick(payload, [
-      'tipo',
-      'admin',
-      'monto',
-      'operationalDate',
-      'tz',
-      'nota',
-      'categoria',
-      'meta',
-      'source',
-      'clienteNombre',
-      'clienteId',
-      'prestamoId',
+      'tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source',
+      'clienteNombre','clienteId','prestamoId','tenantId','rutaId',
     ]),
   });
 
@@ -167,22 +180,13 @@ export async function addMovimiento(
 }
 
 // =============== Escritura idempotente ===============
-/**
- * Crea/actualiza un movimiento con ID fijo en 'cajaDiaria'.
- * - Si el documento ya existe (mismo docId), NO duplica (y no vuelve a auditar).
- * - Devuelve { created: boolean, id: string }
- * - Acepta tipos legacy y los mapea a canónicos.
- */
+// Crea/actualiza un movimiento con ID fijo en 'cajaDiaria'.
 export async function addMovimientoIdempotente(
   _admin: string,
   data: Omit<MovimientoCaja, 'tipo' | 'admin' | 'createdAt' | 'createdAtMs' | 'source'> & {
     tipo: AnyMovimientoTipo;
     admin?: string;
     source?: MovimientoCaja['source'];
-    // top-level opcionales:
-    clienteNombre?: string;
-    clienteId?: string;
-    prestamoId?: string;
   },
   docId: string
 ): Promise<{ created: boolean; id: string }> {
@@ -192,7 +196,7 @@ export async function addMovimientoIdempotente(
     return { created: false, id: ref.id };
   }
 
-  const s = sanitizeInput(_admin, data);
+  const s = sanitizeInput(_admin, data as any);
 
   const payload = {
     tipo: s.tip, // 👈 canónico
@@ -206,10 +210,13 @@ export async function addMovimientoIdempotente(
     createdAt: serverTimestamp(),
     createdAtMs: Date.now(),
     source: s.source,
-    // 👇 Top-level visibles
-    clienteNombre: (data as any).clienteNombre,
-    clienteId: (data as any).clienteId,
-    prestamoId: (data as any).prestamoId,
+
+    // —— Top-level
+    clienteNombre: s.clienteNombre,
+    clienteId: s.clienteId,
+    prestamoId: s.prestamoId,
+    tenantId: s.tenantId,
+    rutaId: s.rutaId,
   };
 
   await setDoc(ref, stripUndefined(payload));
@@ -221,18 +228,8 @@ export async function addMovimientoIdempotente(
     ref,
     before: null,
     after: pick(payload, [
-      'tipo',
-      'admin',
-      'monto',
-      'operationalDate',
-      'tz',
-      'nota',
-      'categoria',
-      'meta',
-      'source',
-      'clienteNombre',
-      'clienteId',
-      'prestamoId',
+      'tipo','admin','monto','operationalDate','tz','nota','categoria','meta','source',
+      'clienteNombre','clienteId','prestamoId','tenantId','rutaId',
     ]),
   });
 
@@ -251,10 +248,12 @@ export async function recordAbonoFromOutbox(params: {
   monto: number;
   operationalDate: string;
   tz: string;
-  // 👇 nuevos campos top-level
-  clienteNombre?: string;
-  clienteId?: string;
-  prestamoId?: string;
+  // —— nuevos campos top-level
+  clienteNombre?: string | null;
+  clienteId?: string | null;
+  prestamoId?: string | null;
+  tenantId?: string | null;
+  rutaId?: string | null;
   // meta extra opcional (por ejemplo abonoRefPath)
   meta?: Record<string, any>;
   tipo?: 'pago' | 'abono';
@@ -268,6 +267,8 @@ export async function recordAbonoFromOutbox(params: {
     clienteNombre,
     clienteId,
     prestamoId,
+    tenantId,
+    rutaId,
     meta,
     tipo = 'abono',
   } = params;
@@ -281,6 +282,7 @@ export async function recordAbonoFromOutbox(params: {
     tz,
     meta,
     source: 'system',
+    clienteNombre, clienteId, prestamoId, tenantId, rutaId,
   });
 
   return addMovimientoIdempotente(
@@ -292,11 +294,10 @@ export async function recordAbonoFromOutbox(params: {
       tz: tzOk,
       meta: { fromOutboxId: outboxId, ...(meta || {}) },
       source: 'system',
-      // 👇 también en top-level
-      clienteNombre,
-      clienteId,
-      prestamoId,
-    },
+
+      // —— también en top-level
+      clienteNombre, clienteId, prestamoId, tenantId, rutaId,
+    } as any,
     `ox_${outboxId}`
   );
 }

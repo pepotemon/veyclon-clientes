@@ -27,6 +27,8 @@ import { useAppTheme } from '../theme/ThemeProvider';
 import { logAudit, pick } from '../utils/auditLogs';
 import { addToOutbox } from '../utils/outbox';
 import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view';
+// 🔐 contexto de auth para scoping
+import { getAuthCtx } from '../utils/authCtx';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoPrestamo'>;
 
@@ -48,7 +50,7 @@ function nextOperativeDayStr(startIso: string, diasHabiles: number[] = [1, 2, 3,
 
 export default function NuevoPrestamoScreen({ route, navigation }: Props) {
   const { palette } = useAppTheme();
-  const { cliente, admin, existingClienteId } = route.params as any;
+  const { cliente, existingClienteId } = route.params as any; // 🚫 no usamos route.params.admin
 
   const [modalidadVisible, setModalidadVisible] = useState(false);
   const [interesVisible, setInteresVisible] = useState(false);
@@ -65,6 +67,31 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
     permitirAdelantar: true,
   });
 
+  // 🔐 contexto auth (tenant/rol/ruta/admin)
+  const [ctx, setCtx] = useState<{
+    admin: string | null;
+    tenantId: string | null;
+    role: 'collector' | 'admin' | 'superadmin' | null;
+    rutaId: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const c = await getAuthCtx();
+      if (!active) return;
+      setCtx({
+        admin: c?.admin ?? null,
+        tenantId: c?.tenantId ?? null,
+        role: (c?.role as any) ?? null,
+        rutaId: c?.rutaId ?? null,
+      });
+    })();
+    return () => { active = false; };
+  }, []);
+
+  const authAdminId = ctx?.admin ?? null;
+
   // 👇 refs para Enter → siguiente
   const refValorNeto = useRef<TextInput>(null);
   const refCuotas = useRef<TextInput>(null);
@@ -77,7 +104,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       r.current?.focus();
       if (node && scrollRef.current?.scrollToFocusedInput) {
         setTimeout(() => {
-          scrollRef.current.scrollToFocusedInput(node, 90); // margen extra sobre teclado
+          scrollRef.current.scrollToFocusedInput(node, 90);
         }, 16);
       }
     }, 0);
@@ -134,7 +161,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       Alert.alert('Falta modalidad', 'Selecciona la modalidad del préstamo.');
       return;
     }
-    // ✅ permite 0% pero exige que haya un valor numérico válido (>= 0)
     if (prestamo.interes === '' || !Number.isFinite(interesPct) || interesPct < 0) {
       Alert.alert('Interés inválido', 'Selecciona un % de interés (puede ser 0%).');
       return;
@@ -163,6 +189,11 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
   const guardarTodo = async () => {
     if (guardando) return;
     try {
+      if (!authAdminId) {
+        Alert.alert('Sesión', 'No se pudo identificar el usuario (admin). Intenta nuevamente.');
+        return;
+      }
+
       setGuardando(true);
 
       // --------- Detectar conectividad ----------
@@ -171,12 +202,12 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         const state = await NetInfo.fetch();
         isOnline = !!(state?.isInternetReachable ?? state?.isConnected);
       } catch {
-        isOnline = true; // si NetInfo falla, intentamos online
+        isOnline = true;
       }
 
       // --------- Datos comunes ----------
-      const tz = pickTZ((cliente as any)?.tz);
-      const hoyIso = todayInTZ(tz);
+      const tzDoc = pickTZ((cliente as any)?.tz);
+      const hoyIso = todayInTZ(tzDoc);
       const diasHabiles = [1, 2, 3, 4, 5, 6]; // Lun–Sáb
       const fechaInicioOperativa = nextOperativeDayStr(hoyIso, diasHabiles);
       const total = totalCalc;
@@ -184,32 +215,54 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       const concepto = String(cliente?.nombre ?? '').trim() || 'Sin nombre';
 
       // ========== OFFLINE: encolar venta ==========
+// (si tu worker crea ambos: préstamo y caja)
       if (!isOnline) {
         if (!existingClienteId) {
           Alert.alert(
             'Sin conexión',
             'Para crear un cliente nuevo necesitas internet. Si ya existe el cliente, selecciónalo e intenta de nuevo.',
           );
+          setGuardando(false);
           return;
         }
 
         try {
-          await addToOutbox({
-            kind: 'venta',
-            payload: {
-              admin,
-              clienteId: existingClienteId,
-              clienteNombre: concepto,
-              valorCuota: vCuota,
-              cuotas: cuotasNum,
-              totalPrestamo: total,
-              fechaInicio: fechaInicioOperativa,
-              tz,
-              operationalDate: hoyIso,
-              retiroCaja: valor,
-              meta: { modalidad: prestamo.modalidad, interesPct, valorNeto: valor },
-            },
-          });
+         await addToOutbox({
+  kind: 'venta',
+  payload: {
+    admin: authAdminId,                // usa solo admin
+    clienteId: existingClienteId,
+    clienteNombre: concepto,
+    valorCuota: vCuota,
+    cuotas: cuotasNum,
+    totalPrestamo: total,              // o montoTotal, como prefieras
+    fechaInicio: fechaInicioOperativa, // 'YYYY-MM-DD'
+    tz: tzDoc,
+    operationalDate: hoyIso,
+    retiroCaja: valor,
+    meta: { modalidad: prestamo.modalidad, interesPct, valorNeto: valor },
+    // 🔐 scoping
+    tenantId: ctx?.tenantId ?? null,
+    rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
+
+    alsoCajaDiaria: true,
+    cajaPayload: {
+      tipo: 'prestamo',
+      admin: authAdminId,              // requerido por VentaCajaPayload
+      clienteId: existingClienteId,
+      clienteNombre: concepto,
+      // el worker rellenará el id real:
+      prestamoId: '__to_be_filled_by_worker__',
+      monto: Number(valor),
+      tz: tzDoc,
+      operationalDate: hoyIso,
+      meta: { modalidad: prestamo.modalidad, interesPct },
+      tenantId: ctx?.tenantId ?? null,
+      rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
+    },
+  },
+});
+
 
           Alert.alert(
             'Sin conexión',
@@ -227,6 +280,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       }
 
       // ========== ONLINE: batch ==========
+// (cliente + préstamo + caja + índice)
       const batch = writeBatch(db);
 
       // 1) Cliente
@@ -239,31 +293,39 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
           ...(cliente?.direccion1 ? { direccion1: cliente.direccion1 } : {}),
           ...(cliente?.telefono1 ? { telefono1: cliente.telefono1 } : {}),
           actualizadoEn: serverTimestamp(),
+          // opcional: scoping para clientes si lo usas
+          tenantId: ctx?.tenantId ?? null,
         };
         batch.set(clienteRef, updatePayload, { merge: true });
         void logAudit({
-          userId: admin,
+          userId: authAdminId,
           action: 'update',
           ref: clienteRef,
-          after: pick(updatePayload, ['nombre', 'alias', 'direccion1', 'telefono1']),
+          after: pick(updatePayload, ['nombre', 'alias', 'direccion1', 'telefono1', 'tenantId']),
         });
       } else {
         clienteRef = doc(collection(db, 'clientes'));
         const clienteId = clienteRef.id;
-        const createPayload = { ...cliente, creadoPor: admin, creadoEn: serverTimestamp(), id: clienteId };
+        const createPayload = {
+          ...cliente,
+          creadoPor: authAdminId,            // 👈 unificado
+          creadoEn: serverTimestamp(),
+          id: clienteId,
+          tenantId: ctx?.tenantId ?? null,
+        };
         batch.set(clienteRef, createPayload);
         void logAudit({
-          userId: admin,
+          userId: authAdminId,
           action: 'create',
           ref: clienteRef,
-          after: pick(createPayload, ['nombre', 'alias', 'direccion1', 'telefono1', 'creadoPor', 'id']),
+          after: pick(createPayload, ['nombre', 'alias', 'direccion1', 'telefono1', 'creadoPor', 'id', 'tenantId']),
         });
       }
 
       // 2) Préstamo
       const prestamoRef = doc(collection(clienteRef, 'prestamos'));
       const prestamoPayload = {
-        creadoPor: admin,
+        creadoPor: authAdminId,              // 👈 unificado
         creadoEn: serverTimestamp(),
         createdAtMs: Date.now(),
         createdDate: hoyIso,
@@ -287,30 +349,36 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         status: 'activo' as const,
         permitirAdelantar: true,
         fechaInicio: fechaInicioOperativa,
-        tz: pickTZ((cliente as any)?.tz),
+        tz: tzDoc,
         diasHabiles: [1, 2, 3, 4, 5, 6],
         feriados: [],
         pausas: [],
         proximoVencimiento: fechaInicioOperativa,
         dueToday: false,
+        // 🔐 scoping
+        tenantId: ctx?.tenantId ?? null,
+        rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
       };
       batch.set(prestamoRef, prestamoPayload);
 
-      // 3) CajaDiaria
+      // 3) CajaDiaria (prestamo)
       const cajaDocId = `loan_${prestamoRef.id}`;
       const cajaRef = doc(collection(db, 'cajaDiaria'), cajaDocId);
       const cajaPayload = {
         tipo: 'prestamo' as const,
-        admin,
+        admin: authAdminId,                  // 👈 unificado
         monto: Number(valor),
         operationalDate: hoyIso,
-        tz: pickTZ((cliente as any)?.tz),
+        tz: tzDoc,
         clienteId: existingClienteId ?? clienteRef.id,
         prestamoId: prestamoRef.id,
         clienteNombre: concepto,
         createdAt: serverTimestamp(),
         createdAtMs: Date.now(),
-        meta: { modalidad: prestamo.modalidad, interesPct }, // ✅ 0 permitido
+        meta: { modalidad: prestamo.modalidad, interesPct },
+        // 🔐 scoping de caja
+        tenantId: ctx?.tenantId ?? null,
+        rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
       };
       batch.set(cajaRef, cajaPayload);
 
@@ -320,18 +388,20 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         id: existingClienteId ?? clienteRef.id,
         disponible: false,
         actualizadoEn: serverTimestamp(),
-        creadoPor: admin,
+        creadoPor: authAdminId,              // 👈 unificado
         alias: cliente?.alias ?? '',
         nombre: concepto,
         barrio: cliente?.barrio ?? '',
         telefono1: cliente?.telefono1 ?? '',
+        // opcional: scoping si lo filtras por tenant
+        tenantId: ctx?.tenantId ?? null,
       };
       batch.set(idxRef, idxPayload, { merge: true });
 
       await batch.commit();
 
       void logAudit({
-        userId: admin,
+        userId: authAdminId,
         action: 'create',
         ref: prestamoRef,
         after: pick(prestamoPayload, [
@@ -350,6 +420,8 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
           'tz',
           'permitirAdelantar',
           'createdDate',
+          'tenantId',
+          'rutaId',
         ]),
       });
 
@@ -363,10 +435,19 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
     }
   };
 
+  // Loader hasta tener contexto (para asegurar authAdminId)
+  if (!ctx || !authAdminId) {
+    return (
+      <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator />
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView
       style={{ flex: 1, backgroundColor: palette.screenBg }}
-      edges={['left','right','bottom']}   // 👈 evita el hueco
+      edges={['left','right','bottom']}
     >
       {/* Header */}
       <View
@@ -434,7 +515,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
             <Text
               style={[
                 styles.selectorText,
-                // ✅ si hay string vacío, mostramos placeholder; si no, mostramos el % (incluye 0%)
                 { color: prestamo.interes === '' ? palette.softText : palette.text },
               ]}
             >
@@ -632,7 +712,7 @@ function Field({
   );
 }
 
-/** ---------- Estilos (con opciones más grandes) ---------- */
+/** ---------- Estilos ---------- */
 const styles = StyleSheet.create({
   header: {
     borderBottomWidth: 1,
@@ -668,7 +748,7 @@ const styles = StyleSheet.create({
   input: {
     borderWidth: 1,
     borderRadius: 10,
-    paddingVertical: Platform.select({ ios: 10, android: 9 }),
+    paddingVertical: Platform.select({ ios: 10, android: 9 }) as number,
     paddingHorizontal: 12,
     fontSize: 16,
   },

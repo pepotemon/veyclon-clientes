@@ -16,6 +16,9 @@ import { addDoc, collection, onSnapshot, query, where, serverTimestamp } from 'f
 import { todayInTZ, pickTZ } from '../utils/timezone';
 import { logAudit } from '../utils/auditLogs';
 
+// 🔐 contexto de sesión (tenant/rol/ruta)
+import { getAuthCtx } from '../utils/authCtx';
+
 type Props = NativeStackScreenProps<RootStackParamList, 'Gastos'>;
 
 type MovimientoGasto = {
@@ -25,11 +28,13 @@ type MovimientoGasto = {
   operationalDate: string; // YYYY-MM-DD
   createdAt?: { seconds?: number };
   createdAtMs?: number;
-  // 👇 lectura tolera antiguo y nuevo; escritura usa SIEMPRE el canónico 'gasto_cobrador'
   tipo: 'gasto_cobrador' | 'gastoCobrador';
   categoria: string;
   monto: number;
   nota?: string | null;
+  tenantId?: string | null;
+  rutaId?: string | null;
+  source?: string;
 };
 
 export default function GastosScreen({ route }: Props) {
@@ -38,6 +43,27 @@ export default function GastosScreen({ route }: Props) {
   const insets = useSafeAreaInsets();
 
   const [tab, setTab] = useState<'lista' | 'nuevo'>('lista');
+
+  // ===== sesión/ctx para scoping en escrituras =====
+  const [ctx, setCtx] = useState<{
+    tenantId: string | null;
+    role: 'collector' | 'admin' | 'superadmin' | null;
+    rutaId: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const c = await getAuthCtx();
+      if (!mounted) return;
+      setCtx({
+        tenantId: c?.tenantId ?? null,
+        role: (c?.role as any) ?? null,
+        rutaId: c?.rutaId ?? null,
+      });
+    })();
+    return () => { mounted = false; };
+  }, []);
 
   // ------- LISTA “Gastos del cobrador hoy” (en cajaDiaria) -------
   const tz = useMemo(() => pickTZ(), []);
@@ -50,7 +76,7 @@ export default function GastosScreen({ route }: Props) {
     if (!admin) return;
     setCargando(true);
 
-    // ✅ Compatibilidad: aceptamos ambos tipos (viejo y canónico)
+    // Compat: aceptamos ambos nombres de tipo
     const ref = collection(db, 'cajaDiaria');
     const qy = query(
       ref,
@@ -78,7 +104,7 @@ export default function GastosScreen({ route }: Props) {
         setCargando(false);
       }
     );
-    return () => unsub();
+    return () => { try { unsub(); } catch {} };
   }, [admin, hoy]);
 
   const total = useMemo(
@@ -107,36 +133,38 @@ export default function GastosScreen({ route }: Props) {
         admin,
         tz: tzNow,
         operationalDate: operationalDateNow,
-        createdAt: undefined,         // lo setea serverTimestamp abajo
+        createdAt: undefined,
         createdAtMs: Date.now(),
-        // ✅ canónico fase 2
-        tipo: 'gasto_cobrador',
+        tipo: 'gasto_cobrador', // canónico
         categoria: categoria.trim(),
         monto: Math.round(m * 100) / 100,
         nota: nota.trim() ? nota.trim() : null,
+        tenantId: ctx?.tenantId ?? null,
+        rutaId: ctx?.rutaId ?? null,
+        source: 'cobrador',
       };
 
       const ref = await addDoc(collection(db, 'cajaDiaria'), {
         ...payload,
         createdAt: serverTimestamp(),
-        source: 'cobrador',
       });
 
-      await logAudit({
-        userId: admin,
-        action: 'caja_gasto',
-        ref,
-        after: {
-          tipo: payload.tipo,
-          categoria: payload.categoria,
-          monto: payload.monto,
-          nota: payload.nota ?? null,
-          operationalDate: payload.operationalDate,
-          tz: payload.tz,
-          admin: payload.admin,
-          source: 'cobrador',
-        },
-      });
+await logAudit({
+  userId: admin,
+  action: 'caja_gasto',        // ← antes: 'caja_gasto_cobrador'
+  ref,
+  after: {
+    tipo: payload.tipo,        // 'gasto_cobrador'
+    categoria: payload.categoria,
+    monto: payload.monto,
+    nota: payload.nota ?? null,
+    operationalDate: payload.operationalDate,
+    tz: payload.tz,
+    admin: payload.admin,
+    source: 'cobrador',
+  },
+});
+
 
       setCategoria('');
       setMonto('');
@@ -149,7 +177,7 @@ export default function GastosScreen({ route }: Props) {
     } finally {
       setEnviando(false);
     }
-  }, [admin, categoria, monto, nota]);
+  }, [admin, categoria, monto, nota, ctx?.tenantId, ctx?.rutaId]);
 
   // ------- UI -------
   const renderItem = ({ item }: { item: MovimientoGasto }) => (
@@ -176,10 +204,10 @@ export default function GastosScreen({ route }: Props) {
   );
 
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right','bottom']}   // 👈 evita el hueco
-  >
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: palette.screenBg }}
+      edges={['left','right','bottom']}
+    >
       {/* Header simple */}
       <View
         style={[
@@ -282,7 +310,7 @@ export default function GastosScreen({ route }: Props) {
             </View>
           </TouchableWithoutFeedback>
 
-          {/* CTA flotante despegado del home-indicator */}
+          {/* CTA flotante */}
           <View
             style={[
               styles.ctaBar,

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, Keyboard,
-  Platform, KeyboardAvoidingView, Pressable, Linking,
+  Platform, KeyboardAvoidingView, Pressable, Linking, ActivityIndicator,
 } from 'react-native';
 import {
   doc, collection, addDoc, deleteDoc, runTransaction, serverTimestamp,
@@ -14,6 +14,8 @@ import { calcularDiasAtraso } from '../utils/atrasoHelper';
 import { logAudit, pick } from '../utils/auditLogs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { addToOutbox } from '../utils/outbox';
+// 🔐 contexto de auth (tenant/rol/ruta/admin)
+import { getAuthCtx } from '../utils/authCtx';
 
 type SuccessPayload = {
   clienteId: string;
@@ -23,15 +25,19 @@ type SuccessPayload = {
   optimistic?: boolean;
 };
 
+type PrefetchedPago = { valorCuota?: number; saldoPendiente?: number };
+
 type Props = {
   visible: boolean;
   onClose: () => void;
   clienteNombre: string;
   clienteId?: string;
   prestamoId?: string;
-  admin: string;
+  admin: string; // <- compat
   onSuccess?: (p?: SuccessPayload) => void;
   clienteTelefono?: string;
+  /** ⚡ datos precargados desde la lista para abrir instantáneo */
+  prefetched?: PrefetchedPago;
 };
 
 const quotaCache: Record<string, { cuota: number; saldo: number }> = {};
@@ -86,14 +92,10 @@ function makeLinhaParcela(opts: {
   const total = Number.isFinite(opts.totalPrestamoAprox) ? Math.max(0, opts.totalPrestamoAprox) : 0;
   if (total <= 0) return undefined;
 
-  // Pago acumulado tras el abono
   const paidAfter = Math.max(0, total - (Number(opts.restanteNuevo) || 0));
-
-  // Cuotas completas acumuladas y resto parcial
   const completas = Math.floor(paidAfter / v);
   const resto = +(paidAfter - completas * v).toFixed(2);
 
-  // Caso: hay al menos una cuota completa (exacta)
   if (resto < 0.01) {
     const k = n > 0 ? Math.min(completas, n) : completas;
     return n > 0
@@ -101,7 +103,6 @@ function makeLinhaParcela(opts: {
       : `Parcela: R$ ${v.toFixed(2)} (#${k})`;
   }
 
-  // Caso: parcial — cuánto falta para completar la siguiente
   const faltam = +(v - resto).toFixed(2);
   const prox = completas + 1;
   return n > 0
@@ -110,7 +111,7 @@ function makeLinhaParcela(opts: {
 }
 
 export default function ModalRegistroPago({
-  visible, onClose, clienteNombre, clienteId, prestamoId, admin, onSuccess,
+  visible, onClose, clienteNombre, clienteId, prestamoId, admin, onSuccess, prefetched,
 }: Props) {
   const insets = useSafeAreaInsets();
   const inputRef = useRef<TextInput>(null);
@@ -120,19 +121,49 @@ export default function ModalRegistroPago({
 
   const [valorCuota, setValorCuota] = useState<number>(0);
   const [saldoPendiente, setSaldoPendiente] = useState<number>(0);
-  const [loadingCuota, setLoadingCuota] = useState(false); // ← evita “Usar cuota” con dato viejo
+  const [loadingCuota, setLoadingCuota] = useState(false); // ← oculta controles hasta estar listo
 
   const [prefConfirmReceipt, setPrefConfirmReceipt] = useState(false);
   const hasOpenedWhatsRef = useRef(false);
 
-  // Token anti “race condition” entre aperturas rápidas
+  // Anti-race / Anti-double-submit
   const requestTokenRef = useRef<string>('');
+  const submittingRef = useRef(false);
+
+  // Refs blindadas vs flicker
+  const lastKnownRef = useRef<{ cuota: number; saldo: number }>({ cuota: 0, saldo: 0 });
+  const montoRef = useRef<string>('');
+  useEffect(() => { montoRef.current = monto; }, [monto]);
+
+  // 🔐 contexto auth (tenant/rol/ruta/admin)
+  const [ctx, setCtx] = useState<{
+    admin: string | null;
+    tenantId: string | null;
+    role: 'collector' | 'admin' | 'superadmin' | null;
+    rutaId: string | null;
+  } | null>(null);
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const c = await getAuthCtx();
+      if (!active) return;
+      setCtx({
+        admin: c?.admin ?? null,
+        tenantId: c?.tenantId ?? null,
+        role: (c?.role as any) ?? null,
+        rutaId: c?.rutaId ?? null,
+      });
+    })();
+    return () => { active = false; };
+  }, []);
+  const authAdminId = ctx?.admin ?? null;
 
   const [contentReady, setContentReady] = useState(false);
   useEffect(() => {
     if (visible) {
       setContentReady(false);
       hasOpenedWhatsRef.current = false;
+      submittingRef.current = false;
     }
   }, [visible]);
 
@@ -146,22 +177,16 @@ export default function ModalRegistroPago({
     const cargarInfo = async () => {
       if (!visible) return;
 
-      // 1) Reset duro al abrir/cambiar cliente → evita “heredar” cuota anterior
       setMonto('');
-      setValorCuota(0);
-      setSaldoPendiente(0);
       setLoading(false);
       setLoadingCuota(true);
 
-      // token para este ciclo de carga
       const token = `${clienteId ?? ''}:${prestamoId ?? ''}:${Date.now()}`;
       requestTokenRef.current = token;
 
       try {
         const v = await AsyncStorage.getItem(KEY_SEND_RECEIPT_CONFIRM);
-        if (requestTokenRef.current === token) {
-          setPrefConfirmReceipt(v === '1');
-        }
+        if (requestTokenRef.current === token) setPrefConfirmReceipt(v === '1');
       } catch {
         if (requestTokenRef.current === token) setPrefConfirmReceipt(false);
       }
@@ -171,63 +196,110 @@ export default function ModalRegistroPago({
         return;
       }
 
-      // 2) Cache: si existe, úsalo YA
-      const cacheHit = quotaCache[prestamoId];
-      if (cacheHit) {
+      // Prefetched
+      let usedPrefetch = false;
+      if (
+        prefetched &&
+        (prefetched.valorCuota !== undefined || prefetched.saldoPendiente !== undefined)
+      ) {
+        const cuota = Number(prefetched.valorCuota ?? lastKnownRef.current.cuota) || 0;
+        const saldo = Number(prefetched.saldoPendiente ?? lastKnownRef.current.saldo) || 0;
+
         if (requestTokenRef.current === token) {
-          setValorCuota(cacheHit.cuota);
-          setSaldoPendiente(cacheHit.saldo);
+          setValorCuota(cuota);
+          setSaldoPendiente(saldo);
           setLoadingCuota(false);
+        }
+        quotaCache[prestamoId] = { cuota, saldo };
+        lastKnownRef.current = { cuota, saldo };
+        usedPrefetch = true;
+      }
+
+      // Cache local
+      if (!usedPrefetch) {
+        const cacheHit = quotaCache[prestamoId];
+        if (cacheHit) {
+          if (requestTokenRef.current === token) {
+            setValorCuota(cacheHit.cuota);
+            setSaldoPendiente(cacheHit.saldo);
+          }
+          lastKnownRef.current = { cuota: cacheHit.cuota, saldo: cacheHit.saldo };
         }
       }
 
-      // 3) Lectura fresca (asíncrona, puede llegar más tarde)
+      // Lectura fresca
       try {
         const ref = doc(db, 'clientes', clienteId, 'prestamos', prestamoId);
         const snap = await getDoc(ref);
-        if (requestTokenRef.current !== token) return; // respuesta de una apertura anterior
+        if (requestTokenRef.current !== token) return;
 
         if (snap.exists()) {
           const d = snap.data() as any;
           const cuota = Number(d?.valorCuota ?? 0) || 0;
-          const saldo = typeof d?.restante === 'number'
-            ? Number(d.restante)
-            : Number(d?.montoTotal ?? d?.totalPrestamo ?? 0) || 0;
+          const saldo =
+            typeof d?.restante === 'number'
+              ? Number(d.restante)
+              : Number(d?.montoTotal ?? d?.totalPrestamo ?? 0) || 0;
 
-          setValorCuota(cuota);
-          setSaldoPendiente(saldo);
+          const changed = cuota !== lastKnownRef.current.cuota || saldo !== lastKnownRef.current.saldo;
           quotaCache[prestamoId] = { cuota, saldo };
+          if (changed && requestTokenRef.current === token) {
+            setValorCuota(cuota);
+            setSaldoPendiente(saldo);
+          }
+          lastKnownRef.current = { cuota, saldo };
         } else {
-          setValorCuota(0);
-          setSaldoPendiente(0);
+          if (!usedPrefetch && requestTokenRef.current === token) {
+            setValorCuota(0);
+            setSaldoPendiente(0);
+            lastKnownRef.current = { cuota: 0, saldo: 0 };
+          }
         }
       } catch {
         // silencioso
       } finally {
-        if (requestTokenRef.current === token) setLoadingCuota(false);
+        if (requestTokenRef.current === token) {
+          setLoadingCuota(false);
+        }
       }
     };
 
     void cargarInfo();
     if (!visible) setMonto('');
-  }, [visible, clienteId, prestamoId]);
+  }, [visible, clienteId, prestamoId, prefetched]);
 
   const parseMonto = (txt: string) => {
-    const norm = txt.replace(',', '.').trim();
+    const norm = (txt ?? '').replace(',', '.').trim();
+    if (!norm) return NaN;
     if (!/^\d+(\.\d{0,2})?$/.test(norm)) return NaN;
     return parseFloat(norm);
   };
 
   const solicitarConfirmacion = () => {
-    const montoNum = parseMonto(monto);
+    if (loadingCuota) {
+      Alert.alert('Espera', 'Estamos preparando los datos del pago.');
+      return;
+    }
+
+    // Usa ref del input; si está vacío y hay cuota, autocompleta
+    let txt = montoRef.current;
+    if ((!txt || txt.trim() === '') && lastKnownRef.current.cuota > 0) {
+      txt = String(lastKnownRef.current.cuota);
+      setMonto(txt);
+      montoRef.current = txt;
+    }
+
+    const montoNum = parseMonto(txt);
     if (!isFinite(montoNum) || montoNum <= 0) {
       Alert.alert('Monto inválido', 'Ingresa un monto mayor a 0.');
       return;
     }
-    if (montoNum > saldoPendiente) {
+
+    const saldoOk = lastKnownRef.current.saldo; // blindado vs flicker
+    if (montoNum > saldoOk) {
       Alert.alert(
         'Monto demasiado alto',
-        `El saldo pendiente es R$ ${saldoPendiente.toFixed(2)}. Ingresa un monto menor o igual.`
+        `El saldo pendiente es R$ ${saldoOk.toFixed(2)}. Ingresa un monto menor o igual.`
       );
       return;
     }
@@ -240,9 +312,20 @@ export default function ModalRegistroPago({
 
   const registrarAbono = async (montoNum: number) => {
     if (!clienteId || !prestamoId) return;
-    if (loading) return;
+    if (loading || loadingCuota) return;
+    if (submittingRef.current) return;
+    submittingRef.current = true;
 
-    // Optimista inmediato → que la lista pinte en verde ya
+    if (!authAdminId) {
+      Alert.alert('Sesión', 'No se pudo identificar el usuario (admin). Intenta nuevamente.');
+      submittingRef.current = false;
+      return;
+    }
+
+    // Clamp defensivo a 2 decimales
+    montoNum = Number(montoNum.toFixed(2));
+
+    // Optimista inmediato
     onSuccess?.({ clienteId, prestamoId, monto: montoNum, optimistic: true });
 
     onClose();
@@ -253,7 +336,7 @@ export default function ModalRegistroPago({
     const abonoRef: DocumentReference = doc(collection(prestamoRef, 'abonos'));
 
     try {
-      // ====================== HOT PATH: TRANSACCIÓN (único paso bloqueante) ======================
+      // ====================== HOT PATH: TRANSACCIÓN ======================
       const txResult = await runTransaction(db, async (tx) => {
         const snap = await tx.get(prestamoRef);
         if (!snap.exists()) throw new Error('El préstamo no existe.');
@@ -289,23 +372,25 @@ export default function ModalRegistroPago({
 
         const nowMs = Date.now();
         const nuevoAbono = {
-          monto: parseFloat(montoNum.toFixed(2)),
-          registradoPor: admin,
+          monto: Number(montoNum.toFixed(2)),
+          registradoPor: authAdminId, // 👈 unificado
           tz,
           operationalDate: operativoHoy,
           createdAtMs: nowMs,
           createdAt: serverTimestamp(),
           source: 'app',
+          // 🔐 scoping
+          tenantId: ctx?.tenantId ?? null,
+          rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
         };
 
         // 1) Abono (subcolección)
         tx.set(abonoRef, nuevoAbono);
 
-        // 2) Agregados del préstamo
+        // 2) Agregados del préstamo (clamp a 0)
         const nuevoRestante = Math.max(restanteActual - montoNum, 0);
         const deltaCuotas = valorCuotaTx > 0 ? Math.floor(montoNum / valorCuotaTx) : 0;
 
-        // ✅ FIX: tope correcto sin caer a 0 por el "|| 0" anterior
         const maxCuotas = cuotasTotalesTx > 0 ? cuotasTotalesTx : Number.MAX_SAFE_INTEGER;
         const nuevasCuotasPagadas = Math.max(
           0,
@@ -340,9 +425,10 @@ export default function ModalRegistroPago({
         };
       });
 
-      // UI libre + notificación final (no-optimista)
+      // UI libre + notificación final
       setMonto('');
       setLoading(false);
+      submittingRef.current = false;
       onSuccess?.({
         clienteId: clienteId!,
         prestamoId: prestamoId!,
@@ -353,7 +439,6 @@ export default function ModalRegistroPago({
 
       // ====================== RECIBO (no bloquea la UI) ======================
       if (prefConfirmReceipt && !hasOpenedWhatsRef.current) {
-        // 🧠 línea de parcela correcta (completa o parcial)
         const totalAprox =
           Number((txResult as any).prestamoBefore?.totalPrestamo) ||
           (txResult.cuotasTotalesTx > 0 && txResult.valorCuotaTx > 0
@@ -378,16 +463,16 @@ export default function ModalRegistroPago({
         setTimeout(() => void openWhats(texto), 0);
       }
 
-      // ====================== TODO LO PESADO → BACKGROUND ======================
+      // ====================== PESADO → BACKGROUND ======================
       setTimeout(async () => {
         try {
           // Caja (idempotente)
           const batch = writeBatch(db);
-          const cajaId = `pay_${abonoRef.id}`;
+          const cajaId = `pay_${(abonoRef as any).id}`;
           const cajaRef = doc(collection(db, 'cajaDiaria'), cajaId);
           batch.set(cajaRef, {
             tipo: 'abono' as const,
-            admin,
+            admin: authAdminId,                 // 👈 unificado
             clienteId: clienteId!,
             prestamoId: prestamoId!,
             clienteNombre: clienteNombre || 'Cliente',
@@ -397,20 +482,26 @@ export default function ModalRegistroPago({
             createdAtMs: Date.now(),
             createdAt: serverTimestamp(),
             source: 'app',
-            meta: { abonoRefId: abonoRef.id },
+            meta: { abonoRefId: (abonoRef as any).id },
+            // 🔐 scoping para que aparezca en CajaDiaria
+            tenantId: ctx?.tenantId ?? null,
+            rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
           });
           await batch.commit();
+
           void logAudit({
-            userId: admin,
+            userId: authAdminId, // 👈 unificado
             action: 'create',
             docPath: cajaRef.path,
             after: {
               tipo: 'abono',
-              admin,
+              admin: authAdminId,
               clienteId,
               prestamoId,
               monto: Number(montoNum.toFixed(2)),
               operationalDate: txResult.operativoHoy,
+              tenantId: ctx?.tenantId ?? null,
+              rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
             },
           });
         } catch (e) {
@@ -420,15 +511,16 @@ export default function ModalRegistroPago({
         try {
           // Audit abono
           void logAudit({
-            userId: admin,
+            userId: authAdminId, // 👈 unificado
             action: 'create',
-            docPath: abonoRef.path,
-            after: pick(txResult.abonoNuevo, ['monto', 'operationalDate', 'tz']),
+            docPath: (abonoRef as any).path,
+            after: pick(txResult.abonoNuevo, ['monto', 'operationalDate', 'tz', 'tenantId', 'rutaId']),
           });
         } catch {}
 
         try {
           // Recalc atraso (pesado)
+          const prestamoRef = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
           const pSnap = await getDoc(prestamoRef);
           if (pSnap.exists()) {
             const p = pSnap.data() as any;
@@ -481,7 +573,7 @@ export default function ModalRegistroPago({
             });
 
             void logAudit({
-              userId: admin,
+              userId: authAdminId, // 👈 unificado
               action: 'update',
               ref: prestamoRef,
               before: txResult.prestamoBefore,
@@ -499,6 +591,7 @@ export default function ModalRegistroPago({
         try {
           // Cierre si saldo 0
           if (txResult.nuevoRestante === 0) {
+            const prestamoRef = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
             const snap = await getDoc(prestamoRef);
             const p = snap.exists() ? (snap.data() as any) : {};
             const historialRef = collection(
@@ -513,17 +606,17 @@ export default function ModalRegistroPago({
               diasAtraso: 0,
               faltas: [],
               finalizadoEn: serverTimestamp(),
-              finalizadoPor: admin,
+              finalizadoPor: authAdminId, // 👈 unificado
             });
             void logAudit({
-              userId: admin,
+              userId: authAdminId,
               action: 'create',
               ref: histRef,
-              after: { clienteId, prestamoId, restante: 0, finalizadoPor: admin },
+              after: { clienteId, prestamoId, restante: 0, finalizadoPor: authAdminId },
             });
             await deleteDoc(prestamoRef);
             void logAudit({
-              userId: admin,
+              userId: authAdminId,
               action: 'delete',
               ref: prestamoRef,
               before: txResult.prestamoBefore,
@@ -538,15 +631,19 @@ export default function ModalRegistroPago({
           // Refrescar cache local
           if (prestamoId) {
             quotaCache[prestamoId] = {
-              cuota: Number(valorCuota ?? txResult.valorCuotaTx ?? 0) || 0,
+              cuota: Number(lastKnownRef.current.cuota || txResult.valorCuotaTx || 0) || 0,
               saldo: txResult.nuevoRestante || 0,
+            };
+            lastKnownRef.current = {
+              cuota: quotaCache[prestamoId].cuota,
+              saldo: quotaCache[prestamoId].saldo,
             };
           }
         } catch {}
       }, 0);
 
     } catch (error: any) {
-      // 🔌 Offline → OUTBOX
+      // 🔌 Offline u otro fallo → OUTBOX
       try {
         const tz = pickTZ();
         const operationalDate = todayInTZ(tz);
@@ -555,20 +652,29 @@ export default function ModalRegistroPago({
           payload: {
             clienteId: clienteId!,
             prestamoId: prestamoId!,
-            admin,
-            monto: parseFloat(montoNum.toFixed(2)),
+            admin: authAdminId!,                 // 👈 unificado
+            monto: Number(montoNum.toFixed(2)),
             tz,
             operationalDate,
             clienteNombre: clienteNombre || 'Cliente',
+            source: 'app',
+            // 🔐 scoping
+            tenantId: ctx?.tenantId ?? null,
+            rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
             alsoCajaDiaria: true,
-            cajaPayload: { tipo: 'abono' as const, clienteNombre },
+            cajaPayload: {
+              tipo: 'abono',
+              // ❌ NO poner admin aquí: AbonoPayload.cajaPayload no lo define
+              clienteNombre,
+              tenantId: ctx?.tenantId ?? null,
+              rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
+            },
           },
         });
         Alert.alert(
           'Sin conexión',
           'El pago se guardó en "Pendientes" y podrás reenviarlo cuando tengas internet.'
         );
-        // Incluso offline, el optimista ya pintó verde.
       } catch (enqueueErr: any) {
         const msg = (enqueueErr?.message || '').toString();
         if (msg.includes('ya tiene un pago pendiente')) {
@@ -581,12 +687,13 @@ export default function ModalRegistroPago({
         }
       } finally {
         setLoading(false);
+        submittingRef.current = false;
       }
     }
   };
 
-  const hasCuota = !loadingCuota && valorCuota > 0;
-  const cuotaNum = valorCuota;
+  const hasCuota = !loadingCuota && (valorCuota > 0 || lastKnownRef.current.cuota > 0);
+  const cuotaNum = lastKnownRef.current.cuota || valorCuota;
 
   return (
     <Modal
@@ -606,7 +713,7 @@ export default function ModalRegistroPago({
         <Pressable style={styles.backdrop} onPress={onClose} />
         <View
           style={[
-            styles.overlayTop,
+            styles.overlayCenter,
             { paddingTop: Math.max(insets.top + 6, 8), paddingBottom: Math.max(insets.bottom, 6) },
           ]}
         >
@@ -621,51 +728,64 @@ export default function ModalRegistroPago({
 
               <View style={styles.infoBox}>
                 <Text style={styles.infoText}>
-                  Saldo <Text style={styles.bold}>{`R$ ${Number(saldoPendiente).toFixed(2)}`}</Text>
+                  Saldo <Text style={styles.bold}>{`R$ ${Number((loadingCuota ? lastKnownRef.current.saldo : saldoPendiente) || 0).toFixed(2)}`}</Text>
                 </Text>
               </View>
 
-              <Text style={styles.label}>Monto</Text>
+              {loadingCuota ? (
+                <View style={styles.prepContainer}>
+                  <ActivityIndicator size="small" />
+                  <Text style={styles.prepTxt}>Preparando…</Text>
+                </View>
+              ) : (
+                <>
+                  <Text style={styles.label}>Monto</Text>
 
-              <TextInput
-                ref={inputRef}
-                style={styles.input}
-                placeholder="0.00"
-                keyboardType="decimal-pad"
-                returnKeyType="done"
-                blurOnSubmit
-                value={monto}
-                onChangeText={setMonto}
-                onSubmitEditing={solicitarConfirmacion}
-                editable={!loading}
-                autoFocus
-              />
+                  <TextInput
+                    ref={inputRef}
+                    style={styles.input}
+                    placeholder="0.00"
+                    keyboardType="decimal-pad"
+                    returnKeyType="done"
+                    blurOnSubmit
+                    value={monto}
+                    onChangeText={(t) => { setMonto(t); montoRef.current = t; }}
+                    onSubmitEditing={solicitarConfirmacion}
+                    editable={!loading && !loadingCuota}
+                    autoFocus
+                  />
 
-              <View style={styles.actionsRow}>
-                {hasCuota ? (
-                  <TouchableOpacity
-                    onPress={() => setMonto(String(cuotaNum))}
-                    style={styles.btnSec}
-                    disabled={loading}
-                    activeOpacity={0.9}
-                  >
-                    <Text style={styles.btnSecTxt}>Usar cuota</Text>
-                  </TouchableOpacity>
-                ) : (
-                  <View style={{ flex: 1 }} />
-                )}
+                  <View style={styles.actionsRow}>
+                    {hasCuota ? (
+                      <TouchableOpacity
+                        onPress={() => {
+                          const v = String(cuotaNum);
+                          setMonto(v);
+                          montoRef.current = v; // blindado
+                        }}
+                        style={styles.btnSec}
+                        disabled={loading || loadingCuota}
+                        activeOpacity={0.9}
+                      >
+                        <Text style={styles.btnSecTxt}>Usar cuota</Text>
+                      </TouchableOpacity>
+                    ) : (
+                      <View style={{ flex: 1 }} />
+                    )}
 
-                <TouchableOpacity
-                  onPress={solicitarConfirmacion}
-                  style={[styles.btnGuardar, loading && { opacity: 0.7 }]}
-                  disabled={loading}
-                  activeOpacity={0.9}
-                >
-                  <Text style={styles.btnGuardarTexto}>
-                    {loading ? 'Guardando…' : 'Guardar'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
+                    <TouchableOpacity
+                      onPress={solicitarConfirmacion}
+                      style={[styles.btnGuardar, (loading || loadingCuota) && { opacity: 0.7 }]}
+                      disabled={loading || loadingCuota}
+                      activeOpacity={0.9}
+                    >
+                      <Text style={styles.btnGuardarTexto}>
+                        {loading ? 'Guardando…' : 'Guardar'}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                </>
+              )}
             </View>
           </View>
         </View>
@@ -679,7 +799,7 @@ const LIGHT = '#E8F5E9';
 
 const styles = StyleSheet.create({
   backdrop: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.22)' },
-  overlayTop: { flex: 1, justifyContent: 'flex-start', alignItems: 'center', paddingHorizontal: 0 },
+  overlayCenter: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 0 },
   cardWrapper: {
     width: '76%', maxWidth: 320, padding: 0,
     ...Platform.select({
@@ -693,10 +813,12 @@ const styles = StyleSheet.create({
   infoBox: { backgroundColor: '#F6F8F7', borderRadius: 8, paddingVertical: 6, paddingHorizontal: 8, marginTop: 6, alignItems: 'center', alignSelf: 'center' },
   infoText: { fontSize: 12, color: '#263238' },
   bold: { fontWeight: '900', color: '#263238' },
+  prepContainer: { alignItems: 'center', justifyContent: 'center', marginTop: 12, marginBottom: 6 },
+  prepTxt: { fontSize: 12, color: '#607d8b', fontWeight: '700', marginTop: 6 },
   label: { fontSize: 11, color: '#607d8b', marginTop: 8, marginBottom: 4, fontWeight: '700' },
   input: {
     width: '60%', borderWidth: 1, borderColor: '#dfe5e1', borderRadius: 8, paddingHorizontal: 10,
-    paddingVertical: Platform.select({ ios: 7, android: 6 }), fontSize: 15, color: '#263238', textAlign: 'center',
+    paddingVertical: Platform.select({ ios: 7, android: 6 }) as number, fontSize: 15, color: '#263238', textAlign: 'center',
   },
   actionsRow: { width: '60%', flexDirection: 'row', alignItems: 'center', marginTop: 10, gap: 6, alignSelf: 'center' },
   btnSec: { flex: 1, backgroundColor: LIGHT, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },

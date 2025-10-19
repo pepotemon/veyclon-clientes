@@ -14,28 +14,30 @@ import {
   where,
 } from 'firebase/firestore';
 import { db } from '../firebase/firebaseConfig';
-import { todayInTZ, pickTZ } from '../utils/timezone';
-import { logAudit, pick } from '../utils/auditLogs';
 
+// ✅ utilidades locales (rutas corregidas)
+import { todayInTZ, pickTZ } from './timezone';
+import { logAudit, pick } from './auditLogs';
+
+// ✅ motor NUEVO de outbox (delegamos aquí)
 import {
   loadOutbox,
   saveOutbox,
-  OutboxItem,
-  OutboxAbono,
-  OutboxNoPago,
-  // 👇 Delegamos en el motor nuevo
+  type OutboxItem,
+  type OutboxAbono,
+  type OutboxNoPago,
   processOutboxBatch as obProcessOutboxBatch,
   processOutboxItem as obProcessOutboxItem,
 } from './outbox';
 
-// 👇 Cache local tras la descarga
-import { saveCatalogSnapshot } from './catalogCache';
-
-// ✅ Cálculo de atraso (para aplicar tras actualizar 'restante')
+// ✅ Cálculo de atraso
 import { calcularDiasAtraso } from './atrasoHelper';
 
-/* ========== Legacy (mantener por compat, ya no se usa) ========== */
-export const MAX_ATTEMPTS = 5; // ya no se usa aquí, lo maneja outbox.ts
+// (opcional) cache de catálogo
+import { saveCatalogSnapshot } from './catalogCache';
+
+/* ========== Legacy (mantener por compat, ya no se usa directamente) ========== */
+export const MAX_ATTEMPTS = 5; // (legacy) el motor nuevo usa su propio backoff
 export function computeNextRetry(attempts: number): number {
   const base = Math.min(60 * 60 * 1000, 5000 * Math.pow(2, Math.max(0, attempts - 1)));
   const jitter = Math.floor(base * 0.3 * Math.random());
@@ -46,13 +48,14 @@ export function computeNextRetry(attempts: number): number {
 async function canSyncNow() {
   try {
     const state = await NetInfo.fetch();
-    return !!state.isConnected;
+    return !!state?.isConnected;
   } catch {
-    return true; // si NetInfo falla, intentamos igual
+    // si NetInfo falla, intentamos igual
+    return true;
   }
 }
 
-/* ===================== Helpers mutación local (legacy) ===================== */
+/* ===================== Mutación local (legacy helpers) ===================== */
 async function updateOutboxItem(
   id: string,
   patch: Partial<Pick<OutboxItem, 'status' | 'lastError' | 'attempts' | 'nextRetryAt'>>
@@ -71,13 +74,12 @@ async function removeFromOutbox(id: string) {
   await saveOutbox(filtered);
 }
 
-/* ===================== Handlers de tipos (legacy) ===================== */
-/** ⚠️ Estos handlers eran el mecanismo viejo.
- *  Se conservan por compatibilidad, pero ya **NO** los usamos desde fuera.
- *  El motor nuevo vive en utils/outbox.ts (idempotente + backoff robusto).
+/* ===================== LEGACY handlers (conservados por compat) ===================== */
+/** ⚠️ Mecanismo antiguo (no idempotente). Se conserva por compat pero
+ *   NO se usa desde fuera: las llamadas nuevas delegan en utils/outbox.ts
  */
 async function handleAbono(item: OutboxAbono) {
-  const p = item.payload;
+  const p = item.payload as any;
 
   const prestamoRef = doc(db, 'clientes', p.clienteId, 'prestamos', p.prestamoId);
   const abonosCol = collection(prestamoRef, 'abonos');
@@ -119,46 +121,28 @@ async function handleAbono(item: OutboxAbono) {
     tx.update(prestamoRef, { restante: nuevoRestante, abonos: nuevosAbonos });
 
     return {
-      abonoDocRef,
       nuevoRestante,
       tz,
       hoy,
-      prestamoBefore: pick(data, [
-        'restante',
-        'valorCuota',
-        'totalPrestamo',
-        'clienteId',
-        'concepto',
-        'fechaInicio',
-        'operationalDate',
-        'diasHabiles',
-        'feriados',
-        'pausas',
-        'modoAtraso',
-        'permitirAdelantar',
-        'cuotas',
-        'montoTotal',
-      ]),
     };
   });
 
   // ✅ Recalcular atraso con datos actualizados (best-effort)
   try {
     // Leer préstamo y abonos reales de la subcolección para el cálculo
+    const abonosSnap = await getDocs(collection(prestamoRef, 'abonos'));
+    const abonos = abonosSnap.docs.map((docu) => {
+      const a = docu.data() as any;
+      return {
+        monto: Number(a?.monto) || 0,
+        operationalDate: a?.operationalDate,
+        fecha: a?.fecha, // compat si existiera
+      };
+    });
+
     const prestamoSnap = await getDoc(prestamoRef);
     if (prestamoSnap.exists()) {
       const d = prestamoSnap.data() as any;
-
-      const abonosSnap = await getDocs(collection(prestamoRef, 'abonos'));
-      const abonos = abonosSnap.docs.map((docu) => {
-        const a = docu.data() as any;
-        return {
-          monto: Number(a?.monto) || 0,
-          operationalDate: a?.operationalDate,
-          fecha: a?.fecha, // compat si existiera
-        };
-      });
-
       const tzDoc = pickTZ(d?.tz);
       const hoy = d?.operationalDate || todayInTZ(tzDoc);
       const diasHabiles = Array.isArray(d?.diasHabiles) && d.diasHabiles.length ? d.diasHabiles : [1, 2, 3, 4, 5, 6];
@@ -183,12 +167,10 @@ async function handleAbono(item: OutboxAbono) {
         permitirAdelantar,
       });
 
-      // ✅ Actualizar atraso/faltas y reafirmar 'restante' no-negativo
       await updateDoc(prestamoRef, {
         diasAtraso: calc.atraso,
         faltas: calc.faltas || [],
         ultimaReconciliacion: serverTimestamp(),
-        // res.nuevoRestante ya estaba clamped, pero reafirmamos por seguridad:
         restante: Math.max(0, Number(res.nuevoRestante || 0)),
       });
     }
@@ -199,7 +181,7 @@ async function handleAbono(item: OutboxAbono) {
   if (p.alsoCajaDiaria) {
     try {
       const ref = await addDoc(collection(db, 'cajaDiaria'), {
-        tipo: 'abono',
+        tipo: 'abono' as const,
         admin: p.admin,
         clienteId: p.clienteId,
         prestamoId: p.prestamoId,
@@ -210,6 +192,9 @@ async function handleAbono(item: OutboxAbono) {
         createdAtMs: Date.now(),
         createdAt: serverTimestamp(),
         source: 'outbox',
+        // 👇 importante para que CajaDiariaScreen (que filtra por scope) los vea
+        tenantId: p.tenantId ?? null,
+        rutaId: p.rutaId ?? null,
       });
       await logAudit({
         userId: p.admin,
@@ -222,6 +207,8 @@ async function handleAbono(item: OutboxAbono) {
           prestamoId: p.prestamoId,
           monto: Number(p.monto.toFixed(2)),
           operationalDate: res.hoy,
+          tenantId: p.tenantId ?? null,
+          rutaId: p.rutaId ?? null,
         },
       });
     } catch {
@@ -246,7 +233,7 @@ async function handleAbono(item: OutboxAbono) {
 }
 
 async function handleNoPago(item: OutboxNoPago) {
-  const p = item.payload;
+  const p = item.payload as any;
 
   let tz: string | undefined;
   try {
@@ -274,6 +261,9 @@ async function handleNoPago(item: OutboxNoPago) {
       promesaMonto: typeof p.promesaMonto === 'number' ? p.promesaMonto : null,
       createdAt: serverTimestamp(),
       source: 'outbox',
+      // 👇 mantener consistencia de scope en no-pagos
+      tenantId: p.tenantId ?? null,
+      rutaId: p.rutaId ?? null,
     }
   );
 
@@ -281,7 +271,7 @@ async function handleNoPago(item: OutboxNoPago) {
     userId: p.admin,
     action: 'no_pago',
     ref,
-    after: { reason: p.reason, fechaOperacion },
+    after: { reason: p.reason, fechaOperacion, tenantId: p.tenantId ?? null, rutaId: p.rutaId ?? null },
   });
 }
 
@@ -299,8 +289,7 @@ async function processOne(item: OutboxItem) {
     }
 
     await updateOutboxItem(item.id, { status: 'done' });
-    // En el motor nuevo los ítems exitosos se eliminan.
-    // Aquí lo dejamos por compat; si quisieras:
+    // En el motor nuevo los OK se eliminan. Aquí mantenemos compat:
     // await removeFromOutbox(item.id);
   } catch (e: any) {
     const attempts = (item.attempts || 0) + 1;
@@ -317,23 +306,27 @@ async function processOne(item: OutboxItem) {
 }
 
 /* ===================== EXPORTS NUEVOS (wrappers al motor real) ===================== */
-/** Compat: hay código viejo que importaba processOutboxItem desde aquí */
+/** Compat: había código que importaba processOutboxItem desde aquí */
 export async function processOutboxItem(item: OutboxItem): Promise<boolean> {
-  // Delegamos al motor nuevo (idempotente)
   return obProcessOutboxItem(item as any);
 }
 
-/** Compat: hay código viejo que importaba processOutboxBatch desde aquí */
+/** Compat: había código que importaba processOutboxBatch desde aquí */
 export async function processOutboxBatch(maxItems = 10): Promise<void> {
-  // Mantén el chequeo de red si quieres evitar martillar cuando está offline
   const okNet = await canSyncNow();
   if (!okNet) return;
   await obProcessOutboxBatch(maxItems);
 }
 
 /* ===================== Sincronización total ===================== */
-// Empuja outbox y refresca clientes + préstamos del admin, guardando cache local.
-export async function sincronizarTodo(admin: string): Promise<{
+/**
+ * Empuja outbox y refresca clientes + préstamos del admin, guardando cache local.
+ * Puedes pasar filtros opcionales para aislar por tenant/ruta en memoria.
+ */
+export async function sincronizarTodo(
+  admin: string,
+  opts?: { tenantId?: string | null; rutaId?: string | null }
+): Promise<{
   pushed: number;
   remaining: number;
   pulled: { clientes: number; prestamos: number };
@@ -350,19 +343,35 @@ export async function sincronizarTodo(admin: string): Promise<{
 
   const afterPush = await loadOutbox();
   const remaining = afterPush.length;
-  const pushed = Math.max(0, beforeLen - remaining); // ✅ ahora correcto (el motor nuevo borra los OK)
+  const pushed = Math.max(0, beforeLen - remaining);
 
-  // 2) Descargar catálogos del admin
+  // 2) Descargar catálogos
   const snapClientes = await getDocs(collection(db, 'clientes'));
-  const clientes = snapClientes.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+  let clientes = snapClientes.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+
+  // (Opcional) filtrar por tenant/ruta en memoria para evitar “fugas” de sesión
+  if (opts?.tenantId != null) {
+    const tid = String(opts.tenantId ?? '');
+    clientes = clientes.filter((c) => String(c?.tenantId ?? '') === tid);
+  }
+  if (opts?.rutaId != null) {
+    const rid = String(opts.rutaId ?? '');
+    clientes = clientes.filter((c) => String(c?.rutaId ?? '') === rid);
+  }
 
   const qPrestamos = query(collectionGroup(db, 'prestamos'), where('creadoPor', '==', admin));
   const snapPrestamos = await getDocs(qPrestamos);
-  const prestamos = snapPrestamos.docs.map((d) => ({
+  let prestamos = snapPrestamos.docs.map((d) => ({
     id: d.id,
     ...(d.data() as any),
     clienteId: d.ref.parent.parent?.id,
   }));
+
+  // (Opcional) si quieres también filtrar préstamos por scope, usa los ids válidos:
+  if (opts?.tenantId != null || opts?.rutaId != null) {
+    const validIds = new Set(clientes.map((c) => c.id));
+    prestamos = prestamos.filter((p) => validIds.has(String(p.clienteId || '')));
+  }
 
   // 3) Guardar cache local
   let cacheSaved = false;

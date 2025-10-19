@@ -1,13 +1,16 @@
+// utils/useMovimientos.ts
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   collection,
   getDocs,
   query,
   where,
+  QueryConstraint,
 } from 'firebase/firestore';
 import { db } from '../firebase/firebaseConfig';
 import { pickTZ } from '../utils/timezone';
 import { canonicalTipo } from '../utils/movimientoHelper';
+import { getAuthCtx } from '../utils/authCtx';
 
 export type TipoMovimiento =
   | 'ingreso'
@@ -21,15 +24,15 @@ export type MovimientoItem = {
   id: string;
   title: string;         // texto corto para la fila (solo nombre de cliente si aplica)
   monto: number;
-  hora: string;          // HH:mm:ss (formateado en la TZ del doc o fallback)
+  hora: string;          // HH:mm:ss
   nota?: string | null;
   categoria?: string;
-  raw?: any;             // por si quieres debuggear
+  raw?: any;
 };
 
 type Params = {
   admin: string;
-  fecha: string;           // YYYY-MM-DD
+  fecha: string;           // YYYY-MM-DD (operationalDate)
   tipo: TipoMovimiento;
 };
 
@@ -116,10 +119,10 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
         if (!nota && data?.descripcion) nota = String(data.descripcion);
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'abono') {
-        title = cliente?.trim() || 'Cliente'; // ✅ sin prefijos
+        title = cliente?.trim() || 'Cliente';
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'prestamo') {
-        title = cliente?.trim() || 'Préstamo'; // ✅ ventas desde caja
+        title = cliente?.trim() || 'Préstamo';
         if (!nota && concepto) nota = concepto;
       } else if (tCanon === 'apertura') {
         title = 'Apertura';
@@ -143,26 +146,32 @@ export function useMovimientos({ admin, fecha, tipo }: Params): Result {
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      // ✅ Exclusivo de cajaDiaria + filtros baratos
       const tipos = buildTiposFiltro(tipo);
-      // Si ‘tipo’ mapea a varios, haremos varias queries pequeñas y uniremos
-      const queries = tipos.length <= 1
-        ? [
-            query(
-              collection(db, 'cajaDiaria'),
-              where('admin', '==', admin),
-              where('operationalDate', '==', fecha),
-              where('tipo', '==', tipos[0] ?? tipo) // por si faltara mapeo
-            ),
-          ]
-        : tipos.map((t) =>
-            query(
-              collection(db, 'cajaDiaria'),
-              where('admin', '==', admin),
-              where('operationalDate', '==', fecha),
-              where('tipo', '==', t)
-            )
-          );
+      const tiposEfectivos = tipos.length ? tipos : [tipo as string];
+
+      // ⤵️ Contexto de sesión para scoping
+      const ctx = await getAuthCtx();
+
+      // 🔎 Construye las cláusulas comunes
+      const baseClauses = (t: string): QueryConstraint[] => {
+        const clauses: QueryConstraint[] = [
+          where('admin', '==', admin),                 // compat con tus docs actuales
+          where('operationalDate', '==', fecha),
+          where('tipo', '==', t),
+        ];
+        // multi-tenant
+        if (ctx?.tenantId) clauses.push(where('tenantId', '==', ctx.tenantId));
+        // collector ve solo su ruta
+        if (ctx?.role === 'collector' && ctx.rutaId) {
+          clauses.push(where('rutaId', '==', ctx.rutaId));
+        }
+        return clauses;
+      };
+
+      // 🔁 Una query por tipo (baratas) y merge
+      const queries = tiposEfectivos.map((t) =>
+        query(collection(db, 'cajaDiaria'), ...baseClauses(t))
+      );
 
       const snaps = await Promise.all(queries.map((q) => getDocs(q)));
       const arr = snaps

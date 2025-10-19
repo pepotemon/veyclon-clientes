@@ -8,25 +8,25 @@ import {
   BackHandler,
   Platform,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
+
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'DecoyRetro'>;
 
-const SECRET_SEQUENCE = '2025='; // Escribe esto para entrar
+const SECRET_SEQUENCE = '2025='; // Ingresa esto para salir del señuelo
 
 export default function DecoyRetroScreen({ navigation }: Props) {
   const { palette, isDark } = useAppTheme();
   const insets = useSafeAreaInsets();
+
   const [buffer, setBuffer] = useState<string>('');
   const unlockedRef = useRef(false);
 
-  // Botón atrás cierra la app
+  // Botón atrás cierra la app (no navegar hacia atrás dentro del stack)
   useFocusEffect(
     React.useCallback(() => {
       const onBack = () => {
@@ -43,12 +43,13 @@ export default function DecoyRetroScreen({ navigation }: Props) {
       setBuffer('');
       return;
     }
-    setBuffer((prev) => {
+    setBuffer(prev => {
       const next = (prev + k).slice(-Math.max(SECRET_SEQUENCE.length, 12));
       if (!unlockedRef.current && next.endsWith(SECRET_SEQUENCE)) {
         unlockedRef.current = true;
         setTimeout(() => {
           setBuffer('');
+          // 🔁 Volvemos SIEMPRE a Login (Login ya no reenvía a Decoy porque el flag fue limpiado)
           navigation.replace('Login');
         }, 0);
       }
@@ -64,29 +65,27 @@ export default function DecoyRetroScreen({ navigation }: Props) {
         style={[
           styles.container,
           {
-            paddingTop: Math.max(insets.top + 12, 24),   // ⬅️ despega de la barra superior
-            paddingBottom: Math.max(insets.bottom + 16, 24), // ⬅️ despega del home indicator inferior
+            paddingTop: Math.max(insets.top + 12, 24),
+            paddingBottom: Math.max(insets.bottom + 16, 24),
           },
         ]}
       >
-        {/* Header “arcade login” */}
         <Text style={[styles.brand, { color: palette.text }]}>
-          <Text style={{ color: palette.accent }}>Retro</Text>Pad<Text style={{ color: palette.accent }}>88</Text>
+          <Text style={{ color: palette.accent }}>Retro</Text>Pad
+          <Text style={{ color: palette.accent }}>88</Text>
         </Text>
         <Text style={[styles.caption, { color: palette.softText }]}>
           ACCESS CODE REQUIRED
         </Text>
 
-        {/* Display del código */}
         <View style={[styles.display, { borderColor: palette.cardBorder, backgroundColor: palette.cardBg }]}>
           <Text style={[styles.displayTxt, { color: palette.text }]} numberOfLines={1}>
             {buffer ? buffer.replace(/./g, '•') : '—'}
           </Text>
         </View>
 
-        {/* Keypad */}
         <View style={styles.grid}>
-          {KEYS.map((k) => (
+          {KEYS.map(k => (
             <TouchableOpacity
               key={k}
               activeOpacity={0.9}
@@ -105,7 +104,6 @@ export default function DecoyRetroScreen({ navigation }: Props) {
           ))}
         </View>
 
-        {/* Pie minimal sin pistas */}
         <Text style={[styles.footer, { color: palette.softText }]}>
           © RetroPad88 • INSERT ACCESS CODE
         </Text>
@@ -124,7 +122,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'flex-start',
   },
-
   brand: {
     fontSize: 26,
     fontWeight: '900',
@@ -137,12 +134,11 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 1,
   },
-
   display: {
     alignSelf: 'stretch',
     borderWidth: 1,
     borderRadius: 12,
-    paddingVertical: Platform.select({ ios: 12, android: 10 }),
+    paddingVertical: Platform.select({ ios: 12, android: 10 }) as number,
     paddingHorizontal: 14,
     marginTop: 18,
     marginBottom: 12,
@@ -153,7 +149,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     letterSpacing: 2,
   },
-
   grid: {
     alignSelf: 'stretch',
     marginTop: 8,
@@ -175,7 +170,6 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   keyTxt: { fontSize: 22, fontWeight: '900', letterSpacing: 1 },
-
   footer: {
     marginTop: 18,
     fontSize: 11,

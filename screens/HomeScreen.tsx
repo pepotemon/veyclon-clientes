@@ -1,3 +1,4 @@
+// screens/HomeScreen.tsx
 import React, { useEffect, useMemo, useState, useCallback, useRef, useTransition } from 'react';
 import {
   View,
@@ -72,7 +73,7 @@ type Prestamo = {
   cobradorId: string;
   montoTotal: number;
   restante: number;
-  abonos: Abono[]; // legado (solo para fallback/UX)
+  abonos: Abono[];
   totalPrestamo: number;
   creadoPor: string;
   valorCuota: number;
@@ -86,8 +87,8 @@ type Prestamo = {
 
   tz?: string;
   fechaInicio?: string;
-  creadoEn?: any;        // Firestore Timestamp
-  createdAtMs?: number;  // ms epoch
+  creadoEn?: any;
+  createdAtMs?: number;
   diasHabiles?: number[];
   feriados?: string[];
   pausas?: { desde: string; hasta: string; motivo?: string }[];
@@ -100,7 +101,9 @@ type Prestamo = {
 };
 
 export default function HomeScreen({ route, navigation }: Props) {
-  const { admin } = route.params;
+  // 🔐 admin en estado (puede venir por params o por AsyncStorage)
+  const [admin, setAdmin] = useState<string | undefined>(route.params?.admin);
+
   const tzSession = 'America/Sao_Paulo';
   const { palette, isDark, toggleTheme } = useAppTheme();
   const insets = useSafeAreaInsets();
@@ -136,7 +139,7 @@ export default function HomeScreen({ route, navigation }: Props) {
   const [tieneCajaSnapshot, setTieneCajaSnapshot] = useState(false);
   const [cajaVisitados, setCajaVisitados] = useState<Set<string>>(new Set());
 
-  // 🔄 Refresh manual: fuerza re-suscripción de snapshots
+  // 🔄 Refresh manual
   const [refreshKey, setRefreshKey] = useState(0);
   const handleManualRefresh = () => {
     setCargando(true);
@@ -149,25 +152,29 @@ export default function HomeScreen({ route, navigation }: Props) {
   // ⬇️ NUEVO: transiciones no bloqueantes
   const [isPending, startTransition] = useTransition();
 
-  // Asegura sesión/admin si no vino por params
+  // ✅ Asegura sesión/admin si no vino por params; si no hay sesión → Login
   useFocusEffect(
     useCallback(() => {
       let alive = true;
       (async () => {
         try {
+          if (route.params?.admin) {
+            setAdmin(route.params.admin);
+            return;
+          }
+
           const u = await AsyncStorage.getItem('usuarioSesion');
           if (!alive) return;
 
           if (!u) {
-            navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
+            navigation.reset({ index: 0, routes: [{ name: 'Login' as any }] });
             return;
           }
 
-          if (!route.params?.admin) {
-            navigation.setParams({ admin: u } as any);
-          }
+          setAdmin(u);
+          navigation.setParams({ admin: u } as any);
         } catch {
-          navigation.reset({ index: 0, routes: [{ name: 'DecoyRetro' as any }] });
+          navigation.reset({ index: 0, routes: [{ name: 'Login' as any }] });
         }
       })();
 
@@ -175,31 +182,28 @@ export default function HomeScreen({ route, navigation }: Props) {
     }, [navigation, route.params?.admin])
   );
 
+  useEffect(() => {
+    let unsubEvt: (() => void) | null = null;
+    try {
+      unsubEvt = subscribeOutbox(() => {
+        setRefreshKey((k) => k + 1);
+      });
+    } catch {
+      unsubEvt = null;
+    }
 
-useEffect(() => {
-  let unsubEvt: (() => void) | null = null;
-  try {
-    unsubEvt = subscribeOutbox(() => {
-      setRefreshKey((k) => k + 1);
+    const unsubCount = subscribeCount((n) => {
+      setOutboxCount((prev) => {
+        if (n !== prev) setRefreshKey((k) => k + 1);
+        return n;
+      });
     });
-  } catch {
-    unsubEvt = null;
-  }
 
-  const unsubCount = subscribeCount((n) => {
-    // 👇 comparamos contra el estado previo sin refs
-    setOutboxCount((prev) => {
-      if (n !== prev) setRefreshKey((k) => k + 1);
-      return n;
-    });
-  });
-
-  return () => {
-    if (unsubEvt) unsubEvt();
-    unsubCount && unsubCount();
-  };
-}, []);
-
+    return () => {
+      if (unsubEvt) unsubEvt();
+      unsubCount && unsubCount();
+    };
+  }, []);
 
   const { storageKeyV, storageKeyO } = useMemo(() => {
     const d = hoyApp;
@@ -290,7 +294,7 @@ useEffect(() => {
     return () => { alive = false; };
   }, [admin]);
 
-  // 🧾 Suscripción a cajaDiaria para KPI “cobrado hoy” + marcar visitados por prestamoId
+  // 🧾 Suscripción a cajaDiaria para KPI
   useEffect(() => {
     if (!admin) return;
 
@@ -336,12 +340,11 @@ useEffect(() => {
     }
   }, [admin, hoyApp, refreshKey]);
 
-  // 🔐 Suscripción a préstamos del admin — **filtrado mínimo** (sin orderBy para evitar índices)
+  // 🔐 Suscripción a préstamos del admin
   useEffect(() => {
     if (!admin) return;
 
     let unsub: (() => void) | undefined;
-    // ⬇️ para cancelar la reconciliación diferida si desmonta/recambia
     let cancelled = false;
 
     const suscribir = () => {
@@ -350,7 +353,6 @@ useEffect(() => {
       setPrestamosLoaded(false);
 
       try {
-        // ⚡ Query mínima: por creador + con saldo (>0). Ordenamos del lado del cliente.
         const qPrestamos = query(
           collectionGroup(db, 'prestamos'),
           where('creadoPor', '==', admin),
@@ -363,7 +365,6 @@ useEffect(() => {
             const lista: Prestamo[] = [];
             sg.forEach((docSnap) => {
               const data = docSnap.data() as any;
-              // Filtrado client-side de status: considera activos los que no tienen status (legacy)
               const st: any = data?.status;
               if (st && st !== 'activo') return;
 
@@ -379,13 +380,10 @@ useEffect(() => {
                 valorCuota: data.valorCuota ?? 0,
                 modalidad: data.modalidad ?? 'Diaria',
                 clienteId: data.clienteId,
-
-                // denormalizados (NO mergeamos con /clientes)
                 clienteAlias: data.clienteAlias ?? data.clienteNombre ?? '',
                 clienteDireccion1: data.clienteDireccion1 ?? '',
                 clienteDireccion2: data.clienteDireccion2 ?? '',
                 clienteTelefono1: data.clienteTelefono1 ?? '',
-
                 tz: data.tz || 'America/Sao_Paulo',
                 fechaInicio: data.fechaInicio,
                 creadoEn: data.creadoEn,
@@ -402,7 +400,6 @@ useEffect(() => {
               });
             });
 
-            // ⬇️ aplicar setStates en transición (no bloquea interacciones)
             startTransition(() => {
               setPrestamosRaw(lista);
               setPrestamosLoaded(true);
@@ -410,7 +407,6 @@ useEffect(() => {
               setCargaPrestamosOk(true);
             });
 
-            // ⬇️ Reconciliación limitada: diferida hasta que terminen interacciones
             InteractionManager.runAfterInteractions(() => {
               if (cancelled) return;
 
@@ -510,7 +506,7 @@ useEffect(() => {
     })();
   }, [admin, prestamosLoaded, prestamosRaw]);
 
-  // ✅ NUEVO: saneador de caja al abrir Home (una sola vez cuando hay admin)
+  // ✅ saneador de caja (una vez)
   const saneadorOnce = useRef(false);
   useEffect(() => {
     if (!admin || saneadorOnce.current) return;
@@ -531,10 +527,9 @@ useEffect(() => {
   // 🔄 No mergeamos con /clientes — usamos los campos denormalizados del propio préstamo
   const prestamos = useMemo(() => prestamosRaw, [prestamosRaw]);
 
-  // (La query ya trae solo del admin y con saldo)
   const prestamosAdmin = useMemo(() => prestamos, [prestamos]);
 
-  // 🆕 Ordenar por orden guardado (AsyncStorage) y fallback a nombre
+  // 🆕 Orden con ruta
   const orderedPrestamosAdmin = useMemo(() => {
     const BIG = 1e9;
     const pos = new Map<string, number>(routeOrderIds.map((id, i) => [id, i]));
@@ -623,7 +618,7 @@ useEffect(() => {
       tipo: 'no_pago',
       reason: payload.reason,
       fechaOperacion,
-      creadoPor: admin,
+      creadoPor: admin!, // 👈 asegurado
       tz,
       clienteId: p.clienteId,
       prestamoId: p.id,
@@ -643,7 +638,7 @@ useEffect(() => {
     );
 
     await logAudit({
-      userId: admin,
+      userId: admin!,
       action: 'no_pago',
       docPath: `clientes/${p.clienteId}/prestamos/${p.id}/reportesNoPago/${docRef.id}`,
       after: pick(
@@ -708,7 +703,6 @@ useEffect(() => {
 
   const cobrado = tieneCajaSnapshot ? cobradoHoy : cobradoLegacy;
 
-  // Meta = suma de valorCuota de todos los préstamos del admin (diaria)
   const meta = useMemo(
     () => orderedPrestamosAdmin.reduce((acc, p) => acc + (Number(p.valorCuota) || 0), 0),
     [orderedPrestamosAdmin]
@@ -879,12 +873,22 @@ useEffect(() => {
     setWhatsVisible(true);
   };
 
+  // 🔒 Mostrar loader si no hay admin aún (evita TS: string | undefined)
+  if (!admin) {
+    return (
+      <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg, justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator size="large" />
+        <Text style={{ marginTop: 10, color: palette.softText }}>Cargando sesión...</Text>
+      </SafeAreaView>
+    );
+  }
+
   // ===== Render =====
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right',]}   // 👈 evita el hueco
-  >
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: palette.screenBg }}
+      edges={['left','right',]}   // 👈 evita el hueco
+    >
       {/* TopBar */}
       <View
         style={[
@@ -904,28 +908,28 @@ useEffect(() => {
           icon="check-decagram"
           tintColor={palette.text}
           accent={palette.accent}
-          onPress={() => navigation.navigate('ClientesDisponibles', { admin })}
+          onPress={() => navigation.navigate('ClientesDisponibles', { admin: admin! })}
         />
         <QuickBtn
           label="Nuevo"
           icon="account-plus"
           tintColor={palette.text}
           accent={palette.accent}
-          onPress={() => navigation.navigate('NuevoCliente', { admin })}
+          onPress={() => navigation.navigate('NuevoCliente', { admin: admin! })}
         />
         <QuickBtn
           label="Lista"
           icon="clipboard-list"
           tintColor={palette.text}
           accent={palette.accent}
-          onPress={() => navigation.navigate('PagosDiarios', { admin })}
+          onPress={() => navigation.navigate('PagosDiarios', { admin: admin! })}
         />
         <QuickBtn
           label="Más"
           icon="dots-horizontal"
           tintColor={palette.text}
           accent={palette.accent}
-          onPress={() => navigation.navigate('Acciones', { admin })}
+          onPress={() => navigation.navigate('Acciones', { admin: admin! })}
         />
       </View>
 
@@ -1330,7 +1334,7 @@ useEffect(() => {
                 await addToOutbox({
                   kind: 'no_pago',
                   payload: {
-                    admin,
+                    admin: admin!, // 👈 asegurado aquí
                     clienteId: current.clienteId!,
                     prestamoId: current.id!,
                     ...form,
@@ -1358,8 +1362,13 @@ useEffect(() => {
           clienteNombre={current.concepto}
           clienteId={current.clienteId}
           prestamoId={current.id}
-          admin={admin}
+          admin={admin!}
           clienteTelefono={current.clienteTelefono1}
+          /* ⚡ prefetched para abrir instantáneo */
+          prefetched={{
+            valorCuota: Number(current.valorCuota ?? 0),
+            saldoPendiente: Number(current.restante ?? 0),
+          }}
         />
       )}
 

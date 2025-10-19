@@ -44,11 +44,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '../theme/ThemeProvider';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-
-// ✅ Solo cuotas vencidas / adelantadas / al día
 import { computeQuotaBadge } from '../utils/alerts';
-
-// 👇 evento de outbox para refrescar UI tras flush
 import { OUTBOX_FLUSHED } from '../utils/outbox';
 
 type Abono = {
@@ -66,13 +62,12 @@ type Prestamo = {
   cobradorId: string;
   montoTotal: number;
   restante: number;
-  abonos: Abono[]; // legado (fallback UX)
+  abonos: Abono[];
   totalPrestamo: number;
   creadoPor: string;
   valorCuota: number;
   modalidad?: string;
 
-  // denormalizados del préstamo (NO join con /clientes)
   clienteAlias?: string;
   clienteDireccion1?: string;
   clienteDireccion2?: string;
@@ -80,12 +75,10 @@ type Prestamo = {
 
   tz?: string;
 
-  // (opcionales para "Nuevo")
-  creadoEn?: any;        // Timestamp Firestore
-  createdAtMs?: number;  // ms epoch
-  fechaInicio?: string;  // 'YYYY-MM-DD'
+  creadoEn?: any;
+  createdAtMs?: number;
+  fechaInicio?: string;
 
-  // ⬇️ necesarios para adelantar / cálculo robusto
   permitirAdelantar?: boolean;
   cuotas?: number;
   diasHabiles?: number[];
@@ -93,12 +86,10 @@ type Prestamo = {
   pausas?: { desde: string; hasta: string; motivo?: string }[];
   modoAtraso?: 'porPresencia' | 'porCuota';
 
-  // para detectar visita de hoy cuando el abono viene de subcolección (outbox)
   lastAbonoAt?: any;
 
-  // ordenamiento barato persistido en doc
   routeOrder?: number;
-  proximoVencimiento?: string; // 'YYYY-MM-DD' si existe
+  proximoVencimiento?: string;
   status?: 'activo' | 'cerrado' | 'pausado';
 };
 
@@ -121,15 +112,12 @@ export default function PagosDiariosScreen({ route }: any) {
   const [dayTick, setDayTick] = useState(0);
   const [mensajeExito, setMensajeExito] = useState('');
 
-  // 👇 pulso para forzar re-render al flush del outbox (snapshot igual traerá cambios)
   const [outboxPulse, setOutboxPulse] = useState(0);
 
   const tzSession = 'America/Sao_Paulo';
-
-  // 💫 transiciones no bloqueantes (igual que en Home)
   const [isPending, startTransition] = useTransition();
 
-  // ===== Helpers =====
+  // ===== Helpers de fecha =====
   function toYYYYMMDDInTZ(date: Date, tz: string) {
     const parts = new Intl.DateTimeFormat('es-ES', {
       timeZone: tz,
@@ -179,13 +167,20 @@ export default function PagosDiariosScreen({ route }: any) {
     if (Number.isFinite(ms)) return Date.now() - ms < 48 * 3600 * 1000;
     return false;
   }
-  // ====================
 
-  // ✅ Selección con ref (no re-renderiza toda la lista)
+  // ✅ selección con ref (no dispara renders en toda la lista)
   const selectedRef = useRef<Prestamo | null>(null);
+
+  // ⚡ Prefetch para el modal (lo pasaremos cuando actualicemos ModalRegistroPago)
+  const [prefetchedPago, setPrefetchedPago] = useState<{ valorCuota?: number; saldoPendiente?: number } | undefined>();
 
   const openPagoDirecto = useCallback((item: Prestamo) => {
     selectedRef.current = item;
+    // capturamos los datos necesarios para abrir el modal sin I/O
+    setPrefetchedPago({
+      valorCuota: Number(item.valorCuota) || 0,
+      saldoPendiente: Number(item.restante) || 0,
+    });
     setOpcionesVisible(false);
     setModalPagoVisible(true);
   }, []);
@@ -195,7 +190,6 @@ export default function PagosDiariosScreen({ route }: any) {
     setOpcionesVisible(true);
   }, []);
 
-  // Redirección si no hay sesión
   useFocusEffect(
     useCallback(() => {
       let alive = true;
@@ -209,7 +203,6 @@ export default function PagosDiariosScreen({ route }: any) {
     }, [navigation])
   );
 
-  // Tique de medianoche en TZ
   useEffect(() => {
     let t: ReturnType<typeof setTimeout>;
     const schedule = () => {
@@ -229,7 +222,6 @@ export default function PagosDiariosScreen({ route }: any) {
     return () => sub.remove();
   }, []);
 
-  // 👉 escuchar flush del outbox (cuando un abono/no_pago/venta/mov se sube)
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener(OUTBOX_FLUSHED, () => {
       setOutboxPulse((n) => n + 1);
@@ -239,23 +231,17 @@ export default function PagosDiariosScreen({ route }: any) {
 
   const hoySession = useMemo(() => todayInTZ(tzSession), [tzSession, dayTick, outboxPulse]);
 
-  // 🟢 visitado hoy: por abonos en doc (legacy) o por lastAbonoAt (subcolección / outbox)
   const esVisitadoHoy = useCallback(
     (p: Prestamo) => {
       const tz = pickTZ(p.tz, tzSession);
       const hoy = todayInTZ(tz);
-
-      // 1) Legacy
       const viaArray =
         Array.isArray(p.abonos) &&
         p.abonos.some((a) => {
           const dia = a.operationalDate ?? normYYYYMMDD(a.fecha);
           return dia === hoy;
         });
-
       if (viaArray) return true;
-
-      // 2) lastAbonoAt
       const lastYmd = anyDateToYYYYMMDD(p.lastAbonoAt, tz);
       return lastYmd === hoy;
     },
@@ -295,7 +281,6 @@ export default function PagosDiariosScreen({ route }: any) {
                 modalidad: data.modalidad ?? 'Diaria',
                 clienteId: data.clienteId,
 
-                // denormalizados
                 clienteAlias: data.clienteAlias ?? data.clienteNombre ?? '',
                 clienteDireccion1: data.clienteDireccion1 ?? '',
                 clienteDireccion2: data.clienteDireccion2 ?? '',
@@ -303,7 +288,6 @@ export default function PagosDiariosScreen({ route }: any) {
 
                 tz: data.tz || 'America/Sao_Paulo',
 
-                // opcionales
                 creadoEn: data.creadoEn,
                 createdAtMs: data.createdAtMs,
                 fechaInicio: data.fechaInicio,
@@ -392,6 +376,11 @@ export default function PagosDiariosScreen({ route }: any) {
       Alert.alert('Error', 'Este préstamo no tiene cliente asignado');
       return;
     }
+    // también precargamos aquí por si vienes del long-press
+    setPrefetchedPago({
+      valorCuota: Number(sel.valorCuota) || 0,
+      saldoPendiente: Number(sel.restante) || 0,
+    });
     setOpcionesVisible(false);
     setModalPagoVisible(true);
   }, []);
@@ -401,7 +390,6 @@ export default function PagosDiariosScreen({ route }: any) {
     setTimeout(() => setMensajeExito(''), 2500);
   };
 
-  // ✅ Handler de éxito: optimista + confirmación final
   const handlePagoSuccess = useCallback((payload?: {
     clienteId: string;
     prestamoId: string;
@@ -410,20 +398,17 @@ export default function PagosDiariosScreen({ route }: any) {
     optimistic?: boolean;
   }) => {
     if (!payload) {
-      // Compat: si el modal aún no envía payload, al menos mostramos el toast
       mostrarMensajeExito('Pago registrado correctamente');
       return;
     }
 
     const { prestamoId, monto, restanteNuevo, optimistic } = payload;
 
-    // Pintar verde y ajustar restante **al instante** en la lista local
     setPrestamos((prev) =>
       prev.map((it) => {
         if (it.id !== prestamoId) return it;
         const base = {
           ...it,
-          // Marcamos "visitado hoy" con un timestamp local; esVisitadoHoy lo detecta
           lastAbonoAt: Date.now(),
         };
 
@@ -432,25 +417,21 @@ export default function PagosDiariosScreen({ route }: any) {
           return { ...base, restante: rest };
         }
 
-        // Confirmación final: usamos el restante real si viene
         return typeof restanteNuevo === 'number'
           ? { ...base, restante: Math.max(restanteNuevo, 0) }
           : base;
       })
     );
 
-    // Mostramos el toast solo cuando no es optimista (para evitar duplicado)
     if (!optimistic) {
       mostrarMensajeExito('Pago registrado correctamente');
     }
   }, []);
 
-  // ===== Fila memoizada =====
   const RowItem = React.memo(function RowItem({ item }: { item: Prestamo }) {
     const visitado = esVisitadoHoy(item);
     const esNuevo = !visitado && esNuevoHoyOPas48h(item);
 
-    // ✅ memo del badge para no recalcular en renders globales
     const qbRaw = useMemo(
       () => computeQuotaBadge(item),
       [item.id, item.valorCuota, item.restante, item.lastAbonoAt, (item.abonos || []).length]
@@ -597,7 +578,7 @@ export default function PagosDiariosScreen({ route }: any) {
   return (
     <SafeAreaView
       style={{ flex: 1, backgroundColor: palette.screenBg }}
-      edges={['left','right']}   // 👈 evita el hueco
+      edges={['left','right']}
     >
       <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
 
@@ -689,6 +670,11 @@ export default function PagosDiariosScreen({ route }: any) {
           if (!prestamoSeleccionado) return;
 
           if (opcion === 'pago') {
+            // precargamos para la apertura por long-press
+            setPrefetchedPago({
+              valorCuota: Number(prestamoSeleccionado.valorCuota) || 0,
+              saldoPendiente: Number(prestamoSeleccionado.restante) || 0,
+            });
             setOpcionesVisible(false);
             setModalPagoVisible(true);
           } else if (opcion === 'historial') {
@@ -718,7 +704,6 @@ export default function PagosDiariosScreen({ route }: any) {
                   }));
               }
             } catch {
-              // Fallback al arreglo legacy del doc si algo falla
               abonosCompat = (prestamoSeleccionado.abonos || []).map((a: any) => ({
                 monto: Number(a.monto) || 0,
                 fecha:
@@ -757,7 +742,10 @@ export default function PagosDiariosScreen({ route }: any) {
         }}
       />
 
-      {/* Modal de pago (tap simple) — SIEMPRE MONTADO */}
+      {/* Modal de pago — SIEMPRE MONTADO
+          En el próximo paso le pasaremos:
+          prefetched={prefetchedPago}
+      */}
       <ModalRegistroPago
         visible={modalPagoVisible}
         onClose={() => setModalPagoVisible(false)}
@@ -765,8 +753,9 @@ export default function PagosDiariosScreen({ route }: any) {
         clienteId={selectedRef.current?.clienteId ?? ''}
         prestamoId={selectedRef.current?.id ?? ''}
         admin={admin}
-        // ✅ usa el handler optimista/confirmación
         onSuccess={handlePagoSuccess}
+        // ⚠️ Próximo paso: cuando actualicemos ModalRegistroPago, descomentar y tipar:
+        // prefetched={prefetchedPago}
       />
 
       {mensajeExito !== '' && (

@@ -1,7 +1,8 @@
 // screens/DefinirCajaScreen.tsx
-import React, { useMemo, useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, TextInput,
-  Alert, KeyboardAvoidingView, Platform
+import React, { useMemo, useState, useEffect } from 'react';
+import {
+  View, Text, StyleSheet, TouchableOpacity, TextInput,
+  Alert, KeyboardAvoidingView, Platform, ActivityIndicator
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -10,10 +11,12 @@ import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
 
 import { db } from '../firebase/firebaseConfig';
-import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
+import { setDoc, doc, getDoc, serverTimestamp } from 'firebase/firestore';
 
 import { pickTZ, todayInTZ } from '../utils/timezone';
 import { logAudit, pick } from '../utils/auditLogs';
+// 🔐 scoping
+import { getAuthCtx } from '../utils/authCtx';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'DefinirCaja'>;
 
@@ -31,9 +34,33 @@ function parseMoney(input: string): number {
   return Number.isFinite(n) ? n : NaN;
 }
 
-export default function DefinirCajaScreen({ route, navigation }: Props) {
-  const { admin } = route.params;
+export default function DefinirCajaScreen({ navigation }: Props) {
   const { palette } = useAppTheme();
+
+  // 🔐 cargar contexto auth (incluye admin real)
+  const [ctx, setCtx] = useState<{
+    admin: string | null;
+    tenantId: string | null;
+    role: 'collector' | 'admin' | 'superadmin' | null;
+    rutaId: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const c = await getAuthCtx();
+      if (!alive) return;
+      setCtx({
+        admin: c?.admin ?? null,
+        tenantId: c?.tenantId ?? null,
+        role: (c?.role as any) ?? null,
+        rutaId: c?.rutaId ?? null,
+      });
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const authAdminId = ctx?.admin ?? null;
 
   // Info para UI; el payload toma TZ/fecha en el momento de guardar
   const tzUI = useMemo(() => pickTZ(undefined, 'America/Sao_Paulo'), []);
@@ -47,6 +74,11 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
 
   const onApertura = async () => {
     try {
+      if (!authAdminId) {
+        Alert.alert('Sesión', 'No se pudo identificar el usuario (admin). Intenta nuevamente.');
+        return;
+      }
+
       if (disabled) {
         Alert.alert('Monto inválido', `Ingresa un valor ≥ R$ ${MIN_APERTURA.toFixed(2)}.`);
         return;
@@ -64,28 +96,45 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
       const opDateNow = todayInTZ(tzNow);
       const notaTrim = (nota || '').trim() || null;
 
-      // ⚠️ APERTURA canónica en cajaDiaria (esto define la CAJA INICIAL del día)
+      // ✅ doc idempotente: evita duplicados si se toca varias veces
+      const aperturaId = `apertura_${authAdminId}_${opDateNow}`;
+      const aperturaRef = doc(db, 'cajaDiaria', aperturaId);
+
+      // Si ya existe, avisamos y salimos
+      const exists = await getDoc(aperturaRef);
+      if (exists.exists()) {
+        Alert.alert('Apertura ya registrada', `Ya existe una apertura para hoy (${opDateNow}).`);
+        navigation.goBack();
+        return;
+      }
+
+      // APERTURA canónica en cajaDiaria (define CAJA INICIAL del día)
       const payload = {
         tipo: 'apertura' as const,
-        admin,
+        admin: authAdminId!,                // << unificado
         monto: val,
-        operationalDate: opDateNow, // YYYY-MM-DD en tu TZ
+        operationalDate: opDateNow,         // YYYY-MM-DD
         tz: tzNow,
         nota: notaTrim,
         createdAt: serverTimestamp(),
         createdAtMs: Date.now(),
         source: 'manual' as const,
+        // 🔐 scoping
+        tenantId: ctx?.tenantId ?? null,
+        rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
       };
 
-      const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
+      await setDoc(aperturaRef, payload, { merge: false });
 
       // Auditoría
       await logAudit({
-        userId: admin,
-        action: 'caja_apertura_manual', // agrega este literal a AuditAction si hace falta
-        ref,
+        userId: authAdminId!,
+        action: 'caja_apertura_manual',
+        ref: aperturaRef,
         before: null,
-        after: pick(payload, ['tipo','admin','monto','operationalDate','tz','nota','source']),
+        after: pick(payload, [
+          'tipo','admin','monto','operationalDate','tz','nota','source','tenantId','rutaId'
+        ]),
       });
 
       Alert.alert(
@@ -99,11 +148,20 @@ export default function DefinirCajaScreen({ route, navigation }: Props) {
     }
   };
 
+  // Mientras cargamos el contexto (para tener admin real)
+  if (!ctx || !authAdminId) {
+    return (
+      <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator />
+      </SafeAreaView>
+    );
+  }
+
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right','bottom']}   // 👈 evita el hueco
-  >
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: palette.screenBg }}
+      edges={['left','right','bottom']}   // 👈 evita el hueco
+    >
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
         <View style={[styles.container, { padding: 16 }]}>
           <Text style={[styles.title, { color: palette.text }]}>Definir caja</Text>

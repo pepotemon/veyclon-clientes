@@ -56,6 +56,11 @@ const Row = memo(function Row({ item, iconName, palette }: RowProps) {
   );
 });
 
+function safeMoney(n: number) {
+  const v = Number.isFinite(n) ? n : 0;
+  return `R$ ${v.toFixed(2)}`;
+}
+
 export default function InformeDiario({
   titulo,
   kpiLabel,
@@ -81,8 +86,7 @@ export default function InformeDiario({
   };
 
   // memo: keyExtractor y renderItem
-  const keyExtractor = useCallback((it: MovimientoItem) => it.id, []);
-
+  const keyExtractor = useCallback((it: MovimientoItem, idx: number) => it.id || String(idx), []);
   const renderItem = useCallback<ListRenderItem<MovimientoItem>>(
     ({ item }) => <Row item={item} iconName={icon} palette={palette} />,
     [icon, palette]
@@ -112,7 +116,7 @@ export default function InformeDiario({
         </View>
         <View style={styles.kpiRow}>
           <Text style={[styles.kpiLabel, { color: palette.softText }]}>{kpiLabel}</Text>
-          <Text style={[styles.kpiValue, { color: palette.text }]}>R$ {total.toFixed(2)}</Text>
+          <Text style={[styles.kpiValue, { color: palette.text }]}>{safeMoney(total)}</Text>
         </View>
 
         <TouchableOpacity
@@ -145,9 +149,9 @@ export default function InformeDiario({
           updateCellsBatchingPeriod={50}
           windowSize={7}
           removeClippedSubviews
-          // Paginación opcional
-          onEndReached={onEndReached}
-          onEndReachedThreshold={0.6}
+          // Paginación opcional (solo si viene handler)
+          onEndReached={onEndReached ? () => void onEndReached() : undefined}
+          onEndReachedThreshold={onEndReached ? 0.6 : undefined}
         />
       )}
 

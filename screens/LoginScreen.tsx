@@ -1,15 +1,8 @@
 // screens/LoginScreen.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  StyleSheet,
-  Alert,
-  ActivityIndicator,
-  KeyboardAvoidingView,
-  Platform,
+  View, Text, TextInput, TouchableOpacity, StyleSheet, Alert,
+  ActivityIndicator, KeyboardAvoidingView, Platform
 } from 'react-native';
 import Checkbox from 'expo-checkbox';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -17,108 +10,136 @@ import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
 
-// 🔐 Nuevo: consultas acotadas y helpers de sesión
-import { findUserByLogin, passwordMatches } from '../utils/userLookup';
-import { setSessionUser } from '../utils/session';
+import { signInWithEmailAndPassword, getIdTokenResult } from 'firebase/auth';
+import { auth, db } from '../firebase/firebaseConfig';
+import { doc, getDoc } from 'firebase/firestore';
+
+import { setSessionUser, getFullSession, DECOY_FLAG } from '../utils/session';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Login'>;
+
+const TENANT = 'cobrox'; // <-- cambia si tu tenant es otro
 
 const STORAGE_KEYS = {
   remember: '@login/remember',
   username: '@login/username',
-  password: '@login/password', // legacy (lo eliminamos si existe)
+  legacyPassword: '@login/password', // si existía de versiones previas, la borramos
 };
 
 export default function LoginScreen({ navigation }: Props) {
   const { palette } = useAppTheme();
 
-  const [usuario, setUsuario] = useState('');      // usuario o correo
-  const [contraseña, setContraseña] = useState(''); // NO se guardará
+  const [ident, setIdent] = useState('');     // usuario o email
+  const [secret, setSecret] = useState('');   // PIN/Password (NO se guarda)
   const [remember, setRemember] = useState<boolean>(false);
 
   const [autofilling, setAutofilling] = useState<boolean>(true);
   const [loading, setLoading] = useState<boolean>(false);
 
-  // Autocompletar SOLO el usuario si el usuario marcó "Recordar"
-  // y borrar cualquier password legacy almacenada previamente.
+  // 🧠 Arranque: 1) si hay flag → DecoyRetro y listo; 2) si no hay flag y hay sesión → Home
   useEffect(() => {
-    const loadSaved = async () => {
+    (async () => {
+      try {
+        const flag = await AsyncStorage.getItem(DECOY_FLAG);
+        if (flag === '1') {
+          await AsyncStorage.removeItem(DECOY_FLAG);
+          navigation.navigate('DecoyRetro' as never);
+          return; // ⛔️ no sigas: evita loop con sesión previa
+        }
+
+        const session = await getFullSession();
+        if (session?.admin) {
+          navigation.reset({
+            index: 0,
+            routes: [{ name: 'Home' as never, params: { admin: session.admin } as never }],
+          });
+          return;
+        }
+      } catch {
+        // ignora errores de storage
+      }
+    })();
+  }, [navigation]);
+
+  // Autorrelleno SOLO del usuario; limpieza de password legacy
+  useEffect(() => {
+    (async () => {
       try {
         const [rememberStr, savedUser, legacyPass] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEYS.remember),
           AsyncStorage.getItem(STORAGE_KEYS.username),
-          AsyncStorage.getItem(STORAGE_KEYS.password), // legacy
+          AsyncStorage.getItem(STORAGE_KEYS.legacyPassword),
         ]);
-
         const remembered = rememberStr === 'true';
         setRemember(remembered);
-        if (remembered) {
-          setUsuario(savedUser ?? '');
-        }
-
-        // 🔒 Limpieza: si había contraseña guardada de versiones anteriores, elimínala
-        if (legacyPass) {
-          await AsyncStorage.removeItem(STORAGE_KEYS.password);
-        }
+        if (remembered) setIdent(savedUser ?? '');
+        if (legacyPass) await AsyncStorage.removeItem(STORAGE_KEYS.legacyPassword);
       } catch (e) {
         console.warn('No se pudieron cargar credenciales guardadas', e);
       } finally {
         setAutofilling(false);
       }
-    };
-    loadSaved();
+    })();
   }, []);
 
-  const manejarLogin = async () => {
-    const loginVal = usuario.trim();
-    const passVal = contraseña; // no trim para no romper casos raros
+  // Si el input trae @, es email real; si no, generamos email sintético
+  const resolvedEmail = useMemo(() => {
+    const raw = (ident || '').trim().toLowerCase();
+    if (!raw) return '';
+    return raw.includes('@') ? raw : `${raw}@${TENANT}.veyclon.local`;
+  }, [ident]);
 
-    if (!loginVal || !passVal) {
-      Alert.alert('Completa los campos', 'Ingresa usuario/correo y contraseña.');
+  const manejarLogin = async () => {
+    if (!resolvedEmail || !secret) {
+      Alert.alert('Completa los campos', 'Ingresa usuario/email y PIN/Password.');
       return;
     }
 
     setLoading(true);
     try {
-      // 🔎 Lookup acotado: primero por usuario, luego por correo (limit 1)
-      const user = await findUserByLogin(loginVal);
-      if (!user) {
-        Alert.alert('Usuario no encontrado', 'Revisa el usuario o correo.');
-        return;
-      }
+      // 1️⃣ Login Firebase
+      const cred = await signInWithEmailAndPassword(auth, resolvedEmail, secret);
 
-      // ✅ Compat: passwordMatches (password/pass) + soporte 'contraseña' (campo con tilde)
-      const matches =
-        passwordMatches(passVal, user as any) ||
-        (user as any)?.contraseña === passVal;
+      // 2️⃣ Claims y perfil Firestore
+      const tokenRes = await getIdTokenResult(cred.user, true);
+      const claims = tokenRes.claims as any;
+      const perfilRef = doc(db, 'usuarios', cred.user.uid);
+      const perfilSnap = await getDoc(perfilRef);
+      const perfil = perfilSnap.exists() ? (perfilSnap.data() as any) : null;
 
-      if (!matches) {
-        Alert.alert('Contraseña incorrecta', 'Vuelve a intentarlo.');
-        return;
-      }
+      // 3️⃣ Derivar admin string
+      const localPart = resolvedEmail.split('@')[0];
+      const admin = localPart || cred.user.uid;
 
-      // Persistir SOLO la sesión (sin contraseña)
-      const admin = (user as any)?.usuario || user.id; // muchos screens esperan "admin"
-      await setSessionUser(admin, { ...user, password: undefined, pass: undefined, contraseña: undefined });
+      // 4️⃣ Guardar sesión
+      await setSessionUser(admin, {
+        uid: cred.user.uid,
+        email: resolvedEmail,
+        tenantId: claims.tenantId ?? perfil?.tenantId ?? null,
+        role: (claims.role as any) ?? (perfil?.role as any) ?? null,
+        rutaId: (claims.rutaId as any) ?? (perfil?.rutaId as any) ?? null,
+        nombre: perfil?.nombre ?? null,
+        ciudad: perfil?.ciudad ?? null,
+      });
 
-      // “Recordar” sólo guarda el usuario (no la contraseña)
+      // 5️⃣ Guardar usuario si “recordar” está activo (tipado correcto)
       if (remember) {
         await AsyncStorage.multiSet([
           [STORAGE_KEYS.remember, 'true'],
-          [STORAGE_KEYS.username, admin],
-        ]);
+          [STORAGE_KEYS.username, ident || ''],
+        ] as [string, string][]);
       } else {
-        await AsyncStorage.multiRemove([STORAGE_KEYS.remember, STORAGE_KEYS.username]);
+        await AsyncStorage.multiRemove([STORAGE_KEYS.remember, STORAGE_KEYS.username] as string[]);
       }
 
-      // Navegar a Home (ajusta la ruta si tu flujo difiere)
+      // 6️⃣ Ir a Home
       navigation.reset({
         index: 0,
-        routes: [{ name: 'Home', params: { admin } }],
+        routes: [{ name: 'Home' as never, params: { admin } as never }],
       });
     } catch (e) {
       console.warn('Login error:', e);
-      Alert.alert('Error', 'No se pudo iniciar sesión en este momento.');
+      Alert.alert('Error', 'No se pudo iniciar sesión. Revisa tus credenciales.');
     } finally {
       setLoading(false);
     }
@@ -133,6 +154,8 @@ export default function LoginScreen({ navigation }: Props) {
     );
   }
 
+  const isEmail = ident.includes('@');
+
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: palette.screenBg }}
@@ -144,16 +167,12 @@ export default function LoginScreen({ navigation }: Props) {
         <TextInput
           style={[
             styles.input,
-            {
-              color: palette.text,
-              borderColor: palette.cardBorder,
-              backgroundColor: palette.cardBg,
-            },
+            { color: palette.text, borderColor: palette.cardBorder, backgroundColor: palette.cardBg },
           ]}
           placeholder="Usuario o correo"
           placeholderTextColor={palette.softText}
-          value={usuario}
-          onChangeText={setUsuario}
+          value={ident}
+          onChangeText={setIdent}
           autoCapitalize="none"
           autoCorrect={false}
           autoComplete="username"
@@ -162,20 +181,21 @@ export default function LoginScreen({ navigation }: Props) {
           editable={!loading}
           returnKeyType="next"
         />
+        {!isEmail && !!ident && (
+          <Text style={{ color: palette.softText, fontSize: 12, marginTop: -6, marginBottom: 8 }}>
+            Se usará: <Text style={{ fontFamily: 'monospace' }}>{`*@${TENANT}.veyclon.local`}</Text>
+          </Text>
+        )}
 
         <TextInput
           style={[
             styles.input,
-            {
-              color: palette.text,
-              borderColor: palette.cardBorder,
-              backgroundColor: palette.cardBg,
-            },
+            { color: palette.text, borderColor: palette.cardBorder, backgroundColor: palette.cardBg },
           ]}
-          placeholder="Contraseña"
+          placeholder="PIN / Contraseña"
           placeholderTextColor={palette.softText}
-          value={contraseña}
-          onChangeText={setContraseña}
+          value={secret}
+          onChangeText={setSecret}
           secureTextEntry
           autoCapitalize="none"
           autoCorrect={false}
@@ -188,16 +208,13 @@ export default function LoginScreen({ navigation }: Props) {
 
         <View style={styles.row}>
           <Checkbox
-            style={[
-              styles.checkbox,
-              { borderColor: palette.cardBorder, backgroundColor: palette.kpiBg },
-            ]}
+            style={[styles.checkbox, { borderColor: palette.cardBorder, backgroundColor: palette.kpiBg }]}
             value={remember}
             onValueChange={setRemember}
             color={remember ? palette.accent : undefined}
           />
           <Text style={[styles.checkboxLabel, { color: palette.text }]}>
-            Recordar mi usuario (no guarda contraseña)
+            Recordar mi usuario (no guarda PIN)
           </Text>
         </View>
 
@@ -207,11 +224,7 @@ export default function LoginScreen({ navigation }: Props) {
           activeOpacity={0.9}
           disabled={loading}
         >
-          {loading ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.buttonText}>Ingresar</Text>
-          )}
+          {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Ingresar</Text>}
         </TouchableOpacity>
 
         <Text style={[styles.note, { color: palette.softText }]}>
@@ -223,56 +236,14 @@ export default function LoginScreen({ navigation }: Props) {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: 'center',
-    padding: 20,
-  },
-  centered: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  title: {
-    fontSize: 26,
-    fontWeight: 'bold',
-    marginBottom: 24,
-    textAlign: 'center',
-  },
-  input: {
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    marginBottom: 12,
-  },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 14,
-  },
-  checkbox: {
-    width: 22,
-    height: 22,
-    borderWidth: 1,
-    borderRadius: 4,
-  },
-  checkboxLabel: {
-    marginLeft: 8,
-  },
-  button: {
-    padding: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  note: {
-    marginTop: 10,
-    fontSize: 12,
-    textAlign: 'center',
-  },
+  container: { flex: 1, justifyContent: 'center', padding: 20 },
+  centered: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  title: { fontSize: 26, fontWeight: 'bold', marginBottom: 24, textAlign: 'center' },
+  input: { borderWidth: 1, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 12 },
+  row: { flexDirection: 'row', alignItems: 'center', marginBottom: 14 },
+  checkbox: { width: 22, height: 22, borderWidth: 1, borderRadius: 4 },
+  checkboxLabel: { marginLeft: 8 },
+  button: { padding: 14, borderRadius: 8, alignItems: 'center' },
+  buttonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+  note: { marginTop: 10, fontSize: 12, textAlign: 'center' },
 });

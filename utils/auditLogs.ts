@@ -6,7 +6,7 @@
  */
 
 import {
-  addDoc, // (fallback)
+  addDoc,                 // (fallback)
   collection,
   serverTimestamp,
   DocumentReference,
@@ -34,8 +34,8 @@ export type AuditAction =
 type Opts = {
   userId: string;
   action: AuditAction;
-  ref?: DocumentReference;   // uno de los dos
-  docPath?: string;          // uno de los dos
+  ref?: DocumentReference;  // uno de los dos
+  docPath?: string;         // uno de los dos
   before?: any;
   after?: any;
 };
@@ -50,7 +50,8 @@ function isPlainObject(value: any): value is Record<string, any> {
   return (
     value !== null &&
     typeof value === 'object' &&
-    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+    (Object.getPrototypeOf(value) === Object.prototype ||
+      Object.getPrototypeOf(value) === null)
   );
 }
 
@@ -106,7 +107,7 @@ const HARD_FLUSH_THRESHOLD = 80;    // si el buffer supera esto, intentamos flus
 const MAX_BACKOFF_MS = 10_000;
 
 let buffer: AuditDocShape[] = [];
-let flushTimer: any = null;
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let flushing = false;
 let backoffMs = 0;
 
@@ -166,7 +167,6 @@ export async function flushAuditBufferNow(): Promise<void> {
     buffer = pending.concat(buffer);
     backoffMs = backoffMs ? Math.min(backoffMs * 2, MAX_BACKOFF_MS) : 1000;
 
-    // fallback (opcional): intenta un addDoc suelto si el batch falló; mejor reintentar en lote
     setTimeout(() => {
       scheduleFlush();
     }, backoffMs);

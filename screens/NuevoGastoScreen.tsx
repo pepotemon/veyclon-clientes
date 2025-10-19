@@ -1,25 +1,16 @@
 // screens/NuevoGastoScreen.tsx
 import React, { useMemo, useState } from 'react';
-import {
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  StyleSheet,
-  KeyboardAvoidingView,
-  Platform,
-  Alert,
-} from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, KeyboardAvoidingView, Platform, Alert } from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { db } from '../firebase/firebaseConfig';
 import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
 import { todayInTZ, pickTZ } from '../utils/timezone';
 import { logAudit } from '../utils/auditLogs';
+// opcional si ya tienes este helper para leer tenant/rol/ruta
+import { getAuthCtx } from '../utils/authCtx';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'NuevoGasto'>;
 
@@ -40,21 +31,34 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
 
   const hoy = useMemo(() => todayInTZ(pickTZ(tzSession, tzSession)), [tzSession]);
 
+  const parseMonto2 = (t: string) => {
+    const norm = (t || '').replace(',', '.').trim();
+    if (!/^\d+(\.\d{0,2})?$/.test(norm)) return NaN;
+    return Math.round(parseFloat(norm) * 100) / 100;
+  };
+
   const guardar = async () => {
-    const num = Number((monto || '').replace(',', '.'));
+    const num = parseMonto2(monto);
     if (!isFinite(num) || num <= 0) {
-      Alert.alert('Monto inválido', 'Ingresa un monto mayor a 0.');
+      Alert.alert('Monto inválido', 'Ingresa un monto mayor a 0 (hasta 2 decimales).');
       return;
     }
     try {
       setGuardando(true);
 
+      // opcional: tenant para futuros filtros multi-tenant
+      let tenantId: string | null = null;
+      try {
+        const ctx = await getAuthCtx();
+        tenantId = ctx?.tenantId ?? null;
+      } catch {}
+
       const payload = {
-        // ✅ tipo canónico para Fase 2 (coincide con movimientoHelper / consultas)
         tipo: 'gasto_admin' as const,
         admin,
+        tenantId: tenantId ?? undefined, // opcional
         categoria,
-        monto: Math.round(num * 100) / 100,
+        monto: num,
         operationalDate: hoy,
         tz: tzSession,
         nota: nota.trim() ? nota.trim() : null,
@@ -65,7 +69,6 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
 
       const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
 
-      // Auditoría
       await logAudit({
         userId: admin,
         action: 'caja_gasto_admin',
@@ -79,6 +82,7 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
           tz: payload.tz,
           admin: payload.admin,
           source: payload.source,
+          tenantId: tenantId ?? undefined,
         },
       });
 
@@ -93,32 +97,23 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
   };
 
   return (
-      <SafeAreaView
-    style={{ flex: 1, backgroundColor: palette.screenBg }}
-    edges={['left','right','bottom']}   // 👈 evita el hueco
-  >
+    <SafeAreaView style={{ flex: 1, backgroundColor: palette.screenBg }} edges={['left','right','bottom']}>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        {/* Header */}
         <View style={[styles.header, { backgroundColor: palette.topBg, borderBottomColor: palette.topBorder }]}>
           <Text style={[styles.headerTxt, { color: palette.text }]}>Nuevo Gasto</Text>
         </View>
 
         <View style={{ flex: 1, padding: 12, gap: 8 }}>
-          {/* Monto */}
           <Text style={[styles.label, { color: palette.softText }]}>Monto</Text>
           <TextInput
             value={monto}
             onChangeText={setMonto}
-            keyboardType="decimal-pad"
+            keyboardType={Platform.select({ ios: 'decimal-pad', android: 'decimal-pad' })}
             placeholder="0,00"
             placeholderTextColor={palette.softText}
-            style={[
-              styles.input,
-              { color: palette.text, borderColor: palette.cardBorder, backgroundColor: palette.cardBg },
-            ]}
+            style={[styles.input, { color: palette.text, borderColor: palette.cardBorder, backgroundColor: palette.cardBg }]}
           />
 
-          {/* Categoría */}
           <Text style={[styles.label, { color: palette.softText, marginTop: 4 }]}>Categoría</Text>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
             {CATEGORIAS.map((c) => {
@@ -142,31 +137,22 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
             })}
           </View>
 
-          {/* Nota */}
           <Text style={[styles.label, { color: palette.softText, marginTop: 4 }]}>Nota (opcional)</Text>
           <TextInput
             value={nota}
             onChangeText={setNota}
             placeholder="Detalle corto"
             placeholderTextColor={palette.softText}
-            style={[
-              styles.input,
-              { color: palette.text, borderColor: palette.cardBorder, backgroundColor: palette.cardBg, height: 70 },
-            ]}
+            style={[styles.input, { color: palette.text, borderColor: palette.cardBorder, backgroundColor: palette.cardBg, height: 70 }]}
             multiline
           />
 
           <View style={{ flex: 1 }} />
 
-          {/* Botón */}
           <View
             style={[
               styles.ctaBar,
-              {
-                backgroundColor: palette.topBg,
-                borderTopColor: palette.topBorder,
-                paddingBottom: Math.max(10, insets.bottom),
-              },
+              { backgroundColor: palette.topBg, borderTopColor: palette.topBorder, paddingBottom: Math.max(10, insets.bottom) },
             ]}
           >
             <TouchableOpacity
@@ -187,29 +173,11 @@ export default function NuevoGastoScreen({ route, navigation }: Props) {
 const styles = StyleSheet.create({
   header: { paddingVertical: 8, alignItems: 'center', borderBottomWidth: 1 },
   headerTxt: { fontSize: 14, fontWeight: '800', opacity: 0.9 },
-
   label: { fontSize: 11, fontWeight: '700' },
-
-  input: {
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    fontSize: 14,
-  },
-
-  pill: {
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    borderWidth: 1,
-  },
+  input: { borderWidth: 1, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10, fontSize: 14 },
+  pill: { paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999, borderWidth: 1 },
   pillTxt: { fontSize: 12, fontWeight: '700' },
-
-  ctaBar: {
-    borderTopWidth: 1,
-    paddingTop: 10,
-  },
+  ctaBar: { borderTopWidth: 1, paddingTop: 10 },
   btn: { paddingVertical: 10, borderRadius: 10, alignItems: 'center' },
   btnTxt: { color: '#fff', fontWeight: '800', fontSize: 14 },
 });

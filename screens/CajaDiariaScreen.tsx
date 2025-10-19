@@ -13,11 +13,10 @@ import {
   Platform,
   AppState,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { useAppTheme } from '../theme/ThemeProvider';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { db } from '../firebase/firebaseConfig';
 import {
@@ -26,11 +25,12 @@ import {
   query,
   where,
   collection,
-  onSnapshot,
   getDocs,
   getDoc,
   doc,
+  QueryConstraint,
 } from 'firebase/firestore';
+import { onSnapshotWithFallback } from '../utils/firestoreFallback';
 
 import { todayInTZ, nextMidnightDelayInTZ } from '../utils/timezone';
 import { logAudit, pick } from '../utils/auditLogs';
@@ -47,29 +47,36 @@ import {
 // ✅ saneadores
 import { closeMissingDays, ensureAperturaDeHoy } from '../utils/cajaEstado';
 
+// 🔐 NUEVO: contexto de autenticación (incluye admin)
+import { getAuthCtx } from '../utils/authCtx';
+
 type Props = NativeStackScreenProps<RootStackParamList, 'CajaDiaria'>;
 
 type MovimientoBase = {
   id: string;
   monto: number;
-  nota?: string;
+  nota?: string | null;
   operationalDate: string; // YYYY-MM-DD
   tz: string;
   admin: string;
   createdAt?: any;
   createdAtMs?: number;
+  clienteNombre?: string; // 👈 para mostrar en lista si viene
 };
 
 type MovimientoCaja = MovimientoBase & {
-  tipo: Extract<MovimientoTipo, 'ingreso' | 'retiro' | 'gasto_admin'>;
+  // 👇 ampliamos para listar también abonos y préstamos
+  tipo: Extract<MovimientoTipo, 'ingreso' | 'retiro' | 'gasto_admin' | 'abono' | 'prestamo'>;
   categoria?: string;
+  tenantId?: string | null;
+  rutaId?: string | null;
 };
 
 // MISMA TZ que usamos para definir aperturas
 const tz = 'America/Sao_Paulo';
 
 export default function CajaDiariaScreen({ route, navigation }: Props) {
-  const { admin } = route.params;
+  const routeAdmin = route.params.admin; // fallback inicial
   const { palette, isDark } = useAppTheme();
   const insets = useSafeAreaInsets();
 
@@ -106,6 +113,33 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
   // Caja inicial base = CIERRE HEREDADO
   const [cajaInicialBase, setCajaInicialBase] = useState(0);
+
+  // 🔐 NUEVO: contexto auth (admin, tenant/rol/ruta)
+  const [ctx, setCtx] = useState<{
+    admin: string | null;
+    tenantId: string | null;
+    role: 'collector' | 'admin' | 'superadmin' | null;
+    rutaId: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const c = await getAuthCtx();
+      if (!mounted) return;
+      setCtx({
+        admin: c?.admin ?? (typeof routeAdmin === 'string' ? routeAdmin : null),
+        tenantId: c?.tenantId ?? null,
+        role: (c?.role as any) ?? null,
+        rutaId: c?.rutaId ?? null,
+      });
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [routeAdmin]);
+
+  const authAdminId = ctx?.admin ?? (typeof routeAdmin === 'string' ? routeAdmin : null);
 
   // Total de gastos admin
   const totalGastos = useMemo(
@@ -180,16 +214,25 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
       if (bestOp) return bestBal;
     } catch {}
 
-    // 3) Nada → 0 (inicio absoluto, esta pantalla no usa cajaEstado como fallback)
+    // 3) Nada → 0
     return 0;
   }
 
-  // --- Cargar CAJA INICIAL BASE = cierre heredado (se recalcula si cambia 'hoy')
+  // Si aún no tenemos adminId, mostramos loader (evita consultas inconsistentes)
+  if (!authAdminId) {
+    return (
+      <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator />
+      </SafeAreaView>
+    );
+  }
+
+  // --- Cargar CAJA INICIAL BASE = cierre heredado (se recalcula si cambia 'hoy' o admin)
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const base = await getCajaInicialUI(admin, hoy);
+        const base = await getCajaInicialUI(authAdminId, hoy);
         if (!cancelled) setCajaInicialBase(Number.isFinite(base) ? base : 0);
       } catch (e) {
         console.warn('[CajaDiaria] cajaInicialBase error:', e);
@@ -199,32 +242,37 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [admin, hoy]);
+  }, [authAdminId, hoy]);
 
   // ✅ SANEADORES al cambiar de día (genera cierres faltantes y apertura de hoy)
   useEffect(() => {
     (async () => {
       try {
-        await closeMissingDays(admin, hoy, tz);
-        await ensureAperturaDeHoy(admin, hoy, tz);
+        await closeMissingDays(authAdminId, hoy, tz);
+        await ensureAperturaDeHoy(authAdminId, hoy, tz);
       } catch (e) {
         console.warn('[CajaDiaria] saneadores:', e);
       }
     })();
-  }, [admin, hoy]);
+  }, [authAdminId, hoy]);
 
   // Snapshot de movimientos del día (todas las KPIs salen de aquí)
   useEffect(() => {
     setCargando(true);
     try {
-      const qDia = query(
-        collection(db, 'cajaDiaria'),
-        where('admin', '==', admin),
-        where('operationalDate', '==', hoy)
-      );
+      const constraints: QueryConstraint[] = [
+        where('admin', '==', authAdminId),
+        where('operationalDate', '==', hoy),
+      ];
+      // 🔒 Scoping multi-tenant (opcional)
+      if (ctx?.tenantId) constraints.push(where('tenantId', '==', ctx.tenantId));
 
-      const unsub = onSnapshot(
+      // 🚫 NO filtrar por rutaId a nivel query (muchos docs históricos no lo traen)
+      const qDia = query(collection(db, 'cajaDiaria'), ...constraints);
+
+      const unsub = onSnapshotWithFallback(
         qDia,
+        null,
         (snap) => {
           let lastAperturaMonto = 0;
           let lastAperturaTs = -1;
@@ -239,6 +287,13 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
             const data = d.data() as any;
             const tip = canonicalTipo(data?.tipo);
             if (!tip) return;
+
+            // ✅ FILTRO POR RUTA EN CLIENTE:
+            const passRuta =
+              !(ctx?.role === 'collector' && ctx?.rutaId) ||
+              data?.rutaId === ctx.rutaId ||
+              data?.rutaId == null; // permitir históricos sin ruta
+            if (!passRuta) return;
 
             const m = Number(
               tip === 'apertura' || tip === 'cierre'
@@ -262,6 +317,20 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
               case 'abono':
                 _abonos += m;
+                _movsCaja.push({
+                  id: d.id,
+                  tipo: 'abono',
+                  monto: m,
+                  nota: data?.nota || null,
+                  operationalDate: data?.operationalDate,
+                  tz: data?.tz || tz,
+                  admin: data?.admin || authAdminId,
+                  createdAt: data?.createdAt,
+                  createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  clienteNombre: (data?.clienteNombre ?? undefined) || undefined,
+                  tenantId: data?.tenantId ?? null,
+                  rutaId: data?.rutaId ?? null,
+                });
                 break;
 
               case 'ingreso':
@@ -270,12 +339,14 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                   id: d.id,
                   tipo: 'ingreso',
                   monto: m,
-                  nota: data?.nota || '',
+                  nota: data?.nota || null,
                   operationalDate: data?.operationalDate,
                   tz: data?.tz || tz,
-                  admin: data?.admin || admin,
+                  admin: data?.admin || authAdminId,
                   createdAt: data?.createdAt,
                   createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  tenantId: data?.tenantId ?? null,
+                  rutaId: data?.rutaId ?? null,
                 });
                 break;
 
@@ -285,12 +356,14 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                   id: d.id,
                   tipo: 'retiro',
                   monto: m,
-                  nota: data?.nota || '',
+                  nota: data?.nota || null,
                   operationalDate: data?.operationalDate,
                   tz: data?.tz || tz,
-                  admin: data?.admin || admin,
+                  admin: data?.admin || authAdminId,
                   createdAt: data?.createdAt,
                   createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  tenantId: data?.tenantId ?? null,
+                  rutaId: data?.rutaId ?? null,
                 });
                 break;
 
@@ -300,17 +373,33 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
                   tipo: 'gasto_admin',
                   categoria: data?.categoria || 'Gasto admin',
                   monto: m,
-                  nota: data?.nota || '',
+                  nota: data?.nota || null,
                   operationalDate: data?.operationalDate,
                   tz: data?.tz || tz,
-                  admin: data?.admin || admin,
+                  admin: data?.admin || authAdminId,
                   createdAt: data?.createdAt,
                   createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  tenantId: data?.tenantId ?? null,
+                  rutaId: data?.rutaId ?? null,
                 });
                 break;
 
               case 'prestamo':
                 _prestamos += m;
+                _movsCaja.push({
+                  id: d.id,
+                  tipo: 'prestamo',
+                  monto: m,
+                  nota: data?.nota || null,
+                  operationalDate: data?.operationalDate,
+                  tz: data?.tz || tz,
+                  admin: data?.admin || authAdminId,
+                  createdAt: data?.createdAt,
+                  createdAtMs: typeof data?.createdAtMs === 'number' ? data.createdAtMs : undefined,
+                  clienteNombre: (data?.clienteNombre ?? undefined) || undefined,
+                  tenantId: data?.tenantId ?? null,
+                  rutaId: data?.rutaId ?? null,
+                });
                 break;
 
               default:
@@ -360,7 +449,8 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
       console.warn('[CajaDiaria] suscripción no disponible:', e);
       setCargando(false);
     }
-  }, [admin, hoy]);
+    // 👇 importante: dependemos de admin real del contexto
+  }, [authAdminId, hoy, ctx?.tenantId, ctx?.role, ctx?.rutaId]);
 
   // ======= Quick add: Ingreso / Retiro (modal) =======
   const [modalOpen, setModalOpen] = useState<false | 'ingreso' | 'retiro'>(false);
@@ -391,7 +481,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
       setGuardandoMov(true);
       const payload = {
         tipo: modalOpen,
-        admin,
+        admin: authAdminId, // << unificado
         monto: Math.round(num * 100) / 100,
         operationalDate: hoy,
         tz,
@@ -399,15 +489,18 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
         createdAt: serverTimestamp(),
         createdAtMs: Date.now(),
         source: 'manual' as const,
+        // 🔐 NUEVO: scoping en escritura
+        tenantId: ctx?.tenantId ?? null,
+        rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
       };
       const ref = await addDoc(collection(db, 'cajaDiaria'), payload);
 
       await logAudit({
-        userId: admin,
+        userId: authAdminId,
         action: modalOpen === 'ingreso' ? 'caja_ingreso' : 'caja_retiro',
         ref,
         before: null,
-        after: pick(payload, ['tipo', 'admin', 'monto', 'operationalDate', 'tz', 'nota', 'source']),
+        after: pick(payload, ['tipo', 'admin', 'monto', 'operationalDate', 'tz', 'nota', 'source', 'tenantId', 'rutaId']),
       });
 
       closeModal();
@@ -425,7 +518,13 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
     const ico = iconFor(item.tipo);
     const tone = toneFor(item.tipo);
     const baseLabel = labelFor(item.tipo);
-    const title = item.tipo === 'gasto_admin' ? item.categoria || baseLabel : baseLabel;
+
+    const title =
+      item.tipo === 'gasto_admin'
+        ? item.categoria || baseLabel
+        : item.clienteNombre
+        ? `${baseLabel} · ${item.clienteNombre}`
+        : baseLabel;
 
     return (
       <View
@@ -457,7 +556,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
   return (
     <SafeAreaView
       style={{ flex: 1, backgroundColor: palette.screenBg }}
-      edges={['left','right','bottom']}   // 👈 evita el hueco
+      edges={['left','right','bottom']}
     >
       <View
         style={[styles.header, { backgroundColor: palette.topBg, borderBottomColor: palette.topBorder }]}
@@ -619,7 +718,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
 
         <TouchableOpacity
           style={[styles.btnGhost, { borderColor: palette.accent }]}
-          onPress={() => navigation.navigate('NuevoGasto', { admin })}
+          onPress={() => navigation.navigate('NuevoGasto', { admin: authAdminId })}
           activeOpacity={0.9}
         >
           <Text style={[styles.btnGhostTxt, { color: palette.accent }]}>+ Nuevo gasto</Text>
@@ -645,7 +744,7 @@ export default function CajaDiariaScreen({ route, navigation }: Props) {
           <TextInput
             value={montoTxt}
             onChangeText={setMontoTxt}
-            keyboardType={Platform.select({ ios: 'decimal-pad', android: 'decimal-pad' })}
+            keyboardType={Platform.select({ ios: 'decimal-pad', android: 'decimal-pad' }) as any}
             placeholder="0,00"
             style={styles.modalInput}
             autoFocus
@@ -758,7 +857,7 @@ const styles = StyleSheet.create({
     borderColor: '#DFE5E1',
     borderRadius: 8,
     paddingHorizontal: 10,
-    paddingVertical: Platform.select({ ios: 8, android: 6 }),
+    paddingVertical: Platform.select({ ios: 8, android: 6 }) as number,
     fontSize: 14,
     color: '#263238',
     backgroundColor: '#fff',

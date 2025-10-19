@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   subscribeOutbox,
   getOutboxCounts,
@@ -24,10 +24,9 @@ function shallowEqualCounts(a: OutboxStatusCounts, b: OutboxStatusCounts) {
   return true;
 }
 
-// Estado inicial consistente con OutboxKind actual
 const INITIAL: OutboxStatusCounts = {
   totalPending: 0,
-  byKind: { abono: 0, venta: 0, no_pago: 0, mov: 0, otro: 0 } as Record<OutboxKind, number>,
+  byKind: { abono: 0, venta: 0, no_pago: 0, mov: 0, otro: 0 },
 };
 
 export default function useOutboxStatus(): UseOutboxStatusResult {
@@ -42,24 +41,30 @@ export default function useOutboxStatus(): UseOutboxStatusResult {
     };
   }, []);
 
-  // Coalescer múltiples emisiones seguidas (va alineado con el throttle del outbox)
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const schedule = (fn: () => void, ms = 120) => {
-    if (debounceRef.current) return;
-    debounceRef.current = setTimeout(() => {
-      debounceRef.current = null;
-      fn();
-    }, ms);
-  };
-
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     try {
       const next = await getOutboxCounts(); // usa mirror en memoria → rápido
+      if (!mountedRef.current) return;
       setCounts((prev) => (shallowEqualCounts(prev, next) ? prev : next));
     } catch {
       // noop
     }
-  };
+  }, []);
+
+  // Coalescer múltiples emisiones seguidas (ligeramente > throttle interno de 150ms)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const schedule = useCallback(
+    (fn: () => void, ms = 160) => {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+      }
+      debounceRef.current = setTimeout(() => {
+        debounceRef.current = null;
+        fn();
+      }, ms);
+    },
+    []
+  );
 
   useEffect(() => {
     // Carga inicial inmediata
@@ -67,7 +72,6 @@ export default function useOutboxStatus(): UseOutboxStatusResult {
 
     // Suscribirse a cambios del outbox (event-driven; sin polling)
     const unsub = subscribeOutbox(() => {
-      // Coalesce múltiples eventos cercanos
       schedule(() => void refresh());
     });
 
@@ -80,7 +84,7 @@ export default function useOutboxStatus(): UseOutboxStatusResult {
         debounceRef.current = null;
       }
     };
-  }, []);
+  }, [refresh, schedule]);
 
   return useMemo(
     () => ({
@@ -88,6 +92,6 @@ export default function useOutboxStatus(): UseOutboxStatusResult {
       byKind: counts.byKind,
       refresh,
     }),
-    [counts]
+    [counts, refresh]
   );
 }

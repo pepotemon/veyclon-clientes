@@ -1,5 +1,4 @@
-// components/ModalNoPago.tsx
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect, useCallback } from 'react';
 import {
   Modal, View, Text, TouchableOpacity, StyleSheet, TextInput, ActivityIndicator, Platform,
   Pressable, KeyboardAvoidingView, TouchableWithoutFeedback, Keyboard,
@@ -66,13 +65,24 @@ export default function ModalNoPago({ visible, onCancel, onSave, saving }: Props
   const isPromesa = reason === 'promesa';
   const isOtro = reason === 'otro';
 
-  const disableSave = useMemo(() => !!saving, [saving]);
-
-  const parseMonto = (v: string) => {
-    const norm = v.replace(',', '.').trim();
+  const parseMonto = useCallback((v: string) => {
+    const norm = (v || '').replace(',', '.').trim();
     const n = Number(norm);
-    return Number.isFinite(n) && n >= 0 ? n : undefined;
-  };
+    return Number.isFinite(n) ? n : NaN;
+  }, []);
+
+  const canSave = useMemo(() => {
+    if (saving) return false;
+    if (isPromesa) {
+      const m = parseMonto(promesaMonto);
+      return !!promesaFecha && Number.isFinite(m) && m > 0;
+    }
+    if (isOtro) {
+      // Nota opcional → igual puede guardar
+      return true;
+    }
+    return true;
+  }, [saving, isPromesa, isOtro, promesaFecha, promesaMonto, parseMonto]);
 
   const normYYYYMMDD = (d: Date) => {
     const y = d.getFullYear();
@@ -82,19 +92,32 @@ export default function ModalNoPago({ visible, onCancel, onSave, saving }: Props
   };
 
   const today = new Date();
-  const minDate = new Date(today.getFullYear(), today.getMonth(), today.getDate()); // desde hoy (promesas futuras o hoy)
+  const minDate = new Date(today.getFullYear(), today.getMonth(), today.getDate()); // desde hoy
 
   const handleSave = () => {
-    onSave({
+    const payload = {
       reason,
       nota: isOtro && nota.trim() ? nota.trim() : undefined,
       promesaFecha: isPromesa && promesaFecha.trim() ? promesaFecha.trim() : undefined,
-      promesaMonto: isPromesa && promesaMonto.trim() ? parseMonto(promesaMonto) : undefined,
-    });
+      promesaMonto:
+        isPromesa && promesaMonto.trim()
+          ? (() => {
+              const n = parseMonto(promesaMonto);
+              return Number.isFinite(n) && n > 0 ? Number(n.toFixed(2)) : undefined;
+            })()
+          : undefined,
+    };
+    onSave(payload);
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel} statusBarTranslucent>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onCancel}
+      statusBarTranslucent
+    >
       <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
         <View style={styles.overlay}>
           {/* backdrop para cerrar */}
@@ -105,7 +128,11 @@ export default function ModalNoPago({ visible, onCancel, onSave, saving }: Props
             behavior={Platform.OS === 'ios' ? 'padding' : undefined}
             style={[
               styles.sheet,
-              { backgroundColor: palette.cardBg, paddingBottom: 12 + Math.max(insets.bottom, 10) },
+              {
+                backgroundColor: palette.cardBg,
+                paddingBottom: 12 + Math.max(insets.bottom, 10),
+                borderTopColor: palette.cardBorder,
+              },
             ]}
           >
             <Text style={[styles.title, { color: palette.text }]}>Razón de no pago</Text>
@@ -118,18 +145,22 @@ export default function ModalNoPago({ visible, onCancel, onSave, saving }: Props
                     key={r.key}
                     style={[
                       styles.chip,
-                      { borderColor: palette.cardBorder, backgroundColor: palette.topBg },
-                      active && { backgroundColor: palette.commBg, borderColor: ACCENT },
+                      {
+                        borderColor: active ? ACCENT : palette.cardBorder,
+                        backgroundColor: active ? palette.commBg : palette.topBg,
+                      },
                     ]}
                     onPress={() => setReason(r.key)}
                     disabled={!!saving}
                     activeOpacity={0.85}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: active, disabled: !!saving }}
                   >
                     <Text
                       style={[
                         styles.chipText,
-                        { color: palette.softText },
-                        active && { color: ACCENT, fontWeight: '700' },
+                        { color: active ? ACCENT : palette.softText },
+                        active && { fontWeight: '700' },
                       ]}
                     >
                       {r.label}
@@ -150,6 +181,7 @@ export default function ModalNoPago({ visible, onCancel, onSave, saving }: Props
                   onPress={() => setPickerOpen(true)}
                   disabled={!!saving}
                   activeOpacity={0.8}
+                  accessibilityRole="button"
                 >
                   <Text style={{ color: palette.text }}>{promesaFecha || 'YYYY-MM-DD'}</Text>
                 </TouchableOpacity>
@@ -171,6 +203,10 @@ export default function ModalNoPago({ visible, onCancel, onSave, saving }: Props
                   value={promesaMonto}
                   onChangeText={setPromesaMonto}
                   editable={!saving}
+                  onSubmitEditing={() => {
+                    if (canSave) handleSave();
+                  }}
+                  returnKeyType="done"
                 />
               </View>
             )}
@@ -209,9 +245,9 @@ export default function ModalNoPago({ visible, onCancel, onSave, saving }: Props
                 <Text style={[styles.btnCancelTxt, { color: palette.text }]}>Cancelar</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.btnSave, { backgroundColor: ACCENT }, disableSave && { opacity: 0.6 }]}
+                style={[styles.btnSave, { backgroundColor: ACCENT }, !canSave && { opacity: 0.6 }]}
                 onPress={handleSave}
-                disabled={disableSave}
+                disabled={!canSave}
                 activeOpacity={0.9}
               >
                 {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnSaveTxt}>Guardar</Text>}
@@ -247,6 +283,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 16,
     paddingHorizontal: 16,
     paddingTop: 12,
+    borderTopWidth: 1,
   },
   title: { fontSize: 18, fontWeight: '800', textAlign: 'center', marginBottom: 8 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },

@@ -4,12 +4,10 @@ import { addMovimientoIdempotente } from './caja';
 import { pickTZ, todayInTZ, normYYYYMMDD } from './timezone';
 import { addToOutbox } from './outbox';
 
-/**
- * Estructura base SIN 'admin' (admin se pasa como 1er argumento).
- */
+/** Payload común sin admin (admin va por argumento) */
 type BaseNoAdmin = {
-  operationalDate: string; // 'YYYY-MM-DD'
-  tz: string;
+  operationalDate: string; // YYYY-MM-DD (si no viene válida, se usa hoy en tz)
+  tz: string;              // IANA TZ
   nota?: string | null;
 };
 
@@ -18,16 +16,15 @@ async function isOnline(): Promise<boolean> {
     const s = await NetInfo.fetch();
     return !!(s?.isInternetReachable ?? s?.isConnected);
   } catch {
-    // si NetInfo falla, asumimos online para intentar directo (y si falla, encolamos en catch)
+    // Si NetInfo falla, intentamos como si hubiera red (y si la escritura falla, encolamos)
     return true;
   }
 }
 
 /**
- * Registra una APERTURA manual del día (tipo canónico: 'apertura').
- * - Escribe un documento en 'cajaDiaria' (idempotente por admin+fecha).
- * - NO modifica cajaEstado.saldoActual (eso se hace en DefinirCajaScreen con setSaldoActual).
- * - Devuelve el ID del documento creado (o existente).
+ * APERTURA MANUAL del día (canónico: 'apertura').
+ * - Crea doc idempotente en 'cajaDiaria' con id: `ap_<admin>_<YYYY-MM-DD>`.
+ * - NO toca cajaEstado (eso lo hace DefinirCajaScreen con setSaldoActual).
  */
 export async function setCajaInicial(
   admin: string,
@@ -38,9 +35,7 @@ export async function setCajaInicial(
 ): Promise<string> {
   const tzOk = pickTZ(tz);
   const op = normYYYYMMDD(operationalDate) || todayInTZ(tzOk);
-
-  // Id determinístico → evita aperturas duplicadas el mismo día
-  const docId = `ap_${admin}_${op}`;
+  const docId = `ap_${admin}_${op}`; // idempotente por admin+fecha
 
   const res = await addMovimientoIdempotente(
     admin,
@@ -59,10 +54,9 @@ export async function setCajaInicial(
 }
 
 /**
- * Registra un movimiento MANUAL de 'ingreso' o 'retiro' (tipos canónicos).
- * - Si hay conexión → escribe directo en 'cajaDiaria' (idempotente con docId).
- * - Si NO hay conexión → encola en outbox (kind 'otro', subkind ingreso/retiro) con el MISMO docId.
- * - Devuelve un ID del doc creado si es online, o 'queued' si se encola.
+ * Movimiento MANUAL de caja (canónico: 'ingreso' | 'retiro').
+ * - Online: escribe idempotente en 'cajaDiaria'.
+ * - Offline: encola en outbox (kind 'otro', subkind ingreso/retiro) con MISMO docId.
  */
 export async function addMovimientoManual(
   admin: string,
@@ -77,7 +71,7 @@ export async function addMovimientoManual(
       const res = await addMovimientoIdempotente(
         admin,
         {
-          tipo: data.tipo, // canónico
+          tipo: data.tipo,
           monto: data.monto,
           operationalDate: op,
           tz: tzOk,
@@ -88,11 +82,10 @@ export async function addMovimientoManual(
       );
       return res.id;
     } catch {
-      // caída en medio → encolar
+      // si algo falla en caliente, encolamos abajo
     }
   }
 
-  // Offline → encolar como 'otro' con subkind ingreso/retiro + docId para idempotencia del worker
   await addToOutbox({
     kind: 'otro',
     payload: {
@@ -102,17 +95,17 @@ export async function addMovimientoManual(
       operationalDate: op,
       tz: tzOk,
       nota: (data.nota ?? '').trim() || null,
-      docId,
+      docId, // ← idempotencia del worker
     },
   });
+
   return 'queued';
 }
 
 /**
- * Registra un GASTO ADMINISTRATIVO.
- * - Tipo canónico: 'gasto_admin'
- * - Este SÍ se incluye en el cierre.
- * - Online → escribe (idempotente); Offline → encola (kind 'otro', subkind 'gasto_admin') con el MISMO docId.
+ * GASTO ADMINISTRATIVO (canónico: 'gasto_admin').
+ * - Online: escribe idempotente.
+ * - Offline: encola con subkind 'gasto_admin' y MISMO docId.
  */
 export async function addGastoAdmin(
   admin: string,
@@ -141,7 +134,7 @@ export async function addGastoAdmin(
       );
       return res.id;
     } catch {
-      // si falla, encolamos
+      // fallback → outbox
     }
   }
 
@@ -158,14 +151,15 @@ export async function addGastoAdmin(
       docId,
     },
   });
+
   return 'queued';
 }
 
 /**
- * Registra un GASTO DEL COBRADOR.
- * - Tipo canónico: 'gasto_cobrador'
- * - Este NO se incluye en el cierre (solo informativo para el cobrador).
- * - Online → escribe (idempotente); Offline → encola (kind 'otro', subkind 'gasto_cobrador') con el MISMO docId.
+ * GASTO DEL COBRADOR (canónico: 'gasto_cobrador').
+ * - Online: escribe idempotente.
+ * - Offline: encola con subkind 'gasto_cobrador' y MISMO docId.
+ * - Este rubro es informativo (no entra al cierre).
  */
 export async function addGastoCobrador(
   admin: string,
@@ -194,7 +188,7 @@ export async function addGastoCobrador(
       );
       return res.id;
     } catch {
-      // si falla, encolamos
+      // fallback → outbox
     }
   }
 
@@ -211,5 +205,6 @@ export async function addGastoCobrador(
       docId,
     },
   });
+
   return 'queued';
 }

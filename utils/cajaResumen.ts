@@ -27,8 +27,25 @@ export type KpisDia = {
   prestamos: number;
 };
 
-/** Lee TODOS los movimientos de 'cajaDiaria' del día (admin+fecha) y normaliza. */
-export async function leerMovsDelDia(admin: string, ymd: string): Promise<RowCaja[]> {
+type ScopeOpts = {
+  /** Si viene, filtra filas cuyo `tenantId` coincida (si el doc lo trae). */
+  tenantId?: string | null;
+  /**
+   * Si es collector + rutaId, filtra por `rutaId` (si el doc lo trae).
+   * Para admin/superadmin se ignora esta restricción.
+   */
+  role?: 'collector' | 'admin' | 'superadmin' | null;
+  rutaId?: string | null;
+};
+
+/** Lee TODOS los movimientos de 'cajaDiaria' del día (admin+fecha) y normaliza.
+ *  Admite scoping opcional por tenant/ruta si los campos están presentes en los documentos.
+ */
+export async function leerMovsDelDia(
+  admin: string,
+  ymd: string,
+  opts?: ScopeOpts
+): Promise<RowCaja[]> {
   const qy = query(
     collection(db, 'cajaDiaria'),
     where('admin', '==', admin),
@@ -37,19 +54,40 @@ export async function leerMovsDelDia(admin: string, ymd: string): Promise<RowCaj
 
   const snap = await getDocs(qy);
 
-  const rows: RowCaja[] = snap.docs.map((d) => {
+  // 1) Trabajamos con objetos "crudos" para poder filtrar por tenantId/rutaId si existen
+  const raw = snap.docs.map((d) => {
     const data: any = d.data();
-    const tipo = canonicalTipo(data?.tipo);
-    const rawMonto = Number(data?.monto ?? data?.balance ?? 0);
+    return { id: d.id, ...(data || {}) };
+  });
+
+  // 2) Scoping opcional (solo si los campos existen en el doc)
+  const scoped = raw.filter((r: any) => {
+    // tenant
+    if (opts?.tenantId != null) {
+      const t = r?.tenantId ?? null;
+      if (t !== opts.tenantId) return false;
+    }
+    // ruta solo para collectors
+    if (opts?.role === 'collector' && opts?.rutaId) {
+      const rr = r?.rutaId ?? null;
+      if (rr !== opts.rutaId) return false;
+    }
+    return true;
+  });
+
+  // 3) Normalización canónica y shape final
+  const rows: RowCaja[] = scoped.map((r: any) => {
+    const tipo = canonicalTipo(r?.tipo);
+    const rawMonto = Number(r?.monto ?? r?.balance ?? 0);
     const monto = round2(Number.isFinite(rawMonto) ? rawMonto : 0);
     const cam =
-      typeof data?.createdAtMs === 'number'
-        ? data.createdAtMs
-        : typeof data?.createdAt?.seconds === 'number'
-        ? data.createdAt.seconds * 1000
+      typeof r?.createdAtMs === 'number'
+        ? r.createdAtMs
+        : typeof r?.createdAt?.seconds === 'number'
+        ? r.createdAt.seconds * 1000
         : 0;
 
-    return { id: d.id, tipo, monto, createdAtMs: cam || 0 };
+    return { id: r.id, tipo, monto, createdAtMs: cam || 0 };
   });
 
   return rows;
@@ -99,12 +137,13 @@ export function sumarKpis(rows: RowCaja[]): KpisDia {
         break;
 
       case 'prestamo':
-        // 👇 “Préstamos (día)” = suma exclusiva de cajaDiaria con tipo 'prestamo'
+        // “Préstamos (día)” = suma exclusiva de cajaDiaria con tipo 'prestamo'
         prestamos += r.monto;
         break;
 
       default:
-        break; // ignora 'cierre' u otros no relevantes para KPIs
+        // ignora 'cierre' u otros informativos
+        break;
     }
   }
 
@@ -119,9 +158,13 @@ export function sumarKpis(rows: RowCaja[]): KpisDia {
   };
 }
 
-/** Azúcar: KPIs del día leyendo y sumando en un solo paso. */
-export async function kpisDelDia(admin: string, ymd: string): Promise<KpisDia> {
-  const rows = await leerMovsDelDia(admin, ymd);
+/** Azúcar: KPIs del día leyendo y sumando (con scoping opcional). */
+export async function kpisDelDia(
+  admin: string,
+  ymd: string,
+  opts?: ScopeOpts
+): Promise<KpisDia> {
+  const rows = await leerMovsDelDia(admin, ymd, opts);
   return sumarKpis(rows);
 }
 

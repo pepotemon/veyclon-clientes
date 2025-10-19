@@ -8,7 +8,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DeviceEventEmitter } from 'react-native';
 
-// ➕ IMPORTS para reenvío real
 import { db } from '../firebase/firebaseConfig';
 import {
   collection,
@@ -17,7 +16,7 @@ import {
   serverTimestamp,
   getDoc,
   getDocs,
-  arrayUnion, // (legacy) empuja al array "abonos" — se quitará en el paso 4
+  arrayUnion,
 } from 'firebase/firestore';
 import { logAudit, pick } from './auditLogs';
 import { pickTZ, todayInTZ } from './timezone';
@@ -45,11 +44,43 @@ export type AbonoPayload = {
   monto: number;
   tz: string;
   operationalDate: string;
-  /** Nombre visible para UI/Informes; queda top-level para no perderlo en outbox/caja */
+
+  /** UI/Informes */
   clienteNombre?: string;
+
+  /** CajaDiaria (si quieres asentar también en caja) */
   alsoCajaDiaria?: boolean;
-  cajaPayload?: { tipo: 'abono'; clienteNombre?: string };
-  createdAtMs?: number; // opcional, por compat
+  cajaPayload?: {
+    tipo: 'abono';
+    clienteNombre?: string;
+
+    /** 🔐 scoping opcional que usas en el callsite */
+    tenantId?: string | null;
+    rutaId?: string | null;
+  };
+
+  /** ⚙️ metadatos que estás enviando desde ModalRegistroPago */
+  source?: 'app' | 'outbox' | string;
+  tenantId?: string | null;
+  rutaId?: string | null;
+
+  createdAtMs?: number; // opcional, compat
+};
+
+export type VentaCajaPayload = {
+  /** Movimiento de caja opcional que algunos workers crean al enviar la venta */
+  tipo: 'prestamo';
+  admin: string;
+  clienteId: string;
+  prestamoId?: string;           // p.ej. "__to_be_filled_by_worker__"
+  clienteNombre?: string;
+  monto: number;
+  tz: string;
+  operationalDate: string;
+  meta?: Record<string, any>;
+  // 🔐 scoping opcional
+  tenantId?: string | null;
+  rutaId?: string | null;
 };
 
 export type VentaPayload = {
@@ -61,17 +92,26 @@ export type VentaPayload = {
   // Campos del préstamo
   valorCuota: number;
   cuotas: number;
-  totalPrestamo?: number; // alias opcional
-  montoTotal?: number; // alias opcional
-  fechaInicio: string; // YYYY-MM-DD
+  totalPrestamo?: number;         // alias opcional
+  montoTotal?: number;            // alias opcional
+  fechaInicio: string;            // YYYY-MM-DD
   tz: string;
   operationalDate: string;
 
   /** Monto que sale de caja al crear el préstamo */
   retiroCaja: number;
 
-  /** Metadatos adicionales opcionales */
+  /** Metadatos adicionales opcionales (guardas modalidad/interés/etc.) */
   meta?: Record<string, any>;
+
+  // 🔐 scoping/metadatos que estás mandando desde la pantalla
+  source?: 'app' | 'outbox' | string;
+  tenantId?: string | null;
+  rutaId?: string | null;
+
+  /** Si tu worker crea también el movimiento de caja desde la venta */
+  alsoCajaDiaria?: boolean;
+  cajaPayload?: VentaCajaPayload;
 };
 
 export type NoPagoPayload = {
@@ -82,7 +122,7 @@ export type NoPagoPayload = {
   nota?: string;
   promesaFecha?: string; // YYYY-MM-DD
   promesaMonto?: number;
-  createdAtMs?: number; // opcional, por compat
+  createdAtMs?: number; // opcional, compat
 };
 
 /** ✅ Movimiento genérico offline (no asociado a un préstamo específico) */
@@ -231,24 +271,16 @@ function hasBlockingAbonoForCliente(list: OutboxItem[], clienteId: string): bool
   );
 }
 
-/* ============ Add helpers (con overloads) ============ */
+/* ============ Add helper: unión discriminada (sin overloads) ============ */
 
-// Overloads
-export async function addToOutbox(params: { kind: 'abono'; payload: AbonoPayload }): Promise<void>;
-export async function addToOutbox(params: { kind: 'venta'; payload: VentaPayload }): Promise<void>;
-export async function addToOutbox(params: { kind: 'no_pago'; payload: NoPagoPayload }): Promise<void>;
-export async function addToOutbox(params: { kind: 'mov'; payload: MovPayload }): Promise<void>;
-export async function addToOutbox(params: { kind: 'otro'; payload: any }): Promise<void>;
+export type AddToOutboxParams =
+  | { kind: 'abono'; payload: AbonoPayload }
+  | { kind: 'venta'; payload: VentaPayload }
+  | { kind: 'no_pago'; payload: NoPagoPayload }
+  | { kind: 'mov'; payload: MovPayload }
+  | { kind: 'otro'; payload: any };
 
-// Implementación
-export async function addToOutbox(
-  params:
-    | { kind: 'abono'; payload: AbonoPayload }
-    | { kind: 'venta'; payload: VentaPayload }
-    | { kind: 'no_pago'; payload: NoPagoPayload }
-    | { kind: 'mov'; payload: MovPayload }
-    | { kind: 'otro'; payload: any }
-): Promise<void> {
+export async function addToOutbox(params: AddToOutboxParams): Promise<void> {
   const base: OutboxBase = {
     id: genLocalId(),
     createdAtMs: Date.now(),
@@ -280,16 +312,24 @@ export async function addToOutbox(
     const list = await loadOutbox();
     list.push(full);
     await saveOutbox(list);
+
   } else if (params.kind === 'venta') {
-    const clienteNombreNorm = params.payload?.clienteNombre ?? undefined;
+    const p = params.payload;
+    const clienteNombreNorm = p?.clienteNombre ?? undefined;
+
+    // ⚠️ Asegurar admin en cajaPayload si viene
+    const cajaPayload =
+      p.cajaPayload ? { ...p.cajaPayload, admin: p.cajaPayload.admin ?? p.admin } : undefined;
+
     full = {
       ...base,
       kind: 'venta',
-      payload: { ...params.payload, clienteNombre: clienteNombreNorm },
+      payload: { ...p, clienteNombre: clienteNombreNorm, ...(cajaPayload ? { cajaPayload } : {}) },
     };
     const list = await loadOutbox();
     list.push(full);
     await saveOutbox(list);
+
   } else if (params.kind === 'no_pago') {
     full = {
       ...base,
@@ -299,6 +339,7 @@ export async function addToOutbox(
     const list = await loadOutbox();
     list.push(full);
     await saveOutbox(list);
+
   } else if (params.kind === 'mov') {
     const sk = params.payload.subkind;
     if (!['ingreso', 'retiro', 'gasto_admin', 'gasto_cobrador'].includes(sk)) {
@@ -308,6 +349,7 @@ export async function addToOutbox(
     const list = await loadOutbox();
     list.push(full);
     await saveOutbox(list);
+
   } else {
     full = {
       ...base,
@@ -351,7 +393,7 @@ export function subscribeCount(cb: (n: number) => void): () => void {
   const fire = async () => {
     if (!alive) return;
     const list = await listOutbox(); // usa mirror si ya cargó
-    cb(list.length); // mantenemos semántica original: total en outbox (pendientes+errores+processing)
+    cb(list.length); // mantenemos semántica original
   };
 
   // suscribimos al emisor interno
@@ -609,7 +651,7 @@ async function reenviarVenta(item: OutboxVenta): Promise<void> {
     if (exists.exists()) return false as const;
 
     const payloadPrestamo: any = {
-      creadoPor: admin,
+      creadoPor: admin,                // 👈 authAdminId
       clienteId,
       concepto: (clienteNombre || '').trim() || 'Sin nombre',
       valorCuota: Number(valorCuota),
@@ -639,7 +681,7 @@ async function reenviarVenta(item: OutboxVenta): Promise<void> {
       admin,
       {
         tipo: 'retiro',
-        admin,
+        admin,                           // 👈 authAdminId
         monto: Number(retiroCaja || total),
         operationalDate,
         tz,

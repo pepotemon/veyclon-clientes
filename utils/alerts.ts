@@ -26,6 +26,7 @@ function baseColors(kind: 'vence' | 'atraso' | 'adelantado' | 'aldia'): BadgeCol
 
 /** ===== Helpers de fecha ===== */
 function toYMDInTZ(d: Date, tz: string) {
+  // en-CA => YYYY-MM-DD
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: tz,
     year: 'numeric',
@@ -33,18 +34,29 @@ function toYMDInTZ(d: Date, tz: string) {
     day: '2-digit',
   }).format(d);
 }
+
 function anyToYMD(input: any, tz: string): string | null {
   if (!input) return null;
+
+  // strings ya normalizadas o aproximables
   if (typeof input === 'string') {
     const n = normYYYYMMDD(input);
     return n || null;
   }
+
+  // epoch ms
   if (typeof input === 'number') return toYMDInTZ(new Date(input), tz);
+
+  // Timestamp Firestore
   if (typeof input?.toDate === 'function') return toYMDInTZ(input.toDate(), tz);
   if (typeof input?.seconds === 'number') return toYMDInTZ(new Date(input.seconds * 1000), tz);
+
+  // Date nativa
   if (input instanceof Date) return toYMDInTZ(input, tz);
+
   return null;
 }
+
 function ymdAdd(ymd: string, days: number) {
   const [Y, M, D] = ymd.split('-').map((n) => parseInt(n, 10));
   const dt = new Date(Date.UTC(Y, M - 1, D));
@@ -96,14 +108,23 @@ function huboAbonoHoy(prestamo: any, hoy: string) {
 
   if (viaArray) return true;
 
-  // 2) Nuevo: marca en el doc (cuando el abono viene por subcolección/outbox)
-  const tz = pickTZ(prestamo?.tz);
-  const last = anyToYMD(prestamo?.lastAbonoAt, tz);
-  return last === hoy;
+  const tz = pickTZ(prestamo?.tz, 'America/Sao_Paulo');
+
+  // 2) Nuevo: marca directa en el doc
+  const lastDirect =
+    (prestamo?.lastAbonoOperationalDate && normYYYYMMDD(prestamo.lastAbonoOperationalDate)) ||
+    anyToYMD(prestamo?.lastAbonoAt, tz);
+  if (lastDirect === hoy) return true;
+
+  // 3) Meta agregada (si la mantienes con un job/outbox)
+  const metaOp = normYYYYMMDD(prestamo?.abonosMeta?.lastOpDate);
+  if (metaOp === hoy) return true;
+
+  return false;
 }
 
 function calcAtraso(prestamo: any, modo: 'porCuota' | 'porPresencia') {
-  const tz = pickTZ(prestamo?.tz);
+  const tz = pickTZ(prestamo?.tz, 'America/Sao_Paulo');
   const hoy = todayInTZ(tz);
 
   // Pago de hoy (robusto)
@@ -137,8 +158,10 @@ function calcAtraso(prestamo: any, modo: 'porCuota' | 'porPresencia') {
     diasHabiles:
       Array.isArray(prestamo?.diasHabiles) && prestamo.diasHabiles.length
         ? prestamo.diasHabiles
-        : [1, 2, 3, 4, 5, 6],
-    feriados: Array.isArray(prestamo?.feriados) ? prestamo.feriados : [],
+        : [1, 2, 3, 4, 5, 6], // L-S
+    feriados: Array.isArray(prestamo?.feriados)
+      ? prestamo.feriados.map((f: any) => normYYYYMMDD(f)).filter(Boolean)
+      : [],
     pausas: Array.isArray(prestamo?.pausas) ? prestamo.pausas : [],
     modo,
     permitirAdelantar: !!prestamo?.permitirAdelantar,
@@ -176,29 +199,35 @@ function computeQuotaProgress(prestamo: any) {
   let esperadas = countExpectedWorkdays(start, hoy, diasHabiles, feriados, pausas);
   if (totalPlan > 0) esperadas = Math.min(esperadas, totalPlan);
 
-  // ---- Cuotas pagadas (robusto a subcolección) ----
+  // ---- Cuotas pagadas (robusto a subcolección y agregados) ----
   const EPS = 0.009;
   let cuotasPagadas = 0;
 
-  // 1) Agregado directo
+  // 0) Si viene agregado, úsalo
   if (Number.isFinite(prestamo?.cuotasPagadas)) {
     cuotasPagadas = Math.max(0, Math.floor(Number(prestamo.cuotasPagadas)));
   } else {
-    // 2) Derivar de restante vs total (si ambos están)
-    const total = Number(prestamo?.totalPrestamo ?? prestamo?.montoTotal ?? 0);
-    const rest = Number(prestamo?.restante);
-    if (valorCuota > 0 && Number.isFinite(total) && Number.isFinite(rest) && total >= rest) {
-      const pagado = total - rest;
-      cuotasPagadas = Math.floor((pagado + EPS) / valorCuota);
+    // 1) Si mantienes agregado de total pagado (ej: abonosMeta.pagadoHastaHoy)
+    const agregadoPagado = Number(prestamo?.abonosMeta?.pagadoHastaHoy);
+    if (valorCuota > 0 && Number.isFinite(agregadoPagado) && agregadoPagado >= 0) {
+      cuotasPagadas = Math.floor((agregadoPagado + EPS) / valorCuota);
     } else {
-      // 3) Fallback: sumar abonos embebidos hasta hoy
-      let pagado = 0;
-      const abonos: any[] = Array.isArray(prestamo?.abonos) ? prestamo.abonos : [];
-      for (const a of abonos) {
-        const dia = a?.operationalDate ?? normYYYYMMDD(a?.fecha);
-        if (dia && dia <= hoy) pagado += Number(a?.monto || 0);
+      // 2) Derivar de restante vs total (si ambos están)
+      const total = Number(prestamo?.totalPrestamo ?? prestamo?.montoTotal ?? 0);
+      const rest = Number(prestamo?.restante);
+      if (valorCuota > 0 && Number.isFinite(total) && Number.isFinite(rest) && total >= rest) {
+        const pagado = total - rest;
+        cuotasPagadas = Math.floor((pagado + EPS) / valorCuota);
+      } else {
+        // 3) Fallback: sumar abonos embebidos hasta hoy
+        let pagado = 0;
+        const abonos: any[] = Array.isArray(prestamo?.abonos) ? prestamo.abonos : [];
+        for (const a of abonos) {
+          const dia = a?.operationalDate ?? normYYYYMMDD(a?.fecha);
+          if (dia && dia <= hoy) pagado += Number(a?.monto || 0);
+        }
+        cuotasPagadas = valorCuota > 0 ? Math.floor((pagado + EPS) / valorCuota) : 0;
       }
-      cuotasPagadas = valorCuota > 0 ? Math.floor((pagado + EPS) / valorCuota) : 0;
     }
   }
 
