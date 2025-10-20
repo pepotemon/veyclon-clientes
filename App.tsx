@@ -1,7 +1,7 @@
 // App.tsx
 import 'react-native-gesture-handler';
-import React, { useEffect } from 'react';
-import { StatusBar, Text, AppState } from 'react-native';
+import React, { useEffect, useRef } from 'react';
+import { StatusBar, Text, AppState, AppStateStatus } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -58,7 +58,7 @@ import { processOutboxBatch } from './utils/outbox';
 // 👉 WATCHER de caja (auto cierre/apertura y live update)
 import { onSnapshot, query, where, collection } from 'firebase/firestore';
 import { db } from './firebase/firebaseConfig';
-import { getSessionUser, DECOY_FLAG } from './utils/session';
+import { getSessionUser, DECOY_FLAG, logoutAndGoToDecoy } from './utils/session';
 import { pickTZ, todayInTZ } from './utils/timezone';
 import {
   updateCajaEstadoLive,
@@ -389,10 +389,39 @@ export default function App() {
     };
   }, []);
 
+  // ⛔️ Watcher GLOBAL de inactividad en segundo plano (aplica a TODAS las pantallas)
+  const idleMs = 180000; // 3 minutos
+  const lastBgAtRef = useRef<number | null>(null);
+  const stateRef = useRef<AppStateStatus>(AppState.currentState);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', async (next) => {
+      const prev = stateRef.current;
+      stateRef.current = next;
+
+      if (next === 'background' || next === 'inactive') {
+        lastBgAtRef.current = Date.now();
+      }
+
+      if (next === 'active') {
+        const bgAt = lastBgAtRef.current;
+        if (bgAt && Date.now() - bgAt >= idleMs) {
+          try {
+            await logoutAndGoToDecoy('global-background-idle');
+          } catch {}
+        }
+      }
+    });
+
+    return () => {
+      try { sub.remove(); } catch {}
+    };
+  }, [idleMs]);
+
   return (
     <SafeAreaProvider /* @ts-ignore */ style={{ backgroundColor: '#0000' }}>
       <ThemeProvider>
-        {/* ⬇️ NUEVO: cierre de sesión por inactividad global (3 min) */}
+        {/* ⬇️ Cierre de sesión por inactividad dentro de la app (taps/gestos) */}
         <InactivityGate idleMs={180000}>
           <AppNavigator />
         </InactivityGate>
