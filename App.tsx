@@ -1,6 +1,6 @@
 // App.tsx
 import 'react-native-gesture-handler';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect } from 'react';
 import { StatusBar, Text, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NavigationContainer } from '@react-navigation/native';
@@ -58,7 +58,7 @@ import { processOutboxBatch } from './utils/outbox';
 // 👉 WATCHER de caja (auto cierre/apertura y live update)
 import { onSnapshot, query, where, collection } from 'firebase/firestore';
 import { db } from './firebase/firebaseConfig';
-import { getSessionUser } from './utils/session';
+import { getSessionUser, DECOY_FLAG } from './utils/session';
 import { pickTZ, todayInTZ } from './utils/timezone';
 import {
   updateCajaEstadoLive,
@@ -70,6 +70,9 @@ import {
 // 👇 NUEVO: ref de navegación + gate de inactividad
 import { navigationRef } from './navigation/navigationRef';
 import InactivityGate from './security/InactivityGate';
+
+// 🔐 Auth para detectar arranque “en frío”
+import { auth } from './firebase/firebaseConfig';
 
 // Tipado de navegación
 export type RootStackParamList = {
@@ -154,38 +157,8 @@ function AppNavigator() {
   const { navigationTheme, isDark } = useAppTheme();
   const bg = navigationTheme.colors.background;
 
-  // 🚦 Arranque dinámico: si hay sesión → Home; si no → Señuelo
-  const [bootReady, setBootReady] = useState(false);
-  const [initialRoute, setInitialRoute] = useState<keyof RootStackParamList>('DecoyRetro');
-  const [initialAdmin, setInitialAdmin] = useState<string | undefined>(undefined);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const admin = await getSessionUser();
-        if (admin) {
-          setInitialAdmin(admin);
-          setInitialRoute('Home');
-        } else {
-          setInitialAdmin(undefined);
-          setInitialRoute('DecoyRetro');
-        }
-      } catch {
-        setInitialAdmin(undefined);
-        setInitialRoute('DecoyRetro');
-      } finally {
-        setBootReady(true);
-      }
-    })();
-  }, []);
-
-  if (!bootReady) return null;
-
   return (
-    <NavigationContainer
-      theme={navigationTheme}
-      ref={navigationRef}
-    >
+    <NavigationContainer theme={navigationTheme} ref={navigationRef}>
       {/* StatusBar sin animación y con color de fondo real */}
       <StatusBar
         barStyle={isDark ? 'light-content' : 'dark-content'}
@@ -195,7 +168,7 @@ function AppNavigator() {
       />
 
       <Stack.Navigator
-        initialRouteName={initialRoute}
+        initialRouteName="Login" // ✅ Login es la ruta inicial real
         screenOptions={{
           animation: 'none',
           gestureEnabled: false,
@@ -225,12 +198,7 @@ function AppNavigator() {
 
         {/* Frecuentes */}
         <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
-        <Stack.Screen
-          name="Home"
-          component={HomeScreen}
-          // Pasamos admin si había sesión para que Home cargue sin parpadeo
-          initialParams={initialAdmin ? { admin: initialAdmin } : undefined}
-        />
+        <Stack.Screen name="Home" component={HomeScreen} />
         <Stack.Screen name="NuevoCliente" component={NuevoClienteScreen} />
         <Stack.Screen name="NuevoPrestamo" component={NuevoPrestamoScreen} />
         <Stack.Screen name="PagosDiarios" component={PagosDiariosScreen} />
@@ -275,6 +243,24 @@ function AppNavigator() {
 }
 
 export default function App() {
+  // 🧼 ARRANQUE EN FRÍO: si Firebase NO tiene usuario (con inMemoryPersistence siempre será así),
+  // limpiamos cualquier sesión previa almacenada por la app y forzamos el señuelo.
+  useEffect(() => {
+    (async () => {
+      try {
+        if (!auth.currentUser) {
+          await AsyncStorage.multiRemove([
+            '@veyclon/session',
+            '@veyclon/admin',
+            'usuarioSesion',
+            'usuarioPerfil',
+          ]);
+          await AsyncStorage.setItem(DECOY_FLAG, '1'); // para que se muestre el señuelo antes del login
+        }
+      } catch {}
+    })();
+  }, []);
+
   // 🔧 Limpieza única de claves legadas que podían forzar "Ruta1"
   useEffect(() => {
     (async () => {

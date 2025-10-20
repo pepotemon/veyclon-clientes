@@ -1,7 +1,12 @@
 // firebase/firebaseConfig.ts
 import { Platform } from 'react-native';
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
+import {
+  getAuth,
+  initializeAuth,
+  inMemoryPersistence,
+  type Auth,
+} from 'firebase/auth';
 import {
   getFirestore,
   initializeFirestore,
@@ -22,13 +27,18 @@ const firebaseConfig = {
 // Evita “Firebase App named '[DEFAULT]' already exists” con HMR
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
-// ---------- Auth ----------
-// Usamos getAuth (sin persistencia RN explícita) para evitar errores de tipos.
-// Si en el futuro actualizas el SDK y quieres persistencia en RN:
-//   import { initializeAuth, getReactNativePersistence } from 'firebase/auth'
-//   import AsyncStorage from '@react-native-async-storage/async-storage'
-//   const auth = initializeAuth(app, { persistence: getReactNativePersistence(AsyncStorage) })
-const auth = getAuth(app);
+// ---------- Auth (SIN persistencia al cerrar la app) ----------
+let auth: Auth;
+try {
+  // En React Native usamos persistencia EN MEMORIA para que
+  // al cerrar la app la sesión NO quede guardada.
+  auth = initializeAuth(app, {
+    persistence: inMemoryPersistence,
+  });
+} catch {
+  // Si ya fue inicializado (por HMR), obtenlo
+  auth = getAuth(app);
+}
 
 // ---------- Firestore ----------
 let db: Firestore;
@@ -39,7 +49,7 @@ if (Platform.OS !== 'web') {
     db = initializeFirestore(app, {
       ignoreUndefinedProperties: true,
       experimentalAutoDetectLongPolling: true,
-      // experimentalForceLongPolling: true, // <- si tu red es muy restrictiva, puedes descomentar esta línea
+      // experimentalForceLongPolling: true, // <- si tu red es muy restrictiva, habilítalo
     });
   } catch {
     // Si ya fue inicializado (HMR), cae aquí
