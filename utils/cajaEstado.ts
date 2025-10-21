@@ -301,8 +301,8 @@ async function computeCajaFinalForDay(
   ymd: string,
   tenantId?: string | null,
 ) {
-  // kpisDelDia debe usar admin (authAdminId). Si soporta tenantId, pásalo aquí.
-  const k = await kpisDelDia(admin, ymd /* , tenantId */);
+  // ⬇️ IMPORTANTE: pasar tenantId si aplica multi-tenant
+  const k = await kpisDelDia(admin, ymd, tenantId);
 
   // Detectar si existió un documento de apertura (aunque el monto sea 0)
   const huboApertura = await existsApertura(admin, ymd, tenantId);
@@ -428,8 +428,8 @@ export async function closeMissingDays(
   missing.reverse();
 
   for (const ymd of missing) {
-    // KPIs del día (filtra por admin internamente). Si kpisDelDia soporta tenantId, pásalo.
-    const k = await kpisDelDia(admin, ymd /* , tenantId */);
+    // ⬇️ IMPORTANTE: pasar tenantId
+    const k = await kpisDelDia(admin, ymd, tenantId);
 
     // Caja inicial derivada SIEMPRE (apertura si existe; si no, cierre heredado)
     const huboApertura = await existsApertura(admin, ymd, tenantId);

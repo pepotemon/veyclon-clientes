@@ -158,17 +158,28 @@ export function sumarKpis(rows: RowCaja[]): KpisDia {
   };
 }
 
-/** Azúcar: KPIs del día leyendo y sumando (con scoping opcional). */
+/** Azúcar: KPIs del día leyendo y sumando.
+ *  ⚠️ Compat: acepta `opts` (ScopeOpts) o directamente `tenantId` como string/null.
+ */
 export async function kpisDelDia(
   admin: string,
   ymd: string,
-  opts?: ScopeOpts
+  optsOrTenant?: ScopeOpts | string | null
 ): Promise<KpisDia> {
+  let opts: ScopeOpts | undefined;
+  if (typeof optsOrTenant === 'string' || optsOrTenant === null) {
+    opts = { tenantId: optsOrTenant ?? null };
+  } else {
+    opts = optsOrTenant;
+  }
   const rows = await leerMovsDelDia(admin, ymd, opts);
   return sumarKpis(rows);
 }
 
-/** Deriva cajaFinal usando sólo KPIs y una base inicial (apertura>0 o cierre de ayer). */
+/** Deriva cajaFinal usando sólo KPIs y una base inicial (apertura>0 o cierre de ayer).
+ *  🛡️ Política actual: SÓLO restamos gastos del ADMIN en la caja.
+ *  Los `gastosCobrador` se reportan en KPIs pero **no** afectan la caja final.
+ */
 export function cajaFinalConBase(baseInicial: number, k: KpisDia): number {
   const val =
     baseInicial +
@@ -176,8 +187,7 @@ export function cajaFinalConBase(baseInicial: number, k: KpisDia): number {
     k.cobrado -
     k.retiros -
     k.prestamos -
-    k.gastosAdmin -
-    k.gastosCobrador;
+    k.gastosAdmin;   // 👈 NO restamos k.gastosCobrador
 
   return round2(val);
 }
