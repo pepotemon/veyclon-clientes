@@ -1,17 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, Keyboard,
-  Platform, KeyboardAvoidingView, Pressable, Linking, ActivityIndicator, BackHandler,
+  Platform, KeyboardAvoidingView, Pressable, Linking, ActivityIndicator,
 } from 'react-native';
 import {
-  doc, collection, addDoc, deleteDoc, runTransaction, serverTimestamp,
-  updateDoc, getDoc, DocumentReference, getDocs, writeBatch,
+  doc, collection, addDoc, serverTimestamp, getDoc,
 } from 'firebase/firestore';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { db } from '../firebase/firebaseConfig';
 import { todayInTZ, pickTZ } from '../utils/timezone';
-import { calcularDiasAtraso } from '../utils/atrasoHelper';
-import { logAudit, pick } from '../utils/auditLogs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { addToOutbox } from '../utils/outbox';
 // 🔐 contexto de auth (tenant/rol/ruta/admin)
@@ -64,18 +61,20 @@ function buildReceiptPT(opts: {
   nombre: string;
   montoPagado: number;
   fecha: string;
-  saldoRestante: number;
+  saldoRestante?: number;
   linhaParcela?: string;
 }) {
   const nombre = opts.nombre || 'cliente';
-  return [
+  const base = [
     `Olá ${nombre} 👋`,
     `Recebemos seu pagamento de R$ ${opts.montoPagado.toFixed(2)}.`,
-    ...(opts.linhaParcela ? [opts.linhaParcela] : []),
-    `Data: ${opts.fecha}`,
-    `Saldo restante: R$ ${opts.saldoRestante.toFixed(2)}.`,
-    `Obrigado!`,
-  ].join('\n');
+  ];
+  if (opts.linhaParcela) base.push(opts.linhaParcela);
+  base.push(`Data: ${opts.fecha}`);
+  if (typeof opts.saldoRestante === 'number')
+    base.push(`Saldo restante: R$ ${opts.saldoRestante.toFixed(2)}.`);
+  base.push(`Obrigado!`);
+  return base.join('\n');
 }
 
 // 🔸 helper: construye la “linhaParcela” correcta (completa o parcial)
@@ -162,18 +161,8 @@ export default function ModalRegistroPago({
   const mountedRef = useRef(false);
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
 
-  // 🚫 Bloquear botón atrás mientras procesa (Android)
-  useEffect(() => {
-    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (!visible) return false;
-      if (loading || loadingCuota) {
-        Alert.alert('Espera', 'Estamos procesando el pago. Por favor, no cierres todavía.');
-        return true; // bloquear
-      }
-      return false;
-    });
-    return () => sub.remove();
-  }, [visible, loading, loadingCuota]);
+  // ❌ quitamos el BackHandler/alerta de “no cierres”
+  // (Ya no bloqueamos el cierre del modal durante el proceso)
 
   const [contentReady, setContentReady] = useState(false);
   useEffect(() => {
@@ -247,7 +236,7 @@ export default function ModalRegistroPago({
         }
       }
 
-      // Lectura fresca
+      // Lectura fresca (ligera)
       try {
         const ref = doc(db, 'clientes', clienteId, 'prestamos', prestamoId);
         const snap = await getDoc(ref);
@@ -330,12 +319,8 @@ export default function ModalRegistroPago({
     ]);
   };
 
-  // 🚪 Cierre seguro: bloquea si está procesando
+  // 🚪 Cierre simple (sin bloquear ni mostrar mensajes)
   const safeClose = () => {
-    if (loading || loadingCuota) {
-      Alert.alert('Espera', 'Estamos procesando el pago. Por favor, no cierres todavía.');
-      return;
-    }
     onClose();
   };
 
@@ -357,326 +342,87 @@ export default function ModalRegistroPago({
     // Optimista inmediato
     onSuccess?.({ clienteId, prestamoId, monto: montoNum, optimistic: true });
 
-    // ⚠️ NO cerrar aquí: primero marcamos loading, hacemos transacción y luego cerramos.
     setLoading(true);
     Keyboard.dismiss();
 
     const prestamoRef = doc(db, 'clientes', clienteId, 'prestamos', prestamoId);
-    const abonoRef: DocumentReference = doc(collection(prestamoRef, 'abonos'));
 
     try {
-      // ====================== HOT PATH: TRANSACCIÓN ======================
-      const txResult = await runTransaction(db, async (tx) => {
-        const snap = await tx.get(prestamoRef);
-        if (!snap.exists()) throw new Error('El préstamo no existe.');
+      // 🔎 Lectura ligera para tz (no hacemos cálculos aquí, la CF lo hace)
+      const pSnap = await getDoc(prestamoRef);
+      const data = (pSnap.exists() ? (pSnap.data() as any) : {}) || {};
+      const tz = pickTZ(data?.tz);
+      const operativoHoy = todayInTZ(tz);
 
-        const data = snap.data() as any;
-        const tz = pickTZ(data?.tz);
-        const operativoHoy = todayInTZ(tz);
+      const abonosColRef = collection(prestamoRef, 'abonos');
 
-        const restanteActual =
-          typeof data.restante === 'number'
-            ? Number(data.restante)
-            : Number(data.montoTotal || data.totalPrestamo || 0);
+      const nuevoAbono = {
+        monto: Number(montoNum.toFixed(2)),
+        registradoPor: authAdminId,
+        tz,
+        operationalDate: operativoHoy,
+        createdAtMs: Date.now(),
+        createdAt: serverTimestamp(),
+        source: 'app',
+        // 🔐 scoping
+        tenantId: ctx?.tenantId ?? null,
+        rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
+      };
 
-        const valorCuotaTx = Number(data?.valorCuota || 0);
-        const cuotasTotalesTx =
-          Number(data?.cuotasTotales || data?.cuotas || 0) ||
-          Math.ceil(
-            Number(data.totalPrestamo || data.montoTotal || 0) /
-              (valorCuotaTx || 1)
-          ) ||
-          0;
+      // ✅ Modo lite: solo crear abono — el backend hará el resto
+      await addDoc(abonosColRef, nuevoAbono);
 
-        const prevCuotasPagadas =
-          typeof data?.cuotasPagadas === 'number'
-            ? Number(data.cuotasPagadas)
-            : valorCuotaTx > 0
-              ? Math.floor(
-                  (Number(data.totalPrestamo || data.montoTotal || 0) -
-                    restanteActual) /
-                    valorCuotaTx
-                )
-              : 0;
+      // Ajuste optimista de saldo local/cache para evitar parpadeos
+      if (prestamoId) {
+        const previo = quotaCache[prestamoId] || { cuota: Number(valorCuota || 0), saldo: Number(saldoPendiente || 0) };
+        const nuevoSaldo = Math.max(0, Number(previo.saldo || lastKnownRef.current.saldo || 0) - montoNum);
+        quotaCache[prestamoId] = { cuota: previo.cuota, saldo: nuevoSaldo };
+        lastKnownRef.current = { cuota: previo.cuota, saldo: nuevoSaldo };
+      }
 
-        const nowMs = Date.now();
-        const nuevoAbono = {
-          monto: Number(montoNum.toFixed(2)),
-          registradoPor: authAdminId, // 👈 unificado
-          tz,
-          operationalDate: operativoHoy,
-          createdAtMs: nowMs,
-          createdAt: serverTimestamp(),
-          source: 'app',
-          // 🔐 scoping
-          tenantId: ctx?.tenantId ?? null,
-          rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-        };
-
-        // 1) Abono (subcolección)
-        tx.set(abonoRef, nuevoAbono);
-
-        // 2) Agregados del préstamo (clamp a 0)
-        const nuevoRestante = Math.max(restanteActual - montoNum, 0);
-        const deltaCuotas = valorCuotaTx > 0 ? Math.floor(montoNum / valorCuotaTx) : 0;
-
-        const maxCuotas = cuotasTotalesTx > 0 ? cuotasTotalesTx : Number.MAX_SAFE_INTEGER;
-        const nuevasCuotasPagadas = Math.max(
-          0,
-          Math.min(prevCuotasPagadas + deltaCuotas, maxCuotas)
-        );
-
-        tx.update(prestamoRef, {
-          restante: nuevoRestante,
-          cuotasPagadas: nuevasCuotasPagadas,
-          lastAbonoAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-
-        return {
-          prestamoBefore: pick(data, [
-            'restante',
-            'valorCuota',
-            'totalPrestamo',
-            'clienteId',
-            'concepto',
-            'cuotasPagadas',
-            'cuotas',
-            'cuotasTotales',
-          ]),
-          nuevoRestante,
-          valorCuotaTx,
-          cuotasTotalesTx,
-          nuevasCuotasPagadas,
-          abonoNuevo: nuevoAbono,
-          tz,
-          operativoHoy,
-        };
-      });
-
-      // UI libre + notificación final
-      if (mountedRef.current) setMonto('');
-      if (mountedRef.current) setLoading(false);
-      submittingRef.current = false;
-
+      // Notificación a padre
       onSuccess?.({
         clienteId: clienteId!,
         prestamoId: prestamoId!,
         monto: montoNum,
-        restanteNuevo: txResult.nuevoRestante,
+        restanteNuevo: Math.max(0, (lastKnownRef.current.saldo || 0)),
         optimistic: false,
       });
 
-      // ====================== RECIBO (no bloquea la UI) ======================
+      // 🧾 Recibo (no bloquea UI) — saldo estimado local ya actualizado
       if (prefConfirmReceipt && !hasOpenedWhatsRef.current) {
         const totalAprox =
-          Number((txResult as any).prestamoBefore?.totalPrestamo) ||
-          (txResult.cuotasTotalesTx > 0 && txResult.valorCuotaTx > 0
-            ? txResult.cuotasTotalesTx * txResult.valorCuotaTx
+          Number(data?.totalPrestamo) ||
+          (Number(data?.cuotasTotales || data?.cuotas || 0) > 0 && Number(data?.valorCuota || 0) > 0
+            ? Number(data?.cuotasTotales || data?.cuotas || 0) * Number(data?.valorCuota || 0)
             : 0);
 
+        const restanteEst = lastKnownRef.current.saldo; // ← ya actualizado arriba
+
         const linhaParcela = makeLinhaParcela({
-          valorCuota: txResult.valorCuotaTx,
-          cuotasTotales: txResult.cuotasTotalesTx,
-          restanteNuevo: txResult.nuevoRestante,
+          valorCuota: Number(data?.valorCuota || valorCuota || 0),
+          cuotasTotales: Number(data?.cuotasTotales || data?.cuotas || 0),
+          restanteNuevo: restanteEst,
           totalPrestamoAprox: totalAprox,
         });
 
         const texto = buildReceiptPT({
           nombre: clienteNombre || 'Cliente',
           montoPagado: montoNum,
-          fecha: txResult.operativoHoy,
-          saldoRestante: txResult.nuevoRestante || 0,
+          fecha: operativoHoy,
+          saldoRestante: restanteEst,
           linhaParcela,
         });
+
         hasOpenedWhatsRef.current = true;
         setTimeout(() => void openWhats(texto), 0);
       }
 
-      // ✅ Cerrar modal recién ahora, tras transacción
+      // ✅ Cerrar modal al final (online)
       if (mountedRef.current) onClose();
 
-      // ====================== PESADO → BACKGROUND ======================
-      setTimeout(async () => {
-        try {
-          // Caja (idempotente)
-          const batch = writeBatch(db);
-          const cajaId = `pay_${(abonoRef as any).id}`;
-          const cajaRef = doc(collection(db, 'cajaDiaria'), cajaId);
-          batch.set(cajaRef, {
-            tipo: 'abono' as const,
-            admin: authAdminId,                 // 👈 unificado
-            clienteId: clienteId!,
-            prestamoId: prestamoId!,
-            clienteNombre: clienteNombre || 'Cliente',
-            monto: Number(montoNum.toFixed(2)),
-            tz: txResult.tz,
-            operationalDate: txResult.operativoHoy,
-            createdAtMs: Date.now(),
-            createdAt: serverTimestamp(),
-            source: 'app',
-            meta: { abonoRefId: (abonoRef as any).id },
-            // 🔐 scoping para que aparezca en CajaDiaria
-            tenantId: ctx?.tenantId ?? null,
-            rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-          });
-          await batch.commit();
-
-          void logAudit({
-            userId: authAdminId, // 👈 unificado
-            action: 'create',
-            docPath: cajaRef.path,
-            after: {
-              tipo: 'abono',
-              admin: authAdminId,
-              clienteId,
-              prestamoId,
-              monto: Number(montoNum.toFixed(2)),
-              operationalDate: txResult.operativoHoy,
-              tenantId: ctx?.tenantId ?? null,
-              rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-            },
-          });
-        } catch (e) {
-          console.warn('[BG] cajaDiaria fallo:', e);
-        }
-
-        try {
-          // Audit abono
-          void logAudit({
-            userId: authAdminId, // 👈 unificado
-            action: 'create',
-            docPath: (abonoRef as any).path,
-            after: pick(txResult.abonoNuevo, ['monto', 'operationalDate', 'tz', 'tenantId', 'rutaId']),
-          });
-        } catch {}
-
-        try {
-          // Recalc atraso (pesado)
-          const prestamoRef2 = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
-          const pSnap = await getDoc(prestamoRef2);
-          if (pSnap.exists()) {
-            const p = pSnap.data() as any;
-
-            const abonosSnap = await getDocs(collection(prestamoRef2, 'abonos'));
-            const abonos = abonosSnap.docs.map((d) => {
-              const a = d.data() as any;
-              return {
-                monto: Number(a?.monto) || 0,
-                operationalDate: a?.operationalDate,
-                fecha: a?.fecha,
-              };
-            });
-
-            const tzDoc = pickTZ(p?.tz);
-            const hoy = p?.operationalDate || todayInTZ(tzDoc);
-            const diasHabiles =
-              Array.isArray(p?.diasHabiles) && p.diasHabiles.length
-                ? p.diasHabiles
-                : [1, 2, 3, 4, 5, 6];
-            const feriados = Array.isArray(p?.feriados) ? p.feriados : [];
-            const pausas = Array.isArray(p?.pausas) ? p.pausas : [];
-            const modo =
-              (p?.modoAtraso as 'porPresencia' | 'porCuota') ?? 'porPresencia';
-            const permitirAdelantar = !!p?.permitirAdelantar;
-            const cuotas =
-              Number(p?.cuotasTotales || p?.cuotas || 0) ||
-              Math.ceil(
-                Number(p.totalPrestamo || p.montoTotal || 0) /
-                  (Number(p.valorCuota) || 1)
-              );
-
-            const res = calcularDiasAtraso({
-              fechaInicio: p?.fechaInicio || hoy,
-              hoy,
-              cuotas,
-              valorCuota: Number(p?.valorCuota || 0),
-              abonos,
-              diasHabiles,
-              feriados,
-              pausas,
-              modo,
-              permitirAdelantar,
-            });
-
-            await updateDoc(prestamoRef2, {
-              diasAtraso: res.atraso,
-              faltas: res.faltas || [],
-              ultimaReconciliacion: serverTimestamp(),
-            });
-
-            void logAudit({
-              userId: authAdminId, // 👈 unificado
-              action: 'update',
-              ref: prestamoRef2,
-              before: txResult.prestamoBefore,
-              after: {
-                restante: txResult.nuevoRestante,
-                cuotasPagadas: txResult.nuevasCuotasPagadas,
-                diasAtraso: res.atraso,
-              },
-            });
-          }
-        } catch (e) {
-          console.warn('[BG] recalc atraso fallo:', e);
-        }
-
-        try {
-          // Cierre si saldo 0
-          if (txResult.nuevoRestante === 0) {
-            const prestamoRef2 = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
-            const snap = await getDoc(prestamoRef2);
-            const p = snap.exists() ? (snap.data() as any) : {};
-            const historialRef = collection(
-              db,
-              'clientes',
-              clienteId!,
-              'historialPrestamos'
-            );
-            const histRef = await addDoc(historialRef, {
-              ...p,
-              restante: 0,
-              diasAtraso: 0,
-              faltas: [],
-              finalizadoEn: serverTimestamp(),
-              finalizadoPor: authAdminId, // 👈 unificado
-            });
-            void logAudit({
-              userId: authAdminId,
-              action: 'create',
-              ref: histRef,
-              after: { clienteId, prestamoId, restante: 0, finalizadoPor: authAdminId },
-            });
-            await deleteDoc(prestamoRef2);
-            void logAudit({
-              userId: authAdminId,
-              action: 'delete',
-              ref: prestamoRef2,
-              before: txResult.prestamoBefore,
-              after: null,
-            });
-          }
-        } catch (e) {
-          console.warn('[BG] cierre a historial fallo:', e);
-        }
-
-        try {
-          // Refrescar cache local
-          if (prestamoId) {
-            quotaCache[prestamoId] = {
-              cuota: Number(lastKnownRef.current.cuota || txResult.valorCuotaTx || 0) || 0,
-              saldo: txResult.nuevoRestante || 0,
-            };
-            lastKnownRef.current = {
-              cuota: quotaCache[prestamoId].cuota,
-              saldo: quotaCache[prestamoId].saldo,
-            };
-          }
-        } catch {}
-      }, 0);
-
     } catch (error: any) {
-      // 🔌 Offline u otro fallo → OUTBOX
+      // 🔌 Offline u otro fallo → OUTBOX (el worker reenviará)
       try {
         const tz = pickTZ();
         const operationalDate = todayInTZ(tz);
@@ -685,7 +431,7 @@ export default function ModalRegistroPago({
           payload: {
             clienteId: clienteId!,
             prestamoId: prestamoId!,
-            admin: authAdminId!,                 // 👈 unificado
+            admin: authAdminId!,
             monto: Number(montoNum.toFixed(2)),
             tz,
             operationalDate,
@@ -694,16 +440,12 @@ export default function ModalRegistroPago({
             // 🔐 scoping
             tenantId: ctx?.tenantId ?? null,
             rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-            alsoCajaDiaria: true,
-            cajaPayload: {
-              tipo: 'abono',
-              // ❌ NO poner admin aquí: AbonoPayload.cajaPayload no lo define
-              clienteNombre,
-              tenantId: ctx?.tenantId ?? null,
-              rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-            },
           },
         });
+
+        // ✅ cerrar modal también en el camino offline
+        if (mountedRef.current) onClose();
+
         Alert.alert(
           'Sin conexión',
           'El pago se guardó en "Pendientes" y podrás reenviarlo cuando tengas internet.'

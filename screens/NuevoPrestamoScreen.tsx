@@ -215,7 +215,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       const concepto = String(cliente?.nombre ?? '').trim() || 'Sin nombre';
 
       // ========== OFFLINE: encolar venta ==========
-// (si tu worker crea ambos: préstamo y caja)
       if (!isOnline) {
         if (!existingClienteId) {
           Alert.alert(
@@ -227,42 +226,25 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         }
 
         try {
-         await addToOutbox({
-  kind: 'venta',
-  payload: {
-    admin: authAdminId,                // usa solo admin
-    clienteId: existingClienteId,
-    clienteNombre: concepto,
-    valorCuota: vCuota,
-    cuotas: cuotasNum,
-    totalPrestamo: total,              // o montoTotal, como prefieras
-    fechaInicio: fechaInicioOperativa, // 'YYYY-MM-DD'
-    tz: tzDoc,
-    operationalDate: hoyIso,
-    retiroCaja: valor,
-    meta: { modalidad: prestamo.modalidad, interesPct, valorNeto: valor },
-    // 🔐 scoping
-    tenantId: ctx?.tenantId ?? null,
-    rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-
-    alsoCajaDiaria: true,
-    cajaPayload: {
-      tipo: 'prestamo',
-      admin: authAdminId,              // requerido por VentaCajaPayload
-      clienteId: existingClienteId,
-      clienteNombre: concepto,
-      // el worker rellenará el id real:
-      prestamoId: '__to_be_filled_by_worker__',
-      monto: Number(valor),
-      tz: tzDoc,
-      operationalDate: hoyIso,
-      meta: { modalidad: prestamo.modalidad, interesPct },
-      tenantId: ctx?.tenantId ?? null,
-      rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-    },
-  },
-});
-
+          await addToOutbox({
+            kind: 'venta',
+            payload: {
+              admin: authAdminId,
+              clienteId: existingClienteId,
+              clienteNombre: concepto,
+              valorCuota: vCuota,
+              cuotas: cuotasNum,
+              totalPrestamo: total,
+              fechaInicio: fechaInicioOperativa, // 'YYYY-MM-DD'
+              tz: tzDoc,
+              operationalDate: hoyIso,
+              retiroCaja: valor,
+              meta: { modalidad: prestamo.modalidad, interesPct, valorNeto: valor },
+              // 🔐 scoping
+              tenantId: ctx?.tenantId ?? null,
+              rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
+            },
+          });
 
           Alert.alert(
             'Sin conexión',
@@ -280,7 +262,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       }
 
       // ========== ONLINE: batch ==========
-// (cliente + préstamo + caja + índice)
+      // (cliente + préstamo) — cajaDiaria y clientesDisponibles las maneja la Cloud Function
       const batch = writeBatch(db);
 
       // 1) Cliente
@@ -293,7 +275,6 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
           ...(cliente?.direccion1 ? { direccion1: cliente.direccion1 } : {}),
           ...(cliente?.telefono1 ? { telefono1: cliente.telefono1 } : {}),
           actualizadoEn: serverTimestamp(),
-          // opcional: scoping para clientes si lo usas
           tenantId: ctx?.tenantId ?? null,
         };
         batch.set(clienteRef, updatePayload, { merge: true });
@@ -308,7 +289,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         const clienteId = clienteRef.id;
         const createPayload = {
           ...cliente,
-          creadoPor: authAdminId,            // 👈 unificado
+          creadoPor: authAdminId, // 👈 unificado
           creadoEn: serverTimestamp(),
           id: clienteId,
           tenantId: ctx?.tenantId ?? null,
@@ -325,7 +306,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       // 2) Préstamo
       const prestamoRef = doc(collection(clienteRef, 'prestamos'));
       const prestamoPayload = {
-        creadoPor: authAdminId,              // 👈 unificado
+        creadoPor: authAdminId, // 👈 unificado
         creadoEn: serverTimestamp(),
         createdAtMs: Date.now(),
         createdDate: hoyIso,
@@ -336,7 +317,7 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
         clienteTelefono1: cliente?.telefono1 ?? '',
         concepto,
         modalidad: prestamo.modalidad,
-        interes: interesPct,                 // ✅ puede ser 0
+        interes: interesPct, // ✅ puede ser 0
         valorNeto: valor,
         totalPrestamo: total,
         montoTotal: total,
@@ -361,42 +342,8 @@ export default function NuevoPrestamoScreen({ route, navigation }: Props) {
       };
       batch.set(prestamoRef, prestamoPayload);
 
-      // 3) CajaDiaria (prestamo)
-      const cajaDocId = `loan_${prestamoRef.id}`;
-      const cajaRef = doc(collection(db, 'cajaDiaria'), cajaDocId);
-      const cajaPayload = {
-        tipo: 'prestamo' as const,
-        admin: authAdminId,                  // 👈 unificado
-        monto: Number(valor),
-        operationalDate: hoyIso,
-        tz: tzDoc,
-        clienteId: existingClienteId ?? clienteRef.id,
-        prestamoId: prestamoRef.id,
-        clienteNombre: concepto,
-        createdAt: serverTimestamp(),
-        createdAtMs: Date.now(),
-        meta: { modalidad: prestamo.modalidad, interesPct },
-        // 🔐 scoping de caja
-        tenantId: ctx?.tenantId ?? null,
-        rutaId: ctx?.role === 'collector' ? ctx?.rutaId ?? null : null,
-      };
-      batch.set(cajaRef, cajaPayload);
-
-      // 4) Índice clientesDisponibles
-      const idxRef = doc(db, 'clientesDisponibles', existingClienteId ?? clienteRef.id);
-      const idxPayload = {
-        id: existingClienteId ?? clienteRef.id,
-        disponible: false,
-        actualizadoEn: serverTimestamp(),
-        creadoPor: authAdminId,              // 👈 unificado
-        alias: cliente?.alias ?? '',
-        nombre: concepto,
-        barrio: cliente?.barrio ?? '',
-        telefono1: cliente?.telefono1 ?? '',
-        // opcional: scoping si lo filtras por tenant
-        tenantId: ctx?.tenantId ?? null,
-      };
-      batch.set(idxRef, idxPayload, { merge: true });
+      // ❌ Ya NO escribimos clientesDisponibles desde el cliente
+      // (lo actualiza onPrestamoCreated / ensureIndiceCliente en el backend)
 
       await batch.commit();
 

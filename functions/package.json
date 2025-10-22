@@ -1,0 +1,35 @@
+{
+  "name": "veyclon-functions",
+  "description": "Cloud Functions for Firebase",
+  "private": true,
+  "main": "lib/index.js",
+  "type": "module",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "clean": "rimraf lib",
+    "build": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "serve": "npm run build && firebase emulators:start --only functions,firestore",
+    "shell": "firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "npm run build && firebase deploy --only functions",
+    "logs": "firebase functions:log",
+    "lint": "eslint \"src/**/*.{ts,tsx}\""
+  },
+  "dependencies": {
+    "firebase-admin": "^12.6.0",
+    "firebase-functions": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@typescript-eslint/eslint-plugin": "^8.46.2",
+    "@typescript-eslint/parser": "^8.46.2",
+    "eslint": "^8.57.0",
+    "eslint-config-google": "^0.14.0",
+    "firebase-functions-test": "^3.1.0",
+    "rimraf": "^5.0.5",
+    "typescript": "^5.9.3"
+  }
+}
