@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, Keyboard,
-  Platform, KeyboardAvoidingView, Pressable, Linking, ActivityIndicator,
+  Platform, KeyboardAvoidingView, Pressable, Linking, ActivityIndicator, BackHandler,
 } from 'react-native';
 import {
   doc, collection, addDoc, deleteDoc, runTransaction, serverTimestamp,
@@ -158,6 +158,23 @@ export default function ModalRegistroPago({
   }, []);
   const authAdminId = ctx?.admin ?? null;
 
+  // 🔒 Evitar setState tras desmontaje
+  const mountedRef = useRef(false);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+
+  // 🚫 Bloquear botón atrás mientras procesa (Android)
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (!visible) return false;
+      if (loading || loadingCuota) {
+        Alert.alert('Espera', 'Estamos procesando el pago. Por favor, no cierres todavía.');
+        return true; // bloquear
+      }
+      return false;
+    });
+    return () => sub.remove();
+  }, [visible, loading, loadingCuota]);
+
   const [contentReady, setContentReady] = useState(false);
   useEffect(() => {
     if (visible) {
@@ -177,22 +194,24 @@ export default function ModalRegistroPago({
     const cargarInfo = async () => {
       if (!visible) return;
 
-      setMonto('');
-      setLoading(false);
-      setLoadingCuota(true);
+      if (mountedRef.current) {
+        setMonto('');
+        setLoading(false);
+        setLoadingCuota(true);
+      }
 
       const token = `${clienteId ?? ''}:${prestamoId ?? ''}:${Date.now()}`;
       requestTokenRef.current = token;
 
       try {
         const v = await AsyncStorage.getItem(KEY_SEND_RECEIPT_CONFIRM);
-        if (requestTokenRef.current === token) setPrefConfirmReceipt(v === '1');
+        if (requestTokenRef.current === token && mountedRef.current) setPrefConfirmReceipt(v === '1');
       } catch {
-        if (requestTokenRef.current === token) setPrefConfirmReceipt(false);
+        if (requestTokenRef.current === token && mountedRef.current) setPrefConfirmReceipt(false);
       }
 
       if (!clienteId || !prestamoId) {
-        if (requestTokenRef.current === token) setLoadingCuota(false);
+        if (requestTokenRef.current === token && mountedRef.current) setLoadingCuota(false);
         return;
       }
 
@@ -205,7 +224,7 @@ export default function ModalRegistroPago({
         const cuota = Number(prefetched.valorCuota ?? lastKnownRef.current.cuota) || 0;
         const saldo = Number(prefetched.saldoPendiente ?? lastKnownRef.current.saldo) || 0;
 
-        if (requestTokenRef.current === token) {
+        if (requestTokenRef.current === token && mountedRef.current) {
           setValorCuota(cuota);
           setSaldoPendiente(saldo);
           setLoadingCuota(false);
@@ -219,9 +238,10 @@ export default function ModalRegistroPago({
       if (!usedPrefetch) {
         const cacheHit = quotaCache[prestamoId];
         if (cacheHit) {
-          if (requestTokenRef.current === token) {
+          if (requestTokenRef.current === token && mountedRef.current) {
             setValorCuota(cacheHit.cuota);
             setSaldoPendiente(cacheHit.saldo);
+            setLoadingCuota(false);
           }
           lastKnownRef.current = { cuota: cacheHit.cuota, saldo: cacheHit.saldo };
         }
@@ -243,13 +263,13 @@ export default function ModalRegistroPago({
 
           const changed = cuota !== lastKnownRef.current.cuota || saldo !== lastKnownRef.current.saldo;
           quotaCache[prestamoId] = { cuota, saldo };
-          if (changed && requestTokenRef.current === token) {
+          if (changed && requestTokenRef.current === token && mountedRef.current) {
             setValorCuota(cuota);
             setSaldoPendiente(saldo);
           }
           lastKnownRef.current = { cuota, saldo };
         } else {
-          if (!usedPrefetch && requestTokenRef.current === token) {
+          if (!usedPrefetch && requestTokenRef.current === token && mountedRef.current) {
             setValorCuota(0);
             setSaldoPendiente(0);
             lastKnownRef.current = { cuota: 0, saldo: 0 };
@@ -258,14 +278,14 @@ export default function ModalRegistroPago({
       } catch {
         // silencioso
       } finally {
-        if (requestTokenRef.current === token) {
+        if (requestTokenRef.current === token && mountedRef.current) {
           setLoadingCuota(false);
         }
       }
     };
 
     void cargarInfo();
-    if (!visible) setMonto('');
+    if (!visible && mountedRef.current) setMonto('');
   }, [visible, clienteId, prestamoId, prefetched]);
 
   const parseMonto = (txt: string) => {
@@ -310,6 +330,15 @@ export default function ModalRegistroPago({
     ]);
   };
 
+  // 🚪 Cierre seguro: bloquea si está procesando
+  const safeClose = () => {
+    if (loading || loadingCuota) {
+      Alert.alert('Espera', 'Estamos procesando el pago. Por favor, no cierres todavía.');
+      return;
+    }
+    onClose();
+  };
+
   const registrarAbono = async (montoNum: number) => {
     if (!clienteId || !prestamoId) return;
     if (loading || loadingCuota) return;
@@ -328,7 +357,7 @@ export default function ModalRegistroPago({
     // Optimista inmediato
     onSuccess?.({ clienteId, prestamoId, monto: montoNum, optimistic: true });
 
-    onClose();
+    // ⚠️ NO cerrar aquí: primero marcamos loading, hacemos transacción y luego cerramos.
     setLoading(true);
     Keyboard.dismiss();
 
@@ -426,9 +455,10 @@ export default function ModalRegistroPago({
       });
 
       // UI libre + notificación final
-      setMonto('');
-      setLoading(false);
+      if (mountedRef.current) setMonto('');
+      if (mountedRef.current) setLoading(false);
       submittingRef.current = false;
+
       onSuccess?.({
         clienteId: clienteId!,
         prestamoId: prestamoId!,
@@ -462,6 +492,9 @@ export default function ModalRegistroPago({
         hasOpenedWhatsRef.current = true;
         setTimeout(() => void openWhats(texto), 0);
       }
+
+      // ✅ Cerrar modal recién ahora, tras transacción
+      if (mountedRef.current) onClose();
 
       // ====================== PESADO → BACKGROUND ======================
       setTimeout(async () => {
@@ -520,12 +553,12 @@ export default function ModalRegistroPago({
 
         try {
           // Recalc atraso (pesado)
-          const prestamoRef = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
-          const pSnap = await getDoc(prestamoRef);
+          const prestamoRef2 = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
+          const pSnap = await getDoc(prestamoRef2);
           if (pSnap.exists()) {
             const p = pSnap.data() as any;
 
-            const abonosSnap = await getDocs(collection(prestamoRef, 'abonos'));
+            const abonosSnap = await getDocs(collection(prestamoRef2, 'abonos'));
             const abonos = abonosSnap.docs.map((d) => {
               const a = d.data() as any;
               return {
@@ -566,7 +599,7 @@ export default function ModalRegistroPago({
               permitirAdelantar,
             });
 
-            await updateDoc(prestamoRef, {
+            await updateDoc(prestamoRef2, {
               diasAtraso: res.atraso,
               faltas: res.faltas || [],
               ultimaReconciliacion: serverTimestamp(),
@@ -575,7 +608,7 @@ export default function ModalRegistroPago({
             void logAudit({
               userId: authAdminId, // 👈 unificado
               action: 'update',
-              ref: prestamoRef,
+              ref: prestamoRef2,
               before: txResult.prestamoBefore,
               after: {
                 restante: txResult.nuevoRestante,
@@ -591,8 +624,8 @@ export default function ModalRegistroPago({
         try {
           // Cierre si saldo 0
           if (txResult.nuevoRestante === 0) {
-            const prestamoRef = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
-            const snap = await getDoc(prestamoRef);
+            const prestamoRef2 = doc(db, 'clientes', clienteId!, 'prestamos', prestamoId!);
+            const snap = await getDoc(prestamoRef2);
             const p = snap.exists() ? (snap.data() as any) : {};
             const historialRef = collection(
               db,
@@ -614,11 +647,11 @@ export default function ModalRegistroPago({
               ref: histRef,
               after: { clienteId, prestamoId, restante: 0, finalizadoPor: authAdminId },
             });
-            await deleteDoc(prestamoRef);
+            await deleteDoc(prestamoRef2);
             void logAudit({
               userId: authAdminId,
               action: 'delete',
-              ref: prestamoRef,
+              ref: prestamoRef2,
               before: txResult.prestamoBefore,
               after: null,
             });
@@ -686,7 +719,7 @@ export default function ModalRegistroPago({
           );
         }
       } finally {
-        setLoading(false);
+        if (mountedRef.current) setLoading(false);
         submittingRef.current = false;
       }
     }
@@ -700,7 +733,7 @@ export default function ModalRegistroPago({
       visible={visible}
       animationType="none"
       transparent
-      onRequestClose={onClose}
+      onRequestClose={safeClose}
       presentationStyle="overFullScreen"
       statusBarTranslucent
       hardwareAccelerated
@@ -710,7 +743,7 @@ export default function ModalRegistroPago({
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0}
       >
-        <Pressable style={styles.backdrop} onPress={onClose} />
+        <Pressable style={styles.backdrop} onPress={safeClose} />
         <View
           style={[
             styles.overlayCenter,

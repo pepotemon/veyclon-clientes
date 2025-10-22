@@ -438,7 +438,7 @@ export default function HomeScreen({ route, navigation }: Props) {
                       hoy: hoyLocal,
                       cuotas,
                       valorCuota: Number(p?.valorCuota || 0),
-                      abonos: (p?.abonos || []).map((a: any) => ({
+                      abonos: (p?.abonos || []).map((a) => ({
                         monto: Number(a.monto) || 0,
                         operationalDate: a.operationalDate,
                         fecha: a.fecha,
@@ -873,6 +873,38 @@ export default function HomeScreen({ route, navigation }: Props) {
     setWhatsVisible(true);
   };
 
+  // ===== NUEVO: Snapshot del préstamo al abrir el modal + token por apertura =====
+  const [modalTarget, setModalTarget] = useState<{
+    clienteId: string;
+    prestamoId: string;
+    nombre: string;
+    telefono?: string;
+    cuota: number;
+    saldo: number;
+  } | null>(null);
+
+  const [payOpenToken, setPayOpenToken] = useState<string | null>(null);
+
+  const memoPrefetched = useMemo(
+    () =>
+      modalTarget
+        ? {
+            valorCuota: Number(modalTarget.cuota || 0),
+            saldoPendiente: Number(modalTarget.saldo || 0),
+          }
+        : undefined,
+    // solo cambia cuando hay NUEVA apertura
+    [payOpenToken, modalTarget]
+  );
+
+  const handlePagoSuccess = () => {
+    setModalPagoVisible(false);
+    // usar el snapshot del modal, no `current` (puede haber cambiado por re-renders)
+    const pid = modalTarget?.prestamoId;
+    if (!pid) return;
+    setTimeout(() => marcarComoPagado(pid), 120);
+  };
+
   // 🔒 Mostrar loader si no hay admin aún (evita TS: string | undefined)
   if (!admin) {
     return (
@@ -1148,7 +1180,20 @@ export default function HomeScreen({ route, navigation }: Props) {
             {/* Acciones verde/rojo */}
             <View style={styles.actionRowBottom}>
               <TouchableOpacity
-                onPress={() => setModalPagoVisible(true)}
+                onPress={() => {
+                  if (!current) return;
+                  // Snapshot del préstamo para el modal (blindaje vs re-renders)
+                  setModalTarget({
+                    clienteId: current.clienteId!,
+                    prestamoId: current.id!,
+                    nombre: current.concepto,
+                    telefono: current.clienteTelefono1,
+                    cuota: Number(current.valorCuota ?? 0),
+                    saldo: Number(current.restante ?? 0),
+                  });
+                  setPayOpenToken(`${current?.clienteId}:${current?.id}:${Date.now()}`);
+                  setModalPagoVisible(true);
+                }}
                 style={[
                   styles.actionBtnCorner,
                   { backgroundColor: '#4CAF50', alignSelf: 'flex-start' },
@@ -1354,21 +1399,18 @@ export default function HomeScreen({ route, navigation }: Props) {
       )}
 
       {/* Modal Registro Pago */}
-      {current && (
+      {modalTarget && (
         <ModalRegistroPago
           visible={modalPagoVisible}
           onClose={() => setModalPagoVisible(false)}
-          onSuccess={() => current?.id && marcarComoPagado(current.id)}
-          clienteNombre={current.concepto}
-          clienteId={current.clienteId}
-          prestamoId={current.id}
+          onSuccess={handlePagoSuccess}
+          clienteNombre={modalTarget.nombre}
+          clienteId={modalTarget.clienteId}
+          prestamoId={modalTarget.prestamoId}
           admin={admin!}
-          clienteTelefono={current.clienteTelefono1}
-          /* ⚡ prefetched para abrir instantáneo */
-          prefetched={{
-            valorCuota: Number(current.valorCuota ?? 0),
-            saldoPendiente: Number(current.restante ?? 0),
-          }}
+          clienteTelefono={modalTarget.telefono}
+          /* ⚡ prefetched estable por apertura */
+          prefetched={memoPrefetched}
         />
       )}
 
